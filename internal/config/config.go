@@ -25,14 +25,12 @@ type Device struct {
 	Name      string   `json:"name,omitempty"`
 	Addresses []string `json:"addresses,omitempty"` // host:port; empty = rely on LAN discovery
 
-	// Admin: this device is a network admin that the owner of this configuration
-	// chose to trust (see package grant). Managed: it was added by an admin's grant,
-	// not by hand, so a later grant may remove it again.
-	Admin   bool `json:"admin,omitempty"`
+	// Managed: it was introduced by another device (see package grant), not paired or
+	// added by hand, so a later introduction may remove it again.
 	Managed bool `json:"managed,omitempty"`
-	// Full: the owner established that this device holds full copies (it joined as the
-	// admin of a full-copy invitation). Only such a device can introduce a new full
-	// folder, because the folder secret will be fetched from it.
+	// Full: the owner established that this device holds full copies (it invited this
+	// device to a full copy, or was invited by it). Only such a device can introduce a
+	// new full folder, because the folder secret will be fetched from it.
 	Full bool `json:"full,omitempty"`
 }
 
@@ -40,7 +38,7 @@ type Device struct {
 type FolderDevice struct {
 	ID    string `json:"id"`
 	Relay bool   `json:"relay,omitempty"` // that device is a temporary relay for this folder
-	// Managed: added by an admin's grant rather than by hand.
+	// Managed: added by an introduction rather than by hand.
 	Managed bool `json:"managed,omitempty"`
 }
 
@@ -52,7 +50,7 @@ type Folder struct {
 	Role    string         `json:"role,omitempty"`
 	Devices []FolderDevice `json:"devices"`
 
-	// Managed: created because an admin granted this device the folder. Such a folder
+	// Managed: created because the device that paired with this one introduced the folder. Such a folder
 	// is removed from the configuration (never from the disk) if the grant is withdrawn.
 	Managed bool `json:"managed,omitempty"`
 	// AwaitingSecret: a full folder whose secret has not arrived yet; it is fetched
@@ -86,10 +84,7 @@ type Config struct {
 	DHT          bool `json:"dht"`           // private address book shared by your own devices
 	RelayService bool `json:"relay_service"` // let your other devices connect *through* this one when they cannot reach each other
 
-	// Admin: this device is a network admin. It vouches, with a signed grant, for the
-	// devices it shares folders with, so a new device only has to connect to one admin.
-	Admin bool `json:"admin,omitempty"`
-	// NetworkDir is where folders granted by an admin are created (<dir>/<folder ID>);
+	// NetworkDir is where folders introduced by the device this one paired with are created (<dir>/<folder ID>);
 	// for a relay it is the temporary store. Empty: such folders are only reported.
 	NetworkDir string `json:"network_dir,omitempty"`
 	// Dismissed remembers, per device, the grant that was current when the owner

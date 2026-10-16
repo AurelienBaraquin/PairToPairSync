@@ -85,6 +85,6 @@
     <string name="notif_text">%1$d modification(s) en attente · %2$d appareil(s) connecté(s)</string>
     <string name="notif_stop">Arrêter</string>
     <string name="pairing_waiting">En attente de l’acceptation de %1$s…</string>
-    <string name="confirm_network_body">Cela connecte votre téléphone au réseau de %1$s. Il sera reconnu comme administrateur du réseau : il choisit les dossiers relayés par ce téléphone (%2$s) et le présente à ses autres appareils.</string>
-    <string name="confirm_approve_note">%1$s doit aussi accepter la demande sur son propre écran.</string>
+    <string name="confirm_network_body">Cela connecte votre téléphone au réseau de %1$s. Il présentera le téléphone à ses autres appareils, et eux au téléphone, pour les dossiers que ce téléphone relaie (%2$s).</string>
+    <string name="confirm_approve_note">Le propriétaire de %1$s doit aussi accepter la demande sur cet appareil.</string>
 </resources>

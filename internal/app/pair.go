@@ -327,15 +327,15 @@ func GuestRequest(cfg *config.Config) protocol.PairRequest {
 
 var _ = identity.Format
 
-// ---- joining a network through an admin ------------------------------------------------------
+// ---- joining a network through a full device ------------------------------------------------------
 
-// approval is a guest waiting for an admin's decision.
+// approval is a guest waiting for its inviter's owner to decide.
 type approval struct {
 	Request
 	decide chan bool
 }
 
-// Request describes a device asking to join, for the admin to approve.
+// Request describes a device asking to join, for the owner of the inviter to approve.
 type Request struct {
 	ID       string    `json:"id"`
 	DeviceID string    `json:"device_id"`
@@ -343,13 +343,12 @@ type Request struct {
 	IP       string    `json:"ip,omitempty"`
 	Folders  []string  `json:"folders"`
 	AsRelay  bool      `json:"as_relay,omitempty"`
-	Admin    bool      `json:"admin,omitempty"`
 	Since    time.Time `json:"since"`
 }
 
 const maxPendingRequests = 4
 
-// Requests lists the devices waiting for an admin's decision.
+// Requests lists the devices waiting for a decision.
 func (p *pairer) Requests() []Request {
 	p.reqMu.Lock()
 	defer p.reqMu.Unlock()
@@ -376,7 +375,7 @@ func (p *pairer) Decide(id string, accept bool) bool {
 	return true
 }
 
-// await registers a request and waits for the admin (or the time limit).
+// await registers a request and waits for the owner (or the time limit).
 func (p *pairer) await(r Request, extend func(time.Duration)) bool {
 	a := &approval{Request: r, decide: make(chan bool, 1)}
 	p.reqMu.Lock()
@@ -411,26 +410,22 @@ func (p *pairer) acceptNetwork(remote peer.ID, remoteIP string, req protocol.Pai
 	if err != nil {
 		return refuse("internal error")
 	}
-	if !cfg.Admin || p.net == nil {
-		return refuse("this device is not a network admin")
+	if p.net == nil {
+		return refuse("internal error")
 	}
 	for _, id := range pend.Folders {
-		f := cfg.Folder(id)
-		if f == nil {
-			return refuse("a folder of the invitation no longer exists")
-		}
-		if f.Role == config.RoleRelay && !pend.InviteeRelay {
-			return refuse("this device is a relay for a folder of the invitation; it can only introduce relays")
+		if f := cfg.Folder(id); f == nil || f.Role != config.RoleFull || f.AwaitingSecret {
+			return refuse("a folder of the invitation is no longer a full copy on this device")
 		}
 	}
 	if pend.Approve {
 		r := Request{ID: grant.RandomID(), DeviceID: guest, Name: guestName, IP: remoteIP, Folders: pend.Folders,
-			AsRelay: pend.InviteeRelay, Admin: pend.GuestAdmin, Since: time.Now()}
-		p.log.Warn("a device asks to join the network; approve it with `p2psync requests accept`",
+			AsRelay: pend.InviteeRelay, Since: time.Now()}
+		p.log.Warn("a device asks to join; answer with `p2psync accept <request>` or `p2psync reject <request>`",
 			"request", r.ID, "device", guest, "name", guestName)
 		if !p.await(r, extend) {
 			p.log.Info("join request declined or timed out", "request", r.ID)
-			return refuse("the admin did not accept this request")
+			return refuse("the other device's owner did not accept this request")
 		}
 	}
 
@@ -441,7 +436,7 @@ func (p *pairer) acceptNetwork(remote peer.ID, remoteIP string, req protocol.Pai
 	var shares []grant.Share
 	for _, id := range pend.Folders {
 		f := cfg.Folder(id)
-		if f == nil || (f.Role == config.RoleRelay && !pend.InviteeRelay) {
+		if f == nil || f.Role != config.RoleFull || f.AwaitingSecret {
 			return refuse("a folder of the invitation changed while waiting")
 		}
 		shares = append(shares, grant.Share{ID: id, Relay: pend.InviteeRelay})
@@ -454,7 +449,6 @@ func (p *pairer) acceptNetwork(remote peer.ID, remoteIP string, req protocol.Pai
 	if err := AddDevice(plan, guest, guestName, nil); err != nil {
 		return refuse("internal error")
 	}
-	plan.Device(guest).Admin = pend.GuestAdmin
 	secrets := map[string]string{}
 	for _, id := range pend.Folders {
 		if err := ShareFolder(plan, id, guest, pend.InviteeRelay); err != nil {
@@ -466,7 +460,7 @@ func (p *pairer) acceptNetwork(remote peer.ID, remoteIP string, req protocol.Pai
 	}
 	// The guest's grant is signed now, but only stored (and gossiped) once the guest has
 	// really been recorded, in commit: a request that fails half-way leaves nothing behind.
-	guestGrant, err := grant.Sign(p.net.id.Key, grant.Grant{Subject: guest, Name: guestName, Admin: pend.GuestAdmin, Folders: shares}, time.Now())
+	guestGrant, err := grant.Sign(p.net.id.Key, grant.Grant{Subject: guest, Name: guestName, Introducer: !pend.InviteeRelay, Folders: shares}, time.Now())
 	if err != nil {
 		p.log.Error("cannot sign the grant", "err", err)
 		return refuse("internal error")
@@ -488,9 +482,6 @@ func (p *pairer) acceptNetwork(remote peer.ID, remoteIP string, req protocol.Pai
 				addrs = []string{addr}
 			}
 			if err = AddDevice(cfg, guest, guestName, addrs); err == nil {
-				if pend.GuestAdmin { // never demote a device that is already trusted as an admin
-					cfg.Device(guest).Admin = true
-				}
 				for _, id := range pend.Folders {
 					if err = ShareFolder(cfg, id, guest, pend.InviteeRelay); err != nil {
 						break
@@ -551,26 +542,25 @@ func uniqueFirst(in []string, n int) []string {
 type NetworkInviteOptions struct {
 	Folders []string // folder IDs to share with the guest (empty: every folder)
 	AsRelay bool     // the guest is a temporary relay (a phone), not a full copy
-	Admin   bool     // the guest becomes an admin
-	Approve bool     // the admin confirms the request by hand
+	Approve bool     // the owner of this device confirms the request by hand
 	TTL     time.Duration
 }
 
 // CreateNetworkInvite issues a single-use invitation that lets a new device join
-// this admin's network: it will be introduced, with the folders chosen here, to
-// the devices that share them.
+// this device's network: it will be introduced, with the folders chosen here, to
+// the devices that share them, who are told about it in turn. Only a full copy of a
+// folder can be offered: a relay holds nothing it could give.
 func CreateNetworkInvite(home string, cfg *config.Config, selfID string, addrs []string, o NetworkInviteOptions) (pairing.Invite, error) {
-	if !cfg.Admin {
-		return pairing.Invite{}, errors.New("this device is not a network admin: run `p2psync admin enable` first")
-	}
 	folders := slices.Clone(o.Folders)
 	if len(folders) == 0 {
 		for _, f := range cfg.Folders {
-			folders = append(folders, f.ID)
+			if f.Role == config.RoleFull && !f.AwaitingSecret {
+				folders = append(folders, f.ID)
+			}
 		}
 	}
 	if len(folders) == 0 {
-		return pairing.Invite{}, errors.New("there is no folder to share yet")
+		return pairing.Invite{}, errors.New("there is no folder to share yet: this device holds no full copy (a relay cannot invite; use the other device)")
 	}
 	if len(folders) > 64 {
 		return pairing.Invite{}, errors.New("too many folders in one invitation")
@@ -582,13 +572,9 @@ func CreateNetworkInvite(home string, cfg *config.Config, selfID string, addrs [
 		if f == nil {
 			return pairing.Invite{}, fmt.Errorf("unknown folder %q", id)
 		}
-		if f.Role == config.RoleRelay && !o.AsRelay {
-			return pairing.Invite{}, fmt.Errorf("this device is only a relay for %q: it can only introduce other relays "+
-				"(invite a full device from a device that holds the folder)", id)
+		if f.Role != config.RoleFull || f.AwaitingSecret {
+			return pairing.Invite{}, fmt.Errorf("this device does not hold a full copy of %q: invite from a device that does", id)
 		}
-	}
-	if o.AsRelay && o.Admin {
-		return pairing.Invite{}, errors.New("a relay cannot be an admin: it would be able to introduce devices that obtain the folder secret")
 	}
 	sel := SelectAddrs(addrs, selfID)
 	if len(sel) == 0 {
@@ -604,14 +590,14 @@ func CreateNetworkInvite(home string, cfg *config.Config, selfID string, addrs [
 	}
 	ttl = min(ttl, 24*time.Hour)
 	inv := pairing.Invite{V: 2, ID: selfID, Name: cfg.DeviceName, Addrs: sel, Token: tok, Folder: folders[0],
-		InviteeRelay: o.AsRelay, Exp: time.Now().Add(ttl).Unix(), Net: true, Folders: folders, Admin: o.Admin, Approve: o.Approve}
+		InviteeRelay: o.AsRelay, Exp: time.Now().Add(ttl).Unix(), Net: true, Folders: folders, Approve: o.Approve}
 	err = pairing.NewStore(home).Add(tok, pairing.Pending{Folder: folders[0], InviteeRelay: o.AsRelay, Exp: inv.Exp,
-		Net: true, Folders: folders, GuestAdmin: o.Admin, Approve: o.Approve})
+		Net: true, Folders: folders, Approve: o.Approve})
 	return inv, err
 }
 
-// JoinNetwork applies an admin's answer: the admin is trusted from now on, its
-// grants (checked one by one) tell which folders and devices this device takes
+// JoinNetwork applies the answer of the device that invited this one: it is trusted
+// from now on, its introductions (checked one by one) tell which folders and devices this device takes
 // part in, and the folders are created under o.Dir.
 func JoinNetwork(m *Membership, cfg *config.Config, inv pairing.Invite, resp protocol.PairResponse, o JoinOptions) error {
 	if !inv.Net || !resp.Network {
@@ -641,10 +627,9 @@ func JoinNetwork(m *Membership, cfg *config.Config, inv pairing.Invite, resp pro
 		return err
 	}
 	d := cfg.Device(inv.ID)
-	d.Admin = true // the owner scanned this code: this device is trusted as an admin
-	if !inv.InviteeRelay {
-		d.Full = true // and, since it offered a full copy, it holds one: it may introduce full folders
-	}
+	// The owner scanned this code: this device is trusted. It offered a full copy, so it
+	// holds one, and may introduce full folders and other devices.
+	d.Full = true
 
 	pins := pinned(cfg, m.id.ID)
 	for pass := 0; pass < 4; pass++ {
@@ -660,16 +645,16 @@ func JoinNetwork(m *Membership, cfg *config.Config, inv pairing.Invite, resp pro
 	}
 	mine, ok := m.set.Latest(m.id.ID)
 	if !ok || mine.Revoked || len(mine.Folders) == 0 {
-		return errors.New("the admin did not send a valid grant for this device")
+		return errors.New("the other device did not send a valid introduction for this device")
 	}
-	// A folder this device already has: the admin joins it.
+	// A folder this device already has: the inviter joins it.
 	for _, sh := range mine.Folders {
 		f := cfg.Folder(sh.ID)
 		if f == nil {
 			continue
 		}
 		if (f.Role == config.RoleRelay) != sh.Relay {
-			return fmt.Errorf("folder %q already exists here with another role than the admin granted", sh.ID)
+			return fmt.Errorf("folder %q already exists here with another role than the invitation gives", sh.ID)
 		}
 		if err := ShareFolder(cfg, sh.ID, inv.ID, false); err != nil {
 			return err
@@ -697,7 +682,7 @@ func JoinNetwork(m *Membership, cfg *config.Config, inv pairing.Invite, resp pro
 }
 
 // PreflightNetwork checks, before a network invitation is spent, that this device
-// can act on it: folders it already has must have the role the admin will grant.
+// can act on it: folders it already has must have the role the invitation gives.
 func PreflightNetwork(cfg *config.Config, inv pairing.Invite) error {
 	for _, id := range inv.Folders {
 		if f := cfg.Folder(id); f != nil && (f.Role == config.RoleRelay) != inv.InviteeRelay {

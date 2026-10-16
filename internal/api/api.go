@@ -25,8 +25,8 @@ type InviteResult struct {
 type Hooks struct {
 	Status    func() any
 	Invite    func(folder string, asRelay bool) (InviteResult, error)
-	NetInvite func(folders []string, asRelay, admin, approve bool) (InviteResult, error)
-	Requests  func() any // devices waiting for this admin's decision
+	NetInvite func(folders []string, asRelay, approve bool) (InviteResult, error)
+	Requests  func() any // devices waiting for the owner's decision
 	Decide    func(id string, accept bool) bool
 }
 
@@ -48,8 +48,8 @@ h1{font-size:1.3rem}.card{border:1px solid #ddd;border-radius:8px;padding:.8rem 
 <div class=card id=inv hidden><b>Inviter un appareil</b><br><small>Affiche un QR code à usage unique (valable 10 min). Traitez-le comme un mot de passe.</small><br>
 <select id=f></select> <label><input type=checkbox id=rl> cet appareil sera un <b>relais</b> (ex. téléphone)</label>
 <button id=go>Générer le QR code</button><div id=res></div></div>
-<div class=card id=nw hidden><b>Inviter dans le réseau (administrateur)</b><br><small>Le nouvel appareil se connecte à vous seul : vous le présentez aux appareils des dossiers choisis. Vous confirmez chaque demande ci-dessous.</small><br>
-<div id=nf></div><label><input type=checkbox id=nrl> relais (ex. téléphone)</label> <label><input type=checkbox id=nad> administrateur</label>
+<div class=card id=nw hidden><b>Inviter un appareil dans le réseau</b><br><small>Le nouvel appareil se connecte à vous seul : vous le présentez aux autres appareils des dossiers choisis, et eux à lui.</small><br>
+<div id=nf></div><label><input type=checkbox id=nrl> relais (ex. téléphone)</label> <label><input type=checkbox id=nap> je confirme chaque demande</label>
 <button id=ngo>Générer le QR code</button><div id=nres></div></div>
 <div class=card id=rq hidden><b>Demandes de connexion</b><div id=rql></div></div>
 <script src="/app.js"></script>`
@@ -81,17 +81,17 @@ async function render(){const o=$('o');
   $('inv').hidden=false}
  catch(e){o.textContent=token?'Démon injoignable ou accès refusé.':'Ouvrez cette page avec le lien donné par « p2psync ui » (il contient le jeton d’accès).'}}
 const post=(url,body)=>fetch(url,{method:'POST',headers:{'Content-Type':'application/json',...hdr()},body:JSON.stringify(body)});
-async function requests(){try{const s=await status();$('nw').hidden=!s.admin;
-  const nf=$('nf');if(s.admin&&nf.childElementCount!==s.folders.length){nf.replaceChildren(...s.folders.filter(f=>!f.managed).map(f=>{const l=el('label');const c=el('input');c.type='checkbox';c.value=f.id;c.checked=true;l.append(c,' '+(f.label||f.id)+' ');return l}))}
+async function requests(){try{const s=await status();const fl=s.folders.filter(f=>!f.managed&&f.role!=='relay');$('nw').hidden=!fl.length;
+  const nf=$('nf');if(fl.length&&nf.childElementCount!==fl.length){nf.replaceChildren(...fl.map(f=>{const l=el('label');const c=el('input');c.type='checkbox';c.value=f.id;c.checked=true;l.append(c,' '+(f.label||f.id)+' ');return l}))}
   const rs=s.requests||[];$('rq').hidden=!rs.length;
   $('rql').replaceChildren(...rs.map(r=>{const d=el('div',undefined,'card');
    d.append(el('b',r.name||'(sans nom)'),el('br'),el('small','ID : '+r.device_id+(r.ip?' · '+r.ip:'')),el('br'),
-    el('span','dossiers : '+(r.folders||[]).join(', ')+(r.as_relay?' · relais':'')+(r.admin?' · administrateur':'')),el('br'));
+    el('span','dossiers : '+(r.folders||[]).join(', ')+(r.as_relay?' · relais':'')),el('br'));
    for(const [label,ok] of [['Accepter',true],['Refuser',false]]){const b=el('button',label);b.onclick=async()=>{await post('/api/requests/decide',{id:r.id,accept:ok});requests()};d.append(b,' ')}
    return d}))}catch(e){}}
 $('ngo').onclick=async()=>{const res=$('nres');res.textContent='…';
  try{const folders=[...$('nf').querySelectorAll('input:checked')].map(c=>c.value);
-  const r=await post('/api/network-invite',{folders,as_relay:$('nrl').checked,admin:$('nad').checked,approve:true});
+  const r=await post('/api/network-invite',{folders,as_relay:$('nrl').checked,approve:$('nap').checked});
   const j=await r.json();if(!r.ok){res.textContent=j.error||'refusé';return}
   const img=el('img');img.src=j.qr;img.width=260;img.height=260;img.alt='QR code';
   const ta=el('textarea',j.code);ta.readOnly=true;ta.rows=3;ta.style.cssText='width:100%;font-size:.7rem';
@@ -175,14 +175,13 @@ func Start(addr, token string, h Hooks, log *slog.Logger) (*Server, error) {
 		var req struct {
 			Folders []string `json:"folders"`
 			AsRelay bool     `json:"as_relay"`
-			Admin   bool     `json:"admin"`
 			Approve bool     `json:"approve"`
 		}
 		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req) != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		res, err := h.NetInvite(req.Folders, req.AsRelay, req.Admin, req.Approve)
+		res, err := h.NetInvite(req.Folders, req.AsRelay, req.Approve)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		if err != nil {

@@ -24,7 +24,7 @@ data class UiState(
     val deviceId: String = "",
     val wifiOnly: Boolean = true,
     val busy: String? = null,
-    val busyCancelable: Boolean = false, // waiting for an admin to accept
+    val busyCancelable: Boolean = false, // waiting for the other device's owner to accept
     val notice: Notice? = null,
     val toConfirm: InviteInfo? = null,
     val showPaste: Boolean = false,
@@ -94,7 +94,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun cancelPair() = _ui.update { it.copy(toConfirm = null) }
 
-    /** Gives up waiting for an admin to accept. */
+    /** Gives up waiting for the other device's owner to accept. */
     fun cancelWait() = io { runCatching { Mobile.cancelPair() } }
 
     fun confirmPair() {

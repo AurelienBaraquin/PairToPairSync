@@ -95,6 +95,7 @@ func AddDevice(cfg *config.Config, ref, name string, addrs []string) error {
 	}
 	name = config.Clean(name)
 	if d := cfg.Device(id); d != nil {
+		d.Managed = false // pairing or adding a device by hand makes it one of ours, whoever introduced it before
 		if name != "" {
 			d.Name = name
 		}
@@ -126,6 +127,7 @@ func ShareFolder(cfg *config.Config, folderID, rawDevID string, relay bool) erro
 	for i := range f.Devices {
 		if f.Devices[i].ID == id {
 			f.Devices[i].Relay = relay
+			f.Devices[i].Managed = false
 			return nil
 		}
 	}

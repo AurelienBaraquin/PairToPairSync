@@ -153,11 +153,11 @@ class ModelsTest {
     }
 
     @Test
-    fun parsesAdminAndManagedFlagsOfTheConfiguration() {
+    fun parsesManagedFlagsOfTheConfiguration() {
         val cfg = parseConfig("""{"device_name":"p","listen_port":1,"lan_discovery":true,
-            "devices":[{"id":"x","name":"PC","admin":true},{"id":"y","name":"Laptop","managed":true}],
+            "devices":[{"id":"x","name":"PC"},{"id":"y","name":"Laptop","managed":true}],
             "folders":[{"id":"docs","role":"relay","managed":true,"devices":[]}]}""")
-        assertTrue(cfg.devices[0].admin && !cfg.devices[0].managed)
+        assertTrue(!cfg.devices[0].managed)
         assertTrue(cfg.devices[1].managed)
         assertTrue(cfg.folders[0].managed)
     }

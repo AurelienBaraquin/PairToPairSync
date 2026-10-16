@@ -43,18 +43,16 @@ Setup:
   folder share <FOLDER_ID> <DEVICE_ID> [--relay]
   folder list
 
-Pairing with a QR code (no IDs to copy, the folder secret is handed over securely):
-  invite [--folder ID] [--as-relay] [--png FILE]
-                                        show a single-use QR code (valid 10 min) for a new device
-  pair <CODE> [--path DIR] [--quota-mb N]
-                                        use the code shown by 'invite' (scan it with a phone, then paste its text)
-
-Network (one admin introduces a new device to the others):
-  admin enable | disable | promote <ID> | demote <ID>
-  invite --network [--folders a,b] [--as-relay] [--admin] [--no-approve]
-  pair <CODE> --dir DIR [--yes]         join through the admin that made the code
-  requests | accept <ID> | reject <ID>  answer devices asking to join
-  network                               who is who
+Pairing with a QR code (no IDs to copy, the folder secrets are handed over securely).
+A new device only has to be paired with ONE device: that device introduces it to the
+others of the same folders, and them to it.
+  invite [--folders a,b] [--as-relay] [--confirm] [--png FILE]
+                                        show a single-use QR code (valid 10 min); --as-relay for a phone,
+                                        --confirm to accept the request by hand
+  pair <CODE> --dir DIR [--yes]         use the code shown by 'invite': the folders are created under DIR
+                                        (--path DIR instead, for a single folder from a relay's invitation)
+  requests | accept <ID> | reject <ID>  answer devices asking to join (with --confirm)
+  network                               who is who (paired directly / introduced by another device)
 
 Running:
   run [--log FILE]                      run the sync daemon in the foreground (--log: write the log to FILE)
@@ -97,8 +95,6 @@ func main() {
 		cmdFolder(home, args)
 	case "ui":
 		cmdUI(home)
-	case "admin":
-		cmdAdmin(home, args)
 	case "network":
 		cmdNetwork(home)
 	case "requests":
@@ -217,7 +213,7 @@ func cmdDevice(home string, args []string) {
 		if cfg.Device(id) == nil {
 			fatal(fmt.Errorf("no such device: %s", identity.Format(id)))
 		}
-		// A device an admin introduced stays removed until the admin says something newer.
+		// A device that another one introduced stays removed until something newer says otherwise.
 		if lid, err := identity.LoadOrCreate(home); err == nil {
 			app.LoadMembership(home, lid, slog.New(slog.NewTextHandler(io.Discard, nil))).Dismiss(cfg, id)
 		}
@@ -569,21 +565,28 @@ func daemonStatus(home string, cfg *config.Config) (id string, addrs []string, e
 func cmdInvite(home string, args []string) {
 	fs := flag.NewFlagSet("invite", flag.ExitOnError)
 	var folder, png, folders string
-	var asRelay, network, admin, noApprove bool
+	var asRelay, confirm bool
 	var ttl time.Duration
-	fs.BoolVar(&network, "network", false, "invite into the whole network through this admin (not just one folder)")
-	fs.StringVar(&folders, "folders", "", "with --network: folders to share (default: all)")
-	fs.BoolVar(&admin, "admin", false, "with --network: the new device becomes an admin too")
-	fs.BoolVar(&noApprove, "no-approve", false, "with --network: do not ask for confirmation when the device connects")
-	fs.StringVar(&folder, "folder", "", "folder to invite the device to (default: the only folder)")
+	fs.StringVar(&folders, "folders", "", "folders to share with the new device, comma separated (default: all your full copies)")
+	fs.BoolVar(&confirm, "confirm", false, "ask me to accept the new device when it connects (p2psync requests / accept)")
+	fs.StringVar(&folder, "folder", "", "same as --folders, for a single folder")
 	fs.BoolVar(&asRelay, "as-relay", false, "the new device will be a temporary relay (e.g. a phone), not a full copy")
 	fs.StringVar(&png, "png", "", "also write the QR code to this PNG file")
 	fs.DurationVar(&ttl, "ttl", pairing.DefaultTTL, "how long the invitation stays valid")
 	parse(fs, args)
 
 	cfg := loadForEdit(home)
-	if network {
-		cmdNetworkInvite(home, cfg, folders, asRelay, admin, noApprove, png, ttl)
+	if folder != "" && folders == "" {
+		folders = folder
+	}
+	// A device that holds a full copy introduces the new device to the others. One that
+	// only relays (nothing to introduce) invites the old way, into a single folder.
+	hasFull := false
+	for _, f := range cfg.Folders {
+		hasFull = hasFull || (f.Role == config.RoleFull && !f.AwaitingSecret)
+	}
+	if hasFull {
+		cmdNetworkInvite(home, cfg, folders, asRelay, confirm, png, ttl)
 		return
 	}
 	if folder == "" {

@@ -387,11 +387,6 @@ func TestChangeRightAfterStartIsNotMissed(t *testing.T) {
 func TestPhoneJoinsTheNetworkThroughAnAdmin(t *testing.T) {
 	pc := newComputer(t)
 	cfg, _ := app.LoadConfig(pc.home)
-	cfg.Admin = true
-	must(t, app.SaveConfig(pc.home, cfg))
-	pc.a.Stop()
-	pc.start(t)
-
 	cfg, _ = app.LoadConfig(pc.home)
 	inv, err := app.CreateNetworkInvite(pc.home, cfg, pc.id.ID, pc.a.Node.Addrs(), app.NetworkInviteOptions{AsRelay: true, Approve: true})
 	if err != nil {
@@ -428,7 +423,7 @@ func TestPhoneJoinsTheNetworkThroughAnAdmin(t *testing.T) {
 	if f == nil || f.Role != config.RoleRelay || f.Secret != "" || !f.Managed || filepath.Dir(f.Path) != storage {
 		t.Fatalf("relay folder not created as expected: %+v", f)
 	}
-	if d := phoneCfg.Device(pc.id.ID); d == nil || !d.Admin {
+	if d := phoneCfg.Device(pc.id.ID); d == nil || !d.Full {
 		t.Fatalf("the admin is not trusted: %+v", d)
 	}
 }
@@ -438,10 +433,6 @@ func TestPhoneJoinsTheNetworkThroughAnAdmin(t *testing.T) {
 func TestPhoneRefusesAFullCopyNetworkInvitation(t *testing.T) {
 	pc := newComputer(t)
 	cfg, _ := app.LoadConfig(pc.home)
-	cfg.Admin = true
-	must(t, app.SaveConfig(pc.home, cfg))
-	pc.a.Stop()
-	pc.start(t)
 	cfg, _ = app.LoadConfig(pc.home)
 	inv, err := app.CreateNetworkInvite(pc.home, cfg, pc.id.ID, pc.a.Node.Addrs(), app.NetworkInviteOptions{})
 	must(t, err)
@@ -458,10 +449,6 @@ func TestPhoneRefusesAFullCopyNetworkInvitation(t *testing.T) {
 func TestCancelPairEndsTheWait(t *testing.T) {
 	pc := newComputer(t)
 	cfg, _ := app.LoadConfig(pc.home)
-	cfg.Admin = true
-	must(t, app.SaveConfig(pc.home, cfg))
-	pc.a.Stop()
-	pc.start(t)
 	cfg, _ = app.LoadConfig(pc.home)
 	inv, err := app.CreateNetworkInvite(pc.home, cfg, pc.id.ID, pc.a.Node.Addrs(), app.NetworkInviteOptions{AsRelay: true, Approve: true})
 	must(t, err)

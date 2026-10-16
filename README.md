@@ -75,11 +75,11 @@ Un **QR code** et un texte `p2psync://pair/…` s'affichent, valables **10 minut
 Sur le portable, installez le programme, puis :
 
 ```powershell
-p2psync pair "p2psync://pair/…" --path "D:\Projets"      # collez le texte entre guillemets
+p2psync pair "p2psync://pair/…" --dir "D:\P2PSync"      # collez le texte entre guillemets
 p2psync run
 ```
 
-Le dossier `D:\Projets` se remplit avec le contenu du PC, puis les deux restent identiques en quelques secondes dès
+Chaque dossier du PC est créé sous `D:\P2PSync` (ici `D:\P2PSync\projets`) et se remplit avec son contenu, puis les deux restent identiques en quelques secondes dès
 qu'un fichier change d'un côté ou de l'autre. Il n'y a rien d'autre à configurer : ni compte, ni serveur, ni
 adresse IP à recopier.
 
@@ -89,8 +89,9 @@ adresse IP à recopier.
 2. Sur le PC : `p2psync invite --as-relay`.
 3. Sur le téléphone : **Scanner un QR code**, vérifiez le nom et le dossier proposés, **confirmez**, puis activez
    **Relais actif** (une notification permanente apparaît : c'est normal, c'est ce qui garde la connexion).
-4. Pour que le portable passe aussi par le téléphone : dans l'application, **Afficher un QR code pour un
-   ordinateur**, puis sur le portable `p2psync pair "p2psync://pair/…"`.
+4. C'est tout : le PC présente le téléphone au portable (et le portable au téléphone), ils se connectent d'eux-mêmes
+   dès que le portable a relu la configuration, sans nouvel appairage. Pour un deuxième téléphone, même chose :
+   un seul appairage avec n'importe lequel de vos appareils complets.
 
 Le téléphone **ne garde jamais de copie** de vos fichiers : il retient seulement, chiffrées, les modifications que
 certains de vos appareils n'ont pas encore reçues, et les efface dès que tous les ont. Il n'a aucun moyen de les
@@ -123,12 +124,14 @@ lire. Par défaut il ne travaille qu'en Wi‑Fi (réglable).
   la mettez pas dans un dossier synchronisé.
 - Mettre à jour : remplacez le fichier du programme et relancez-le.
 
-### 5. Beaucoup d'appareils : un administrateur
+### 5. Beaucoup d'appareils : un seul appairage suffit
 
-Pour ne pas appairer chaque nouvel appareil avec tous les autres, désignez un appareil **administrateur** :
-`p2psync admin enable`, puis `p2psync invite --network`. Le nouvel appareil (`p2psync pair "…" --dir "D:\P2PSync"`)
-se présente à l'admin, qui accepte la demande (`p2psync requests`, puis `p2psync accept <demande>`) ; il est alors
-relié automatiquement aux autres appareils des dossiers choisis. Détails : [docs/ADMIN.md](docs/ADMIN.md).
+Pas besoin d'appairer chaque nouvel appareil avec tous les autres : appairez-le avec **un seul** appareil de votre
+réseau (`p2psync invite`, puis `p2psync pair "…" --dir "D:\P2PSync"` sur le nouveau). Cet appareil le présente
+automatiquement aux autres appareils des mêmes dossiers, et les leur présente : ils se connectent entre eux. Avec un
+nouveau téléphone-relais, c'est pareil : un appairage, et il est relié au reste du réseau. Ajoutez `--confirm` à
+`invite` si vous voulez accepter chaque demande à la main (`p2psync requests`, puis `p2psync accept <demande>`).
+Détails et règles de confiance : [docs/INTRODUCTIONS.md](docs/INTRODUCTIONS.md).
 
 ### Si ça ne marche pas
 
@@ -156,14 +159,13 @@ p2psync run                              # en continu ; --log fichier.log pour �
 
 # Inviter le portable (copie complète) : un QR code s'affiche
 p2psync invite
-#   Sur le portable :   p2psync pair <texte du QR> --path "D:\Projets"
+#   Sur le portable :   p2psync pair <texte du QR> --dir "D:\P2PSync"
 
 # Inviter le téléphone comme relais temporaire
 p2psync invite --as-relay
 #   Application Android : « Scanner un QR code »
 
-# Pour que le portable aussi passe par le téléphone, le téléphone l'invite à son tour
-#   (application, « Inviter un appareil »)     ->     (portable) p2psync pair <texte du QR>
+# Le portable apprend tout seul l'existence du téléphone (et le téléphone la sienne) : le PC les présente.
 ```
 
 Le QR code est aussi disponible dans la page d'état locale : `p2psync ui` affiche son lien (il contient un
@@ -184,15 +186,15 @@ Le démon recharge `config.json` tout seul. Si `config.json` devient illisible, 
 garde la configuration qui tournait et le dit dans le journal. Les commandes manuelles (`device add`,
 `folder add --secret-file`, `folder add-relay`…) restent disponibles : voir `p2psync` sans argument.
 
-## Appareils administrateurs
+## Présentation automatique des appareils
 
-Plutôt que d'appairer chaque appareil avec tous les autres, on peut désigner des **admins** : un nouvel appareil
-scanne le QR d'un seul admin, l'admin accepte la demande, et le nouvel appareil est automatiquement relié aux
-autres appareils des dossiers que l'admin a choisi de partager (qui l'apprennent de l'admin, puis se connectent
-directement). `p2psync admin enable`, `p2psync invite --network`, `p2psync pair … --dir …`, `p2psync requests` /
-`accept`. Un admin ne peut agir que sur les dossiers dont il est membre, un relais (téléphone) ne peut jamais faire
-entrer une copie complète, et ce que vous avez configuré à la main n'est jamais modifié. Détails, limites et
-modèle de confiance : [docs/ADMIN.md](docs/ADMIN.md).
+Plutôt que d'appairer chaque appareil avec tous les autres, un nouvel appareil n'est appairé qu'avec **un seul**
+appareil de votre réseau, qui le présente aux autres appareils des mêmes dossiers (et les lui présente) : ils se
+connectent ensuite directement. Il n'y a pas de rôle d'administrateur : tout appareil qui détient une copie complète
+présente ceux qu'il a appairés. Un relais (téléphone) ne présente personne et ne peut jamais faire entrer une copie
+complète ; on ne présente qu'aux dossiers dont on est membre ; ce que vous avez configuré à la main n'est jamais
+modifié. `p2psync invite`, `p2psync pair … --dir …`, éventuellement `--confirm` / `requests` / `accept`. Détails,
+limites et modèle de confiance : [docs/INTRODUCTIONS.md](docs/INTRODUCTIONS.md).
 
 ## Sécurité
 
@@ -205,7 +207,7 @@ modèle de confiance : [docs/ADMIN.md](docs/ADMIN.md).
 | Relais | **Chiffré de bout en bout, à connaissance nulle** (ci-dessous). |
 | Appairage | Invitation à usage unique (128 bits, 10 min). Les inconnus ne sont acceptés **que pendant une invitation**, 6 au plus (2 par adresse IP), 15 s au plus, un seul échange à la fois, et ne peuvent faire qu'une chose : présenter le jeton (requête limitée à 4 Ko). L'annuaire DHT leur est fermé. |
 | Contenu venu d'un autre appareil | Identifiants de dossier, noms et libellés sont validés/filtrés (pas de `/`, `..`, ni balisage) ; un invité vérifie la réponse de l'invitant avant d'appliquer quoi que ce soit. |
-| Réseau d'admins | Autorisations signées (Ed25519, séparation de domaine), ordonnées par numéro de séquence, vérifiées par chaque appareil ; seuls les admins que **vous** avez choisis (ou qu'ils ont promus) comptent ; un admin ne touche qu'aux dossiers dont il est membre ; chaque demande de connexion est confirmée par un humain côté admin ; les secrets de dossier ne sont remis qu'à une copie complète listée, jamais à un relais. |
+| Présentation des appareils | Présentations signées (Ed25519, séparation de domaine), ordonnées par numéro de séquence, vérifiées par chaque appareil ; seuls les appareils complets que **vous** avez appairés (et ceux qu'ils présentent comme tels) comptent ; un appareil ne présente qu'aux dossiers dont il est membre, un relais ne présente personne ; chaque demande peut être confirmée par un humain (`--confirm`) ; les secrets de dossier ne sont remis qu'à une copie complète listée, jamais à un relais. |
 | Page locale | `127.0.0.1` seulement ; jeton d'accès obligatoire ; refuse tout `Host` non local (anti DNS-rebinding) ; création d'invitation = POST JSON de même origine ; aucun script en ligne, texte inséré via `textContent`, politique CSP stricte. |
 | Fichiers de config | `config.json`, clé, index : permissions `0600` ; sous Windows, le dossier de données (`%LOCALAPPDATA%\p2psync`) n'est accessible qu'à votre compte (liste d'accès non héritée). Écritures atomiques et synchronisées sur disque. |
 

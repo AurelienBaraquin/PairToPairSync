@@ -237,7 +237,7 @@ type PairResponse struct {
 	Secret       string `json:"secret,omitempty"`
 	InviterRelay bool   `json:"inviter_relay,omitempty"`
 
-	// Joining a network through an admin (see package grant): the signed grants the
+	// Joining a network through a full device that introduces the guest (see package grant): the signed grants the
 	// guest needs (its own, and those of the devices it shares folders with), the
 	// secrets of the full folders the inviter holds, and where to find the devices.
 	Network bool                `json:"network,omitempty"`
@@ -263,7 +263,7 @@ const (
 )
 
 // SecretRequest asks a full device of a folder for the folder secret. It is only
-// answered for a device that the folder's members were told, by an admin or by
+// answered for a device that the folder's members were told, by an introduction or by
 // the owner, to treat as a full member.
 type SecretRequest struct {
 	Folder string `json:"folder"`

@@ -18,25 +18,26 @@ import (
 // GrantsFile holds the signed grants a device has received or issued.
 const GrantsFile = "grants.json"
 
-// Membership connects the signed grants of the network's admins to this device's
-// configuration.
+// Membership connects the signed introductions the devices of the network make of each
+// other to this device's configuration.
 //
 // Two directions:
-//   - receiving: a grant from a trusted admin says that device S takes part in
+//   - receiving: an introduction from a trusted device says that device S takes part in
 //     folders F. The matching entries are added to config.json, marked "managed" so
-//     that a later grant (a revocation, a change) can take them out again. Entries
-//     the owner created by hand are never touched.
-//   - issuing (admins): the devices this admin was paired with directly are
-//     described in a signed grant, so that the devices they share folders with can
-//     learn about them without the owner connecting everything one by one.
+//     that a later introduction (a revocation, a change) can take them out again.
+//     Entries the owner created by hand or by pairing are never touched.
+//   - issuing: a full device describes, in signed introductions, the devices it was
+//     paired with directly, so that the devices it shares folders with learn about them
+//     (and they about those) without the owner pairing everything with everything.
 //
-// What a grant can change is limited on purpose:
-//   - the issuer must be a trusted admin (pinned by the owner or promoted by one);
-//   - only folders this device has are affected (a grant never creates access to
-//     something the issuer is not a member of);
+// What an introduction can change is limited on purpose:
+//   - the issuer must be trusted: a full device this one was paired with, or a full
+//     device that such a device introduced as an introducer;
+//   - only folders this device has are affected, and only if the issuer is a member of
+//     them (an introduction never creates access to something the issuer cannot give);
 //   - a full copy is only honoured when the issuer is itself a full member of the
-//     folder: a relay is blind (it never has the folder secret), and a blind
-//     device that could introduce full copies would defeat that.
+//     folder: a relay is blind (it never has the folder secret), and a blind device
+//     that could introduce full copies would defeat that.
 type Membership struct {
 	home string
 	id   *identity.Identity
@@ -51,16 +52,15 @@ func LoadMembership(home string, id *identity.Identity, log *slog.Logger) *Membe
 // Set exposes the grants (for tests and the status page).
 func (m *Membership) Set() *grant.Set { return m.set }
 
-// pinned lists the admins the owner trusts directly (this device itself, if it is one).
+// pinned lists the devices trusted to introduce others without anyone else vouching for
+// them: this device itself, and the full devices its owner paired it with (or set up by
+// hand). A relay is never one of them.
 func pinned(cfg *config.Config, self string) map[string]bool {
-	p := map[string]bool{}
+	p := map[string]bool{self: true}
 	for _, d := range cfg.Devices {
-		if d.Admin {
+		if !d.Managed && established(cfg, d.ID) {
 			p[d.ID] = true
 		}
-	}
-	if cfg.Admin {
-		p[self] = true
 	}
 	return p
 }
@@ -70,7 +70,7 @@ func pinned(cfg *config.Config, self string) map[string]bool {
 // Receive takes grants offered by a connected device, keeps the valid ones and
 // brings the configuration in line. It reports whether config.json changed (the
 // daemon then restarts on its own). Hints about where to find devices are only
-// written to the configuration when they come from a trusted admin.
+// written to the configuration when they come from a trusted device.
 func (m *Membership) Receive(from string, list []grant.Signed, hints map[string][]string) (changed bool) {
 	WithConfigLock(func() {
 		cfg, err := LoadConfig(m.home)
@@ -140,11 +140,11 @@ func (m *Membership) reconcileLocked(cfg *config.Config, hints map[string][]stri
 	return true
 }
 
-// Apply brings cfg in line with what the trusted admins granted and reports whether it
+// Apply brings cfg in line with what the trusted devices introduced and reports whether it
 // changed. Each device is handled on its own copy of the configuration and kept only if
 // the result is valid, so one grant that cannot be applied never blocks the others.
 //
-// What a device is granted is the union of what the trusted admins say about it. A
+// What a device is granted is the union of what the trusted devices say about it. A
 // device with no grant at all is left alone: losing grants.json never removes anything.
 func (m *Membership) Apply(cfg *config.Config) bool {
 	self := m.id.ID
@@ -171,8 +171,8 @@ func (m *Membership) Apply(cfg *config.Config) bool {
 		return subjects[i] < subjects[j]
 	})
 	changed := false
-	// A few passes: a device vouched for by an admin is only honoured once that admin's
-	// own membership of the folder is recorded.
+	// A few passes: a device vouched for by another is only honoured once that one's own
+	// membership of the folder is recorded.
 	for pass := 0; pass < 4; pass++ {
 		progress := false
 		for _, sub := range subjects {
@@ -220,7 +220,7 @@ func cloneConfig(c *config.Config) (*config.Config, error) {
 // established reports whether the owner of this configuration has reason to treat the
 // device as a holder of full copies: a device it paired with as such, or one that is a
 // full member of a folder it set up by hand. A device's own claim never counts, and
-// neither does an admin's: a relay could otherwise pass for a full copy and be handed
+// neither does an introducer's: a relay could otherwise pass for a full copy and be handed
 // the folder secret.
 func established(cfg *config.Config, id string) bool {
 	if d := cfg.Device(id); d != nil && d.Full {
@@ -250,7 +250,7 @@ func roleIn(f *config.Folder, self, id string) (relay, ok bool) {
 	return false, false
 }
 
-// applyOthers records what the admins' grants say about another device: the shares the
+// applyOthers records what the introductions say about another device: the shares the
 // issuers are entitled to give, and nothing else.
 func applyOthers(cfg *config.Config, subject string, gs []grant.Grant, self string) bool {
 	desired := map[string]bool{} // folder -> the subject is a relay there
@@ -275,7 +275,7 @@ func applyOthers(cfg *config.Config, subject string, gs []grant.Grant, self stri
 				continue
 			}
 			if cur, seen := desired[sh.ID]; !seen || (cur && !sh.Relay) {
-				desired[sh.ID] = sh.Relay // a full copy beats a relay when admins disagree
+				desired[sh.ID] = sh.Relay // a full copy beats a relay when introducers disagree
 			}
 		}
 	}
@@ -299,6 +299,26 @@ func applyOthers(cfg *config.Config, subject string, gs []grant.Grant, self stri
 	keep := map[string]bool{}
 	for f := range desired {
 		keep[f] = true
+	}
+	// Silence is not removal: a managed share is withdrawn from a folder only when a
+	// device entitled to speak about that folder (a member of it) said something about
+	// this one and left the folder out. A grant by someone who is not (yet) a member says
+	// nothing about the folder.
+	for i := range cfg.Folders {
+		f := &cfg.Folders[i]
+		if keep[f.ID] {
+			continue
+		}
+		heard := false
+		for _, g := range gs {
+			if _, member := roleIn(f, self, g.Issuer); member {
+				heard = true
+				break
+			}
+		}
+		if !heard {
+			keep[f.ID] = true
+		}
 	}
 	return withdraw(cfg, subject, keep) || changed
 }
@@ -338,7 +358,7 @@ func withdraw(cfg *config.Config, subject string, keep map[string]bool) bool {
 		f.Devices = slices.DeleteFunc(f.Devices, func(d config.FolderDevice) bool { return d.ID == subject && d.Managed })
 		changed = changed || len(f.Devices) != n
 	}
-	if d := cfg.Device(subject); d != nil && d.Managed && !d.Admin {
+	if d := cfg.Device(subject); d != nil && d.Managed {
 		still := false
 		for _, f := range cfg.Folders {
 			still = still || f.SharesWith(subject)
@@ -351,7 +371,7 @@ func withdraw(cfg *config.Config, subject string, keep map[string]bool) bool {
 	return changed
 }
 
-// applySelf records what the admins grant this device: the folders it takes part in.
+// applySelf records what the introductions give this device: the folders it takes part in.
 func (m *Membership) applySelf(cfg *config.Config, gs []grant.Grant) bool {
 	type want struct {
 		relay  bool
@@ -383,10 +403,10 @@ func (m *Membership) applySelf(cfg *config.Config, gs []grant.Grant) bool {
 		if seq, ok := cfg.Dismissed["folder/"+id]; ok && w.seq <= seq {
 			continue // the owner removed it after that grant
 		}
-		// A full copy is created only on the word of an admin known to hold full copies:
-		// its secret will be fetched from that admin, and a relay must never receive it.
+		// A full copy is created only on the word of a device known to hold full copies:
+		// its secret will be fetched from it, and a relay must never receive it.
 		if !w.relay && !established(cfg, w.issuer) {
-			m.log.Warn("granted folder skipped: the admin is not known to hold full copies", "folder", id)
+			m.log.Warn("introduced folder skipped: the introducer is not known to hold full copies", "folder", id)
 			continue
 		}
 		path := filepath.Join(cfg.NetworkDir, id)
@@ -396,7 +416,7 @@ func (m *Membership) applySelf(cfg *config.Config, gs []grant.Grant) bool {
 		}
 		cfg.Folders = append(cfg.Folders, config.Folder{
 			ID: id, Label: id, Path: path, Role: role, Managed: true, AwaitingSecret: role == config.RoleFull,
-			// The admin that gave us the folder is a member of it: that is where we get it from.
+			// The device that introduced the folder is a member of it: that is where we get it from.
 			Devices: []config.FolderDevice{{ID: w.issuer, Managed: true}},
 		})
 		if cfg.Device(w.issuer) == nil {
@@ -404,18 +424,21 @@ func (m *Membership) applySelf(cfg *config.Config, gs []grant.Grant) bool {
 		}
 		changed = true
 	}
-	// Folders the admins no longer give us. The files stay where they are.
+	// Folders no longer introduced, when a member of them says so (see applyOthers). The
+	// files stay where they are.
+	heardAny := false
 	for i := 0; i < len(cfg.Folders); i++ {
 		if f := cfg.Folders[i]; f.Managed {
-			if _, still := desired[f.ID]; !still {
-				m.log.Info("folder withdrawn by an admin; its files are left untouched", "folder", f.ID, "path", f.Path)
+			if _, still := desired[f.ID]; !still && heardFrom(&f, gs, m.id.ID) {
+				heardAny = true
+				m.log.Info("folder withdrawn by the device that introduced it; its files are left untouched", "folder", f.ID, "path", f.Path)
 				cfg.Folders = slices.Delete(cfg.Folders, i, i+1)
 				i--
 				changed = true
 			}
 		}
 	}
-	if len(desired) == 0 { // removed from the network: drop what admins introduced
+	if len(desired) == 0 && heardAny { // removed from the network: drop what was introduced
 		for _, d := range slices.Clone(cfg.Devices) {
 			if d.Managed && withdraw(cfg, d.ID, nil) {
 				changed = true
@@ -425,30 +448,32 @@ func (m *Membership) applySelf(cfg *config.Config, gs []grant.Grant) bool {
 	return changed
 }
 
-// ---- issuing (admins) --------------------------------------------------------------------
+// ---- issuing --------------------------------------------------------------------------------
 
-// IssueFromConfig writes the signed grants that describe this admin's own
-// configuration: every device it shares folders with that it added itself. A device
-// that disappeared from the configuration is revoked. Devices that arrived through
-// somebody else's grant are not re-issued (two admins would otherwise keep
-// answering each other). It reports whether anything was issued.
+// IssueFromConfig writes the signed introductions that describe this device's own
+// configuration: every device it was paired with directly (or set up by hand),
+// limited to the folders this device holds a full copy of. A device that disappeared
+// from the configuration is revoked. Devices that arrived through somebody else's
+// introduction are not re-issued (two devices would otherwise keep answering each
+// other). A relay holds no full copy and so introduces nobody. It reports whether
+// anything was issued.
 func (m *Membership) IssueFromConfig(cfg *config.Config) (issued bool, err error) {
-	if !cfg.Admin {
-		return false, nil
-	}
 	now := time.Now()
 	want := map[string]grant.Grant{}
 	for _, d := range cfg.Devices {
 		if d.Managed || d.ID == m.id.ID {
 			continue
 		}
-		g := grant.Grant{Subject: d.ID, Name: d.Name, Admin: d.Admin}
+		g := grant.Grant{Subject: d.ID, Name: d.Name}
 		for _, f := range cfg.Folders {
-			if f.SharesWith(d.ID) {
-				g.Folders = append(g.Folders, grant.Share{ID: f.ID, Relay: f.IsRelay(d.ID)})
+			if f.Role != config.RoleFull || f.AwaitingSecret || !f.SharesWith(d.ID) {
+				continue
 			}
+			g.Folders = append(g.Folders, grant.Share{ID: f.ID, Relay: f.IsRelay(d.ID)})
+			// A full device paired with this one may introduce others in turn.
+			g.Introducer = g.Introducer || !f.IsRelay(d.ID)
 		}
-		if len(g.Folders) == 0 && !g.Admin {
+		if len(g.Folders) == 0 {
 			continue
 		}
 		want[d.ID] = g
@@ -464,11 +489,11 @@ func (m *Membership) IssueFromConfig(cfg *config.Config) (issued bool, err error
 			continue // already said
 		}
 		if _, _, err := m.set.Issue(m.id.Key, g, now); err != nil {
-			return issued, fmt.Errorf("grant for %s: %w", id[:min(len(id), 12)], err)
+			return issued, fmt.Errorf("introduction of %s: %w", id[:min(len(id), 12)], err)
 		}
 		issued = true
 	}
-	// Revoke what this admin once granted and no longer configures.
+	// Revoke what this device once introduced and no longer has.
 	for _, e := range m.set.All() {
 		g := e.Grant
 		if g.Issuer != m.id.ID || g.Revoked {
@@ -503,10 +528,11 @@ func normalised(g grant.Grant) grant.Grant {
 
 // ---- what to tell a connected device -----------------------------------------------------
 
-// ForPeer selects the grants worth sending to a connected device: its own, those of
-// the admins (it needs them to check the others), those of the devices that share a
-// folder with it, those that used to (so that being narrowed or demoted reaches the
-// devices that knew the old state), and every revocation.
+// ForPeer selects the grants worth sending to a connected device: its own, those of the
+// devices that share a folder with it, those that used to (so that being narrowed or
+// demoted reaches the devices that knew the old state), every revocation, and the
+// introductions that make an issuer of those trusted (so the peer can check the chain).
+// Devices it shares nothing with are not revealed.
 func (m *Membership) ForPeer(cfg *config.Config, peerID string) []grant.Signed {
 	trusted := m.set.Trusted(pinned(cfg, m.id.ID))
 	mine := map[string]bool{}
@@ -515,13 +541,37 @@ func (m *Membership) ForPeer(cfg *config.Config, peerID string) []grant.Signed {
 			mine[f.ID] = true
 		}
 	}
-	var out []grant.Signed
+	var all []grant.Entry
 	for _, e := range m.set.All() {
-		g := e.Grant
-		if !trusted[g.Issuer] {
-			continue
+		if trusted[e.Grant.Issuer] {
+			all = append(all, e)
 		}
-		if g.Subject == peerID || trusted[g.Subject] || e.PrevAdmin || g.Revoked || e.Mentions(mine) {
+	}
+	chosen := make([]bool, len(all))
+	for i, e := range all {
+		g := e.Grant
+		chosen[i] = g.Subject == peerID || e.PrevIntroducer || g.Revoked || e.Mentions(mine)
+	}
+	for round := 0; round < 8; round++ { // follow the chain of introducers back to someone the peer trusts
+		added := false
+		for i, e := range all {
+			if !chosen[i] || e.Grant.Issuer == m.id.ID {
+				continue
+			}
+			for j, link := range all {
+				l := link.Grant
+				if !chosen[j] && l.Subject == e.Grant.Issuer && l.Introducer && !l.Revoked {
+					chosen[j], added = true, true
+				}
+			}
+		}
+		if !added {
+			break
+		}
+	}
+	var out []grant.Signed
+	for i, e := range all {
+		if chosen[i] {
 			out = append(out, e.Signed)
 		}
 	}
@@ -539,7 +589,7 @@ func (m *Membership) Dismiss(cfg *config.Config, deviceID string) {
 	}
 }
 
-// DismissFolder records that the owner removed a folder an admin had granted: only a
+// DismissFolder records that the owner removed a folder that had been introduced: only a
 // newer grant for this device recreates it.
 func (m *Membership) DismissFolder(cfg *config.Config, folderID string) {
 	if g, ok := m.set.Latest(m.id.ID); ok {
@@ -548,4 +598,14 @@ func (m *Membership) DismissFolder(cfg *config.Config, folderID string) {
 		}
 		cfg.Dismissed["folder/"+folderID] = max(cfg.Dismissed["folder/"+folderID], g.Seq)
 	}
+}
+
+// heardFrom reports whether any of the grants was issued by a member of the folder.
+func heardFrom(f *config.Folder, gs []grant.Grant, self string) bool {
+	for _, g := range gs {
+		if _, member := roleIn(f, self, g.Issuer); member {
+			return true
+		}
+	}
+	return false
 }

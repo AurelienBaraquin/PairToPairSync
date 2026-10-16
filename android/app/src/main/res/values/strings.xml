@@ -85,6 +85,6 @@
     <string name="notif_text">%1$d change(s) waiting · %2$d device(s) connected</string>
     <string name="notif_stop">Stop</string>
     <string name="pairing_waiting">Waiting for %1$s to accept…</string>
-    <string name="confirm_network_body">This connects your phone to the network of %1$s. It will be trusted as a network admin: it chooses which folders this phone relays (%2$s) and introduces the phone to its other devices.</string>
-    <string name="confirm_approve_note">%1$s must also accept the request on its own screen.</string>
+    <string name="confirm_network_body">This connects your phone to the network of %1$s. It will introduce the phone to its other devices, and them to the phone, for the folders this phone relays (%2$s).</string>
+    <string name="confirm_approve_note">The owner of %1$s must also accept the request on that device.</string>
 </resources>

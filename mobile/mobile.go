@@ -130,7 +130,7 @@ func Pair(home, code, storageDir string, quotaMB int64) (res string, err error) 
 	return string(b), nil
 }
 
-// pairCtx lets the app give up on a pairing that is waiting for an admin.
+// pairCtx lets the app give up on a pairing that is waiting for the other owner.
 var (
 	pairMu     sync.Mutex
 	pairCancel context.CancelFunc
@@ -145,7 +145,7 @@ func pairContext(d time.Duration) (context.Context, context.CancelFunc) {
 }
 
 // CancelPair abandons the pairing in progress (for instance while it waits for the
-// admin to accept). The invitation is spent either way.
+// other device's owner to accept). The invitation is spent either way.
 func CancelPair() {
 	defer quiet()
 	pairMu.Lock()
@@ -156,9 +156,9 @@ func CancelPair() {
 	}
 }
 
-// pairNetwork joins a network through an admin: this phone becomes a relay for the
-// folders the admin chose, and learns the other devices from the admin's grants. The
-// admin may have to accept the request, which can take minutes.
+// pairNetwork joins a network through the full device that made the code: this phone
+// becomes a relay for the folders it chose, and learns the other devices from its
+// introductions. Its owner may have to accept the request, which can take minutes.
 func pairNetwork(home string, inv pairing.Invite, storageDir string) (string, error) {
 	if !inv.InviteeRelay {
 		return "", errors.New("this invitation would make the phone a full copy, which it cannot hold; " +
@@ -241,8 +241,7 @@ func NewInvite(home, folderID string) (res string, err error) {
 type deviceView struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
-	Admin   bool   `json:"admin,omitempty"`   // trusted as a network admin
-	Managed bool   `json:"managed,omitempty"` // introduced by an admin rather than paired directly
+	Managed bool   `json:"managed,omitempty"` // introduced by another device rather than paired directly
 }
 
 type folderView struct {
@@ -252,7 +251,7 @@ type folderView struct {
 	QuotaMB        int64        `json:"quota_mb"`
 	RetentionHours int          `json:"retention_hours"`
 	Devices        []deviceView `json:"devices"`
-	Managed        bool         `json:"managed,omitempty"` // granted by an admin
+	Managed        bool         `json:"managed,omitempty"` // introduced by another device
 }
 
 // ConfigJSON describes devices and folders for the UI. It never contains secrets.
@@ -270,7 +269,7 @@ func ConfigJSON(home string) (res string, err error) {
 		Folders    []folderView `json:"folders"`
 	}{DeviceName: cfg.DeviceName, ListenPort: cfg.ListenPort, LAN: cfg.LANDiscover, Devices: []deviceView{}, Folders: []folderView{}}
 	for _, d := range cfg.Devices {
-		out.Devices = append(out.Devices, deviceView{d.ID, d.Name, d.Admin, d.Managed})
+		out.Devices = append(out.Devices, deviceView{d.ID, d.Name, d.Managed})
 	}
 	for _, f := range cfg.Folders {
 		fv := folderView{ID: f.ID, Label: f.Label, Role: f.Role, QuotaMB: f.Quota() >> 20,
@@ -322,7 +321,7 @@ func RemoveDevice(home, deviceID string) error {
 	m := membership(home)
 	return edit(home, func(c *config.Config) error {
 		if d := c.Device(id); d != nil && d.Managed && m != nil {
-			m.Dismiss(c, id) // an admin's grant does not bring it back, only a newer one
+			m.Dismiss(c, id) // the same introduction does not bring it back, only a newer one
 		}
 		var devs []config.Device
 		for _, d := range c.Devices {

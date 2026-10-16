@@ -54,11 +54,11 @@ func folderCfg(t *testing.T, id, role string, devs ...config.FolderDevice) confi
 	return config.Folder{ID: id, Path: filepath.Join(t.TempDir(), id), Role: role, Devices: devs}
 }
 
-func TestJoiningThroughAnAdminLearnsTheOtherDevices(t *testing.T) {
+func TestJoiningThroughOneDeviceLearnsTheOtherDevices(t *testing.T) {
 	admin, other, n := newID(t), newID(t), newID(t)
 	cfg := config.Default()
 	cfg.NetworkDir = t.TempDir()
-	cfg.Devices = []config.Device{{ID: admin.ID, Name: "admin", Admin: true}}
+	cfg.Devices = []config.Device{{ID: admin.ID, Name: "admin", Full: true}}
 	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: admin.ID})}
 	cfg.Folders[0].Secret = "" // none needed: no relay
 	m := member(t, n, cfg)
@@ -97,7 +97,7 @@ func TestJoiningThroughAnAdminLearnsTheOtherDevices(t *testing.T) {
 func TestAGrantFromAStrangerChangesNothing(t *testing.T) {
 	admin, stranger, victim := newID(t), newID(t), newID(t)
 	cfg := config.Default()
-	cfg.Devices = []config.Device{{ID: admin.ID, Admin: true}}
+	cfg.Devices = []config.Device{{ID: admin.ID, Full: true}}
 	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: admin.ID})}
 	m := member(t, newID(t), cfg)
 	sg := signed(t, stranger, grant.Grant{Subject: victim.ID, Folders: []grant.Share{{ID: "docs"}}})
@@ -106,10 +106,10 @@ func TestAGrantFromAStrangerChangesNothing(t *testing.T) {
 	}
 }
 
-func TestAdminCannotGrantAFolderItIsNotAMemberOf(t *testing.T) {
+func TestADeviceCannotIntroduceToAFolderItIsNotAMemberOf(t *testing.T) {
 	admin, x := newID(t), newID(t)
 	cfg := config.Default()
-	cfg.Devices = []config.Device{{ID: admin.ID, Admin: true}}
+	cfg.Devices = []config.Device{{ID: admin.ID, Full: true}}
 	// The admin is pinned, but is not a member of "private" here.
 	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: admin.ID}), folderCfg(t, "private", config.RoleFull)}
 	m := member(t, newID(t), cfg)
@@ -125,10 +125,10 @@ func TestAdminCannotGrantAFolderItIsNotAMemberOf(t *testing.T) {
 
 // A relay never has the folder secret. If it could introduce full copies, whoever
 // controls the relay (a lost phone) could obtain the secret from the full devices.
-func TestBlindAdminCanOnlyIntroduceRelays(t *testing.T) {
+func TestBlindMemberCanOnlyIntroduceRelays(t *testing.T) {
 	relayAdmin, full, relay2 := newID(t), newID(t), newID(t)
 	cfg := config.Default()
-	cfg.Devices = []config.Device{{ID: relayAdmin.ID, Admin: true}}
+	cfg.Devices = []config.Device{{ID: relayAdmin.ID, Full: true}}
 	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: relayAdmin.ID, Relay: true})}
 	sec, _ := seal.NewSecret()
 	cfg.Folders[0].Secret = sec // a folder with a relay needs its secret
@@ -149,7 +149,7 @@ func TestBlindAdminCanOnlyIntroduceRelays(t *testing.T) {
 func TestRevocationRemovesOnlyWhatGrantsAdded(t *testing.T) {
 	admin, byGrant, byHand := newID(t), newID(t), newID(t)
 	cfg := config.Default()
-	cfg.Devices = []config.Device{{ID: admin.ID, Admin: true}, {ID: byHand.ID, Name: "hand"}}
+	cfg.Devices = []config.Device{{ID: admin.ID, Full: true}, {ID: byHand.ID, Name: "hand"}}
 	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: admin.ID}, config.FolderDevice{ID: byHand.ID})}
 	m := member(t, newID(t), cfg)
 
@@ -177,7 +177,7 @@ func TestRevocationRemovesOnlyWhatGrantsAdded(t *testing.T) {
 func TestRemovedByHandStaysRemovedUntilANewerGrant(t *testing.T) {
 	admin, x := newID(t), newID(t)
 	cfg := config.Default()
-	cfg.Devices = []config.Device{{ID: admin.ID, Admin: true}}
+	cfg.Devices = []config.Device{{ID: admin.ID, Full: true}}
 	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: admin.ID})}
 	m := member(t, newID(t), cfg)
 	m.recv(admin.ID, []grant.Signed{signed(t, admin, grant.Grant{Subject: x.ID, Folders: []grant.Share{{ID: "docs"}}, Seq: 100})})
@@ -204,7 +204,7 @@ func TestBeingRevokedDropsGrantedFoldersButKeepsTheFiles(t *testing.T) {
 	admin, n := newID(t), newID(t)
 	cfg := config.Default()
 	cfg.NetworkDir = t.TempDir()
-	cfg.Devices = []config.Device{{ID: admin.ID, Admin: true, Full: true}}
+	cfg.Devices = []config.Device{{ID: admin.ID, Full: true}}
 	cfg.Folders = []config.Folder{folderCfg(t, "mine", config.RoleFull)}
 	m := member(t, n, cfg)
 	m.recv(admin.ID, []grant.Signed{signed(t, admin, grant.Grant{Subject: n.ID, Folders: []grant.Share{{ID: "docs"}}, Seq: 5})})
@@ -219,15 +219,14 @@ func TestBeingRevokedDropsGrantedFoldersButKeepsTheFiles(t *testing.T) {
 	if got.Folder("mine") == nil {
 		t.Fatal("a folder created by hand was dropped")
 	}
-	if got.Device(admin.ID) == nil || !got.Device(admin.ID).Admin {
+	if got.Device(admin.ID) == nil || !got.Device(admin.ID).Full {
 		t.Fatal("the pinned admin must stay: that was the owner's choice")
 	}
 }
 
-func TestAdminIssuesGrantsFromItsOwnConfig(t *testing.T) {
+func TestDeviceIssuesIntroductionsFromItsOwnConfig(t *testing.T) {
 	a, b, c := newID(t), newID(t), newID(t)
 	cfg := config.Default()
-	cfg.Admin = true
 	cfg.Devices = []config.Device{{ID: b.ID, Name: "b"}, {ID: c.ID, Name: "c", Managed: true}}
 	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: b.ID}, config.FolderDevice{ID: c.ID, Managed: true}),
 		folderCfg(t, "pics", config.RoleFull, config.FolderDevice{ID: b.ID, Relay: true})}
@@ -261,21 +260,36 @@ func TestAdminIssuesGrantsFromItsOwnConfig(t *testing.T) {
 	}
 }
 
-func TestOnlyAdminsIssue(t *testing.T) {
+// A relay holds no full copy and so introduces nobody.
+func TestARelayIntroducesNobody(t *testing.T) {
+	a, b := newID(t), newID(t)
+	cfg := config.Default()
+	cfg.Devices = []config.Device{{ID: b.ID}}
+	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleRelay, config.FolderDevice{ID: b.ID})}
+	m := member(t, a, cfg)
+	if issued, _ := m.IssueFromConfig(cfg); issued {
+		t.Fatal("a relay issued introductions")
+	}
+}
+
+// Everybody who holds a full copy introduces the devices it was paired with.
+func TestEveryFullDeviceIntroducesItsPairs(t *testing.T) {
 	a, b := newID(t), newID(t)
 	cfg := config.Default()
 	cfg.Devices = []config.Device{{ID: b.ID}}
 	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: b.ID})}
 	m := member(t, a, cfg)
-	if issued, _ := m.IssueFromConfig(cfg); issued {
-		t.Fatal("a device that is not an admin issued grants")
+	if issued, _ := m.IssueFromConfig(cfg); !issued {
+		t.Fatal("a full device did not introduce the device it is paired with")
+	}
+	if g, ok := m.set.By(a.ID, b.ID); !ok || !g.Introducer {
+		t.Fatalf("a full pair should be allowed to introduce in turn: %+v", g)
 	}
 }
 
 func TestForPeerOnlyRevealsFolderMates(t *testing.T) {
 	a, p, mate, stranger := newID(t), newID(t), newID(t), newID(t)
 	cfg := config.Default()
-	cfg.Admin = true
 	cfg.Devices = []config.Device{{ID: p.ID}, {ID: mate.ID}, {ID: stranger.ID}}
 	cfg.Folders = []config.Folder{
 		folderCfg(t, "shared", config.RoleFull, config.FolderDevice{ID: p.ID}, config.FolderDevice{ID: mate.ID}),
@@ -305,26 +319,46 @@ func (m *Membership) recv(from string, list []grant.Signed) bool { return m.Rece
 // A relay-only admin used to be able to claim, about itself, to be a full member of a
 // folder the receiver does not have yet, and so get a folder whose secret would later be
 // handed to it.
-func TestBlindAdminCannotCreateAFullFolderByClaimingToHoldIt(t *testing.T) {
-	relayAdmin, n := newID(t), newID(t)
+func TestARelayPairedWithUsIsNotTrustedToIntroduceAnything(t *testing.T) {
+	relay, n := newID(t), newID(t)
 	cfg := config.Default()
 	cfg.NetworkDir = t.TempDir()
-	// Pinned by the owner, known only as a relay of an existing folder.
-	cfg.Devices = []config.Device{{ID: relayAdmin.ID, Admin: true}}
 	sec, _ := seal.NewSecret()
-	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: relayAdmin.ID, Relay: true})}
+	cfg.Devices = []config.Device{{ID: relay.ID}}
+	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: relay.ID, Relay: true})}
 	cfg.Folders[0].Secret = sec
 	m := member(t, n, cfg)
-	m.recv(relayAdmin.ID, []grant.Signed{signed(t, relayAdmin, grant.Grant{Subject: n.ID, Folders: []grant.Share{{ID: "Documents"}}})})
+	m.recv(relay.ID, []grant.Signed{
+		signed(t, relay, grant.Grant{Subject: n.ID, Folders: []grant.Share{{ID: "Documents"}}}),
+		signed(t, relay, grant.Grant{Subject: newID(t).ID, Folders: []grant.Share{{ID: "docs", Relay: true}}}),
+	})
 	got, _ := LoadConfig(m.home)
-	if got.Folder("Documents") != nil {
-		t.Fatal("a folder was created on the word of a device that is not known to hold full copies")
+	if got.Folder("Documents") != nil || len(got.Devices) != 1 {
+		t.Fatalf("a relay's introductions were applied: %+v", got.Devices)
 	}
-	if _, ok := secretFrom(got, "Documents", relayAdmin.ID); ok {
+	if _, ok := secretFrom(got, "Documents", relay.ID); ok {
 		t.Fatal("secret released")
 	}
-	// The same admin may hand out a relay role, which carries no secret.
-	m.recv(relayAdmin.ID, []grant.Signed{signed(t, relayAdmin, grant.Grant{Subject: n.ID, Folders: []grant.Share{{ID: "Documents", Relay: true}}, Seq: time.Now().UnixNano() + 5})})
+}
+
+// A device introduced by one we trust is not itself known to hold full copies: it
+// cannot make us create a full folder on its word, only a relay one.
+func TestAnIntroducedDeviceCannotCreateAFullFolderOnItsOwnWord(t *testing.T) {
+	p, x, n := newID(t), newID(t), newID(t)
+	cfg := config.Default()
+	cfg.NetworkDir = t.TempDir()
+	cfg.Devices = []config.Device{{ID: p.ID, Full: true}}
+	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: p.ID})}
+	m := member(t, n, cfg)
+	now := time.Now().UnixNano()
+	m.recv(p.ID, []grant.Signed{
+		signed(t, p, grant.Grant{Subject: x.ID, Introducer: true, Folders: []grant.Share{{ID: "docs"}}, Seq: now}),
+		signed(t, x, grant.Grant{Subject: n.ID, Folders: []grant.Share{{ID: "Documents"}}, Seq: now}),
+	})
+	if got, _ := LoadConfig(m.home); got.Folder("Documents") != nil {
+		t.Fatal("a full folder was created on the word of a device nobody established as holding full copies")
+	}
+	m.recv(p.ID, []grant.Signed{signed(t, x, grant.Grant{Subject: n.ID, Folders: []grant.Share{{ID: "Documents", Relay: true}}, Seq: now + 5})})
 	if got, _ := LoadConfig(m.home); got.Folder("Documents") == nil || got.Folder("Documents").Role != config.RoleRelay {
 		t.Fatal("a relay folder should be creatable")
 	}
@@ -336,11 +370,11 @@ func secretFrom(cfg *config.Config, folderID, requester string) (string, bool) {
 	return a.secretFor(requester, folderID)
 }
 
-func TestAnAdminHeldAsFullByTheOwnerCanCreateFullFolders(t *testing.T) {
+func TestADevicePairedAsFullCanIntroduceFullFolders(t *testing.T) {
 	admin, n := newID(t), newID(t)
 	cfg := config.Default()
 	cfg.NetworkDir = t.TempDir()
-	cfg.Devices = []config.Device{{ID: admin.ID, Admin: true, Full: true}}
+	cfg.Devices = []config.Device{{ID: admin.ID, Full: true}}
 	m := member(t, n, cfg)
 	m.recv(admin.ID, []grant.Signed{signed(t, admin, grant.Grant{Subject: n.ID, Folders: []grant.Share{{ID: "photos"}}})})
 	got, _ := LoadConfig(m.home)
@@ -350,10 +384,10 @@ func TestAnAdminHeldAsFullByTheOwnerCanCreateFullFolders(t *testing.T) {
 }
 
 // Another admin narrowing its own grant must not erase what a different admin granted.
-func TestAdminsGrantsAreUnioned(t *testing.T) {
+func TestIntroductionsAreUnioned(t *testing.T) {
 	a, b, s := newID(t), newID(t), newID(t)
 	cfg := config.Default()
-	cfg.Devices = []config.Device{{ID: a.ID, Admin: true}, {ID: b.ID, Admin: true}}
+	cfg.Devices = []config.Device{{ID: a.ID, Full: true}, {ID: b.ID, Full: true}}
 	cfg.Folders = []config.Folder{
 		folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: a.ID}, config.FolderDevice{ID: b.ID}),
 		folderCfg(t, "photos", config.RoleFull, config.FolderDevice{ID: a.ID}),
@@ -379,7 +413,6 @@ func TestAdminsGrantsAreUnioned(t *testing.T) {
 func TestNarrowingReachesTheDevicesThatKnewTheOldFolder(t *testing.T) {
 	a, d1, d2, s := newID(t), newID(t), newID(t), newID(t)
 	cfg := config.Default()
-	cfg.Admin = true
 	cfg.Devices = []config.Device{{ID: d1.ID}, {ID: d2.ID}, {ID: s.ID}}
 	cfg.Folders = []config.Folder{
 		folderCfg(t, "F", config.RoleFull, config.FolderDevice{ID: d1.ID}, config.FolderDevice{ID: s.ID}),
@@ -410,7 +443,7 @@ func TestNarrowingReachesTheDevicesThatKnewTheOldFolder(t *testing.T) {
 func TestAnUnappliableGrantDoesNotBlockTheRest(t *testing.T) {
 	admin, good, bad := newID(t), newID(t), newID(t)
 	cfg := config.Default()
-	cfg.Devices = []config.Device{{ID: admin.ID, Admin: true}}
+	cfg.Devices = []config.Device{{ID: admin.ID, Full: true}}
 	// A hand-made full folder with no secret: adding a relay to it would be invalid.
 	cfg.Folders = []config.Folder{
 		folderCfg(t, "nosecret", config.RoleFull, config.FolderDevice{ID: admin.ID}),
@@ -434,7 +467,7 @@ func TestBeingRemovedWithAHandMadeFolderMentioningAManagedDevice(t *testing.T) {
 	admin, n, other := newID(t), newID(t), newID(t)
 	cfg := config.Default()
 	cfg.NetworkDir = t.TempDir()
-	cfg.Devices = []config.Device{{ID: admin.ID, Admin: true, Full: true}, {ID: other.ID, Managed: true}}
+	cfg.Devices = []config.Device{{ID: admin.ID, Full: true}, {ID: other.ID, Managed: true}}
 	// The owner shared a hand-made folder with a device an admin introduced.
 	cfg.Folders = []config.Folder{folderCfg(t, "mine", config.RoleFull, config.FolderDevice{ID: other.ID})}
 	m := member(t, n, cfg)
@@ -456,7 +489,7 @@ func TestFolderRemovedByHandStaysRemoved(t *testing.T) {
 	admin, n, other := newID(t), newID(t), newID(t)
 	cfg := config.Default()
 	cfg.NetworkDir = t.TempDir()
-	cfg.Devices = []config.Device{{ID: admin.ID, Admin: true, Full: true}}
+	cfg.Devices = []config.Device{{ID: admin.ID, Full: true}}
 	m := member(t, n, cfg)
 	m.recv(admin.ID, []grant.Signed{signed(t, admin, grant.Grant{Subject: n.ID, Folders: []grant.Share{{ID: "docs"}}, Seq: 100})})
 	WithConfigLock(func() {
@@ -478,7 +511,7 @@ func TestFolderRemovedByHandStaysRemoved(t *testing.T) {
 	}
 }
 
-func TestHintsAreFilteredAndOnlyTrustedAdminsWriteThem(t *testing.T) {
+func TestHintsAreFilteredAndOnlyTrustedDevicesWriteThem(t *testing.T) {
 	node.AllowLoopbackHints = false
 	t.Cleanup(func() { node.AllowLoopbackHints = true })
 	got := node.CleanHints([]string{
@@ -494,11 +527,13 @@ func TestHintsAreFilteredAndOnlyTrustedAdminsWriteThem(t *testing.T) {
 			t.Fatalf("got %v, want %v", got, want)
 		}
 	}
-	// Hints relayed by a device that is not an admin are not written to config.json.
+	// Hints relayed by a device that is not trusted to introduce are not written to config.json.
 	admin, relayed, n, nobody := newID(t), newID(t), newID(t), newID(t)
 	cfg := config.Default()
-	cfg.Devices = []config.Device{{ID: admin.ID, Admin: true}, {ID: nobody.ID}}
-	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: admin.ID}, config.FolderDevice{ID: nobody.ID})}
+	cfg.Devices = []config.Device{{ID: admin.ID, Full: true}, {ID: nobody.ID}}
+	sec, _ := seal.NewSecret()
+	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull, config.FolderDevice{ID: admin.ID}, config.FolderDevice{ID: nobody.ID, Relay: true})}
+	cfg.Folders[0].Secret = sec
 	m := member(t, n, cfg)
 	grants := []grant.Signed{signed(t, admin, grant.Grant{Subject: relayed.ID, Folders: []grant.Share{{ID: "docs"}}})}
 	m.Receive(nobody.ID, grants, map[string][]string{relayed.ID: {"203.0.113.9:22100"}})
@@ -532,7 +567,6 @@ func TestFolderIDsThatWindowsWouldMangleAreRefused(t *testing.T) {
 func TestConcurrentApprovalsDoNotRevokeEachOther(t *testing.T) {
 	admin := newID(t)
 	cfg := config.Default()
-	cfg.Admin = true
 	cfg.Folders = []config.Folder{folderCfg(t, "docs", config.RoleFull)}
 	sec, _ := seal.NewSecret()
 	cfg.Folders[0].Secret = sec

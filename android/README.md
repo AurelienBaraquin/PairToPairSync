@@ -14,8 +14,9 @@ Android avec `gomobile` (paquet [`../mobile`](../mobile)).
    appli de lecture de QR, ou **Coller un code**). L'application affiche avec qui et pour quel dossier, et
    **demande confirmation** : un lien ne peut jamais appairer le téléphone sans votre accord.
 3. Activer **Relais actif**. Un service au premier plan maintient la connexion (notification permanente).
-4. Pour qu'un autre ordinateur utilise aussi ce relais : **Afficher un QR code pour un ordinateur**, puis
-   `p2psync pair <code>` sur cet ordinateur.
+4. Les autres ordinateurs de vos dossiers sont présentés au téléphone par celui qui l'a appairé, et lui à eux :
+   rien à faire. Si besoin, **Afficher un QR code pour un ordinateur** puis `p2psync pair <code>` sur cet ordinateur
+   (cas d'un ordinateur qui n'est relié à aucun des autres).
 
 Réglages : *Wi‑Fi uniquement* (activé par défaut : pause sur données mobiles), découverte sur le réseau local,
 nom de l'appareil, limite de stockage et durée de rétention par dossier, appareils appairés, diagnostic

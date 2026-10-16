@@ -43,18 +43,16 @@ type Invite struct {
 	InviteeRelay bool   `json:"er,omitempty"` // the guest will be a relay for this folder
 	Exp          int64  `json:"x"`            // unix seconds
 
-	// Joining the inviter's whole network (version 2): the inviter is an admin and
-	// vouches for the guest in Folders (which are only shown to the guest; the real
-	// list is in the signed grant it receives). Admin: the guest becomes an admin
-	// too. Approve: the inviter's owner confirms each request by hand, so the guest
+	// Joining the inviter's whole network (version 2): the inviter, a full device,
+	// introduces the guest in Folders (which are only shown to the guest; the real
+	// list is in the signed introduction it receives). Approve: the inviter's owner confirms each request by hand, so the guest
 	// has to wait for an answer.
 	Net     bool     `json:"nw,omitempty"`
 	Folders []string `json:"fs,omitempty"`
-	Admin   bool     `json:"ad,omitempty"`
 	Approve bool     `json:"ap,omitempty"`
 }
 
-// MaxApprovalWait is how long a guest waits for an admin to approve its request.
+// MaxApprovalWait is how long a guest waits for the inviter's owner to approve its request.
 const MaxApprovalWait = 3 * time.Minute
 
 // NewToken returns a fresh random token.
@@ -88,7 +86,7 @@ func Decode(s string) (Invite, error) {
 	if i.V != 1 && i.V != 2 {
 		return Invite{}, fmt.Errorf("unsupported invitation version %d (update p2psync)", i.V)
 	}
-	if i.V == 1 && (i.Net || i.Admin || i.Approve || len(i.Folders) > 0) {
+	if i.V == 1 && (i.Net || i.Approve || len(i.Folders) > 0) {
 		return Invite{}, errors.New("malformed invitation")
 	}
 	if id, err := identity.Normalize(i.ID); err != nil {

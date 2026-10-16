@@ -78,11 +78,10 @@ func Start(ctx context.Context, home string, cfg *config.Config, id *identity.Id
 		log = slog.Default()
 	}
 	a := &App{Home: home, Cfg: cfg, Identity: id, log: log, Net: LoadMembership(home, id, log)}
-	if cfg.Admin {
-		// Describe this admin's configuration in signed grants before anyone connects.
-		if _, err := a.Net.IssueFromConfig(cfg); err != nil {
-			log.Warn("could not issue the network grants", "err", err)
-		}
+	// Describe the devices this one was paired with in signed introductions before
+	// anyone connects (a relay holds no full copy and introduces nobody).
+	if _, err := a.Net.IssueFromConfig(cfg); err != nil {
+		log.Warn("could not issue the introductions", "err", err)
 	}
 	stateDir := filepath.Join(home, "state")
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
@@ -160,13 +159,12 @@ type Status struct {
 	Addresses  []string        `json:"addresses"`
 	Folders    []any           `json:"folders"`
 	Peers      []node.PeerInfo `json:"peers"`
-	Admin      bool            `json:"admin"`
 	Requests   []Request       `json:"requests"`
 }
 
 func (a *App) Status() any {
 	st := Status{DeviceID: identity.Format(a.Identity.ID), DeviceName: a.Cfg.DeviceName, Addresses: a.Node.Addrs(), Peers: a.Node.Peers(),
-		Admin: a.Cfg.Admin, Requests: a.pairer.Requests()}
+		Requests: a.pairer.Requests()}
 	for _, h := range a.handlers {
 		st.Folders = append(st.Folders, h.Status())
 	}
@@ -219,13 +217,13 @@ func APIToken(home string) (string, error) {
 func (a *App) requestsForAPI() any { return a.pairer.Requests() }
 
 // netInviteForAPI creates a network invitation for the local web page.
-func (a *App) netInviteForAPI(folders []string, asRelay, admin, approve bool) (api.InviteResult, error) {
+func (a *App) netInviteForAPI(folders []string, asRelay, approve bool) (api.InviteResult, error) {
 	cfg, err := LoadConfig(a.Home)
 	if err != nil {
 		return api.InviteResult{}, err
 	}
 	inv, err := CreateNetworkInvite(a.Home, cfg, a.Identity.ID, a.Node.Addrs(),
-		NetworkInviteOptions{Folders: folders, AsRelay: asRelay, Admin: admin, Approve: approve})
+		NetworkInviteOptions{Folders: folders, AsRelay: asRelay, Approve: approve})
 	if err != nil {
 		return api.InviteResult{}, err
 	}
@@ -340,7 +338,7 @@ func (h *netHandler) Incoming(peerID string, g protocol.Grants) {
 	h.a.Net.Receive(peerID, g.List, g.Hints)
 }
 
-// Requests lists the devices waiting for this admin's decision to join the network.
+// Requests lists the devices waiting for this device's owner to let them join.
 func (a *App) Requests() []Request { return a.pairer.Requests() }
 
 // Decide accepts or declines one of them; it reports whether the request still existed.

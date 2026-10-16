@@ -1,23 +1,20 @@
-// Package grant lets an administrator device vouch for the other devices of the
-// network, so that a new device only has to connect to one admin instead of to
-// every device one by one.
+// Package grant lets the full devices of a network introduce the devices they were
+// paired with to each other, so that a new device only has to be paired with one
+// device instead of with every one of them.
 //
-// A grant is a statement signed with an admin's device key: "device S takes part
-// in these folders (as a full copy or as a relay), under this name". Any device
-// can check it with nothing but the issuer's ID (which is its public key); no
+// An introduction (a grant) is a statement signed with a device's key: "device S
+// takes part in these folders (as a full copy or as a relay), under this name".
+// Anyone can check it with nothing but the issuer's ID (which is its public key); no
 // server and no certificate authority is involved. Grants travel from device to
 // device inside the already authenticated and encrypted sessions.
 //
-// What an admin can and cannot do:
-//   - it can introduce devices to the folders it takes part in, and revoke them;
-//   - it can make another device an admin;
-//   - it cannot reach a folder it is not a member of, and a relay-only admin can
-//     never introduce a full copy (which would hand out the folder secret and
-//     defeat the blind relay): that rule is enforced by the receiver, see
-//     internal/app/membership.go.
-//
-// Whom a device trusts as admin is decided by its owner: the admin it paired
-// with is pinned explicitly. Further admins are those a trusted admin promoted.
+// Who may introduce whom:
+//   - only full devices introduce: a relay never has the folder secret, and a relay
+//     that could introduce a full copy would defeat that blindness (the receiver
+//     enforces it, see internal/app/membership.go);
+//   - a device only introduces others to the folders it is itself a member of;
+//   - a device trusts the full devices its owner paired it with, and those that a
+//     trusted device introduced as full devices in turn.
 package grant
 
 import (
@@ -44,7 +41,7 @@ const (
 	Version     = 1
 	maxBody     = 16 << 10
 	maxFolders  = 64
-	maxSubjects = 512
+	maxSubjects = 1024
 	// A clock that is wrong by more than this is not an honest clock.
 	maxFuture = 24 * time.Hour
 	domain    = "p2psync/grant/v1\n"
@@ -56,16 +53,17 @@ type Share struct {
 	Relay bool   `json:"relay,omitempty"` // the subject is a temporary relay for this folder
 }
 
-// Grant is what an admin says about one device. The highest Seq wins.
+// Grant is what one device says about another. The highest Seq of each issuer wins.
 type Grant struct {
-	V       int     `json:"v"`
-	Issuer  string  `json:"iss"`
-	Subject string  `json:"sub"`
-	Name    string  `json:"name,omitempty"`
-	Admin   bool    `json:"admin,omitempty"`
-	Folders []Share `json:"folders"`
-	Seq     int64   `json:"seq"` // unix nanoseconds when it was issued
-	Revoked bool    `json:"revoked,omitempty"`
+	V       int    `json:"v"`
+	Issuer  string `json:"iss"`
+	Subject string `json:"sub"`
+	Name    string `json:"name,omitempty"`
+	// Introducer: the subject is a full device that may introduce others in turn.
+	Introducer bool    `json:"intro,omitempty"`
+	Folders    []Share `json:"folders"`
+	Seq        int64   `json:"seq"` // unix nanoseconds when it was issued
+	Revoked    bool    `json:"revoked,omitempty"`
 }
 
 // Signed is a grant with its signature. Body is the exact signed JSON, kept as
@@ -108,7 +106,7 @@ func (g *Grant) validate() error {
 	if len(g.Folders) > maxFolders {
 		return errors.New("grant: too many folders")
 	}
-	if g.Revoked && (len(g.Folders) > 0 || g.Admin) {
+	if g.Revoked && (len(g.Folders) > 0 || g.Introducer) {
 		return errors.New("grant: a revocation carries no rights")
 	}
 	seen := map[string]bool{}
@@ -121,6 +119,15 @@ func (g *Grant) validate() error {
 	return nil
 }
 
+func (g Grant) hasFull() bool {
+	for _, f := range g.Folders {
+		if !f.Relay {
+			return true
+		}
+	}
+	return false
+}
+
 func (g Grant) newer(o Grant) bool {
 	if g.Seq != o.Seq {
 		return g.Seq > o.Seq
@@ -130,7 +137,7 @@ func (g Grant) newer(o Grant) bool {
 
 // SameRights reports whether two grants give the subject the same rights.
 func (g Grant) SameRights(o Grant) bool {
-	return g.Subject == o.Subject && g.Admin == o.Admin && g.Revoked == o.Revoked && g.Name == o.Name &&
+	return g.Subject == o.Subject && g.Introducer == o.Introducer && g.Revoked == o.Revoked && g.Name == o.Name &&
 		slices.Equal(g.Folders, o.Folders)
 }
 
@@ -200,30 +207,30 @@ func Verify(s Signed) (Grant, error) {
 
 // ---- the set of grants a device holds ------------------------------------------------
 
-// Grants are kept per (issuer, subject): each admin's statement about a device stands on
-// its own. What a device is granted is the union of what the trusted admins say, so
-// one admin narrowing or withdrawing its own grant cannot erase another's, and a
-// promoted admin cannot cut off the admin that promoted it.
+// Grants are kept per (issuer, subject): each device's statement about another stands on
+// its own. What a device is granted is the union of what the trusted devices say, so
+// one narrowing or withdrawing its own grant cannot erase another's, and a device
+// introduced by another cannot cut off the one that introduced it.
 func key(issuer, subject string) string { return issuer + "|" + subject }
 
 type entry struct {
 	Signed
 	g Grant
-	// What this device remembers about the grant it replaced. An admin that narrows a
+	// What this device remembers about the grant it replaced. A device that narrows a
 	// device to other folders must still be heard by the devices that knew it for the
 	// old ones (see Entry.Mentions).
-	prev      []string
-	prevAdmin bool
+	prev           []string
+	prevIntroducer bool
 }
 
 // stored is the on-disk form of an entry.
 type stored struct {
 	Signed
-	Prev      []string `json:"prev,omitempty"`
-	PrevAdmin bool     `json:"prev_admin,omitempty"`
+	Prev           []string `json:"prev,omitempty"`
+	PrevIntroducer bool     `json:"prev_intro,omitempty"`
 }
 
-// Set holds the newest grant of each admin for each device.
+// Set holds the newest grant of each issuer for each device.
 type Set struct {
 	mu   sync.Mutex
 	path string
@@ -247,7 +254,7 @@ func Load(path string) *Set {
 	for _, st := range list {
 		if g, err := Verify(st.Signed); err == nil && s.keep(st.Signed, g) {
 			e := s.m[key(g.Issuer, g.Subject)]
-			e.prev, e.prevAdmin = capFolders(st.Prev), st.PrevAdmin
+			e.prev, e.prevIntroducer = capFolders(st.Prev), st.PrevIntroducer
 			s.m[key(g.Issuer, g.Subject)] = e
 		}
 	}
@@ -275,7 +282,7 @@ func (s *Set) keep(sg Signed, g Grant) bool {
 	}
 	e := entry{Signed: sg, g: g}
 	if had {
-		e.prev, e.prevAdmin = cur.prev, cur.prevAdmin || cur.g.Admin
+		e.prev, e.prevIntroducer = cur.prev, cur.prevIntroducer || cur.g.Introducer
 		for _, f := range cur.g.Folders {
 			if !slices.Contains(e.prev, f.ID) {
 				e.prev = append(e.prev, f.ID)
@@ -300,9 +307,9 @@ func (s *Set) evict() {
 	}
 }
 
-// Trusted returns the admins this device obeys: those it pinned (its owner's
-// choice, including itself when it is an admin) and, transitively, those that a
-// trusted admin promoted with a grant.
+// Trusted returns the devices this device accepts introductions from: those it was
+// paired with as full devices (its owner's choice, and itself) and, transitively, the
+// full devices that a trusted device introduced as introducers.
 func (s *Set) Trusted(pinned map[string]bool) map[string]bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -319,7 +326,8 @@ func (s *Set) trustedLocked(pinned map[string]bool) map[string]bool {
 	for changed := true; changed; {
 		changed = false
 		for _, e := range s.m {
-			if sub := e.g.Subject; !t[sub] && e.g.Admin && !e.g.Revoked && t[e.g.Issuer] {
+			// An introducer must be a full device: a relay is never trusted to introduce.
+			if sub := e.g.Subject; !t[sub] && e.g.Introducer && !e.g.Revoked && e.g.hasFull() && t[e.g.Issuer] {
 				t[sub], changed = true, true
 			}
 		}
@@ -327,8 +335,8 @@ func (s *Set) trustedLocked(pinned map[string]bool) map[string]bool {
 	return t
 }
 
-// ErrUntrusted is returned for a grant whose issuer is not an admin we trust.
-var ErrUntrusted = errors.New("grant: issuer is not a trusted admin")
+// ErrUntrusted is returned for a grant whose issuer is not a device we trust to introduce.
+var ErrUntrusted = errors.New("grant: issuer is not a trusted introducer")
 
 // Offer adds a grant received from another device. It reports whether the set
 // changed. Invalid, forged, untrusted or outdated grants are refused.
@@ -348,7 +356,7 @@ func (s *Set) Offer(sg Signed, pinned map[string]bool, now time.Time) (Grant, bo
 	return g, s.keep(sg, g), nil
 }
 
-// Issue signs and stores a grant made by this device (an admin).
+// Issue signs and stores a grant made by this device.
 func (s *Set) Issue(priv crypto.PrivKey, g Grant, now time.Time) (Signed, Grant, error) {
 	pid, err := peer.IDFromPrivateKey(priv)
 	if err != nil {
@@ -381,7 +389,7 @@ func (s *Set) Issue(priv crypto.PrivKey, g Grant, now time.Time) (Signed, Grant,
 	return sg, parsed, nil
 }
 
-// By returns the newest grant that one admin made for a device.
+// By returns the newest grant that one device made for another.
 func (s *Set) By(issuer, subject string) (Grant, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -389,7 +397,7 @@ func (s *Set) By(issuer, subject string) (Grant, bool) {
 	return e.g, ok
 }
 
-// Latest returns the most recent grant of any admin about a device.
+// Latest returns the most recent grant of any issuer about a device.
 func (s *Set) Latest(subject string) (Grant, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -405,10 +413,10 @@ func (s *Set) Latest(subject string) (Grant, bool) {
 
 // Entry is a stored grant together with its parsed form.
 type Entry struct {
-	Signed    Signed
-	Grant     Grant
-	Prev      []string // folders the replaced grant listed
-	PrevAdmin bool     // an earlier grant made the subject an admin
+	Signed         Signed
+	Grant          Grant
+	Prev           []string // folders the replaced grant listed
+	PrevIntroducer bool     // an earlier grant made the subject an introducer
 }
 
 // Mentions reports whether the grant concerns any of the folders: those it lists now
@@ -433,7 +441,7 @@ func (s *Set) All() []Entry {
 	defer s.mu.Unlock()
 	out := make([]Entry, 0, len(s.m))
 	for _, e := range s.m {
-		out = append(out, Entry{e.Signed, e.g, slices.Clone(e.prev), e.prevAdmin})
+		out = append(out, Entry{e.Signed, e.g, slices.Clone(e.prev), e.prevIntroducer})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Grant.Subject != out[j].Grant.Subject {
@@ -449,7 +457,7 @@ func (s *Set) Save() error {
 	s.mu.Lock()
 	list := make([]stored, 0, len(s.m))
 	for _, e := range s.m {
-		list = append(list, stored{e.Signed, e.prev, e.prevAdmin})
+		list = append(list, stored{e.Signed, e.prev, e.prevIntroducer})
 	}
 	s.mu.Unlock()
 	sort.Slice(list, func(i, j int) bool { return bytes.Compare(list[i].Body, list[j].Body) < 0 })

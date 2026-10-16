@@ -32,7 +32,7 @@ data class EngineStatus(
     val storedTotal get() = folders.sumOf { it.storedBytes }
 }
 
-data class DeviceCfg(val id: String, val name: String, val admin: Boolean = false, val managed: Boolean = false)
+data class DeviceCfg(val id: String, val name: String, val managed: Boolean = false)
 
 data class FolderCfg(
     val id: String,
@@ -41,7 +41,7 @@ data class FolderCfg(
     val quotaMb: Long,
     val retentionHours: Int,
     val devices: List<DeviceCfg>,
-    val managed: Boolean = false, // granted by a network admin
+    val managed: Boolean = false, // introduced by the device this phone was paired with
 ) {
     val title get() = label.ifBlank { id }
 }
@@ -90,7 +90,7 @@ fun parseStatus(json: String): EngineStatus {
 fun parseConfig(json: String): AppConfig {
     val root = JSONObject(json)
     fun devices(a: JSONArray?) = a.objects {
-        DeviceCfg(it.optString("id"), it.optString("name"), it.optBoolean("admin"), it.optBoolean("managed"))
+        DeviceCfg(it.optString("id"), it.optString("name"), it.optBoolean("managed"))
     }
     return AppConfig(
         deviceName = root.optString("device_name"),
@@ -120,7 +120,7 @@ data class InviteInfo(
     val label: String,
     val forRelay: Boolean,
     val expiresAtSec: Long,
-    /** Joining the inviter's whole network: it becomes a trusted admin and chooses [folders]. */
+    /** Joining the inviter's whole network: it introduces this phone to its other devices, for [folders]. */
     val network: Boolean = false,
     val folders: List<String> = emptyList(),
     /** The inviter's owner has to accept the request: the phone waits for an answer. */

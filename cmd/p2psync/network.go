@@ -20,48 +20,6 @@ import (
 	"github.com/aurelienbaraquin/pairtopairsync/internal/pairing"
 )
 
-func cmdAdmin(home string, args []string) {
-	if len(args) == 0 {
-		fatal(fmt.Errorf("usage: admin enable|disable|promote <ID>|demote <ID>"))
-	}
-	switch args[0] {
-	case "enable", "disable":
-		cfg := loadForEdit(home)
-		cfg.Admin = args[0] == "enable"
-		check(app.SaveConfig(home, cfg))
-		if cfg.Admin {
-			fmt.Println("this device is now a network admin: it vouches for the devices it was paired with.")
-			fmt.Println("Create invitations with `p2psync invite --network`.")
-		} else {
-			fmt.Println("this device is no longer an admin. Grants it already issued stay valid; revoke a device with `device remove`.")
-		}
-	case "promote", "demote":
-		if len(args) != 2 {
-			fatal(fmt.Errorf("usage: admin %s <ID>", args[0]))
-		}
-		id, err := identity.Normalize(args[1])
-		check(err)
-		cfg := loadForEdit(home)
-		d := cfg.Device(id)
-		if d == nil {
-			fatal(fmt.Errorf("no such device: pair with it first"))
-		}
-		d.Admin = args[0] == "promote"
-		check(app.SaveConfig(home, cfg))
-		if d.Admin {
-			fmt.Printf("%s is now trusted as a network admin on this device", orID(d.Name, d.ID))
-			if cfg.Admin {
-				fmt.Print(", and the other devices will be told to trust it too")
-			}
-			fmt.Println(".")
-		} else {
-			fmt.Printf("%s is no longer trusted as an admin on this device.\n", orID(d.Name, d.ID))
-		}
-	default:
-		fatal(fmt.Errorf("unknown admin command %q", args[0]))
-	}
-}
-
 func orID(name, id string) string {
 	if name != "" {
 		return name
@@ -69,8 +27,8 @@ func orID(name, id string) string {
 	return identity.Format(id)
 }
 
-// cmdNetworkInvite prints a QR code for a network invitation.
-func cmdNetworkInvite(home string, cfg *config.Config, folders string, asRelay, admin, noApprove bool, png string, ttl time.Duration) {
+// cmdNetworkInvite prints a QR code that lets a new device join this device's network.
+func cmdNetworkInvite(home string, cfg *config.Config, folders string, asRelay, confirm bool, png string, ttl time.Duration) {
 	selfID, addrs, err := daemonStatus(home, cfg)
 	check(err)
 	var list []string
@@ -80,7 +38,7 @@ func cmdNetworkInvite(home string, cfg *config.Config, folders string, asRelay, 
 		}
 	}
 	inv, err := app.CreateNetworkInvite(home, cfg, selfID, addrs, app.NetworkInviteOptions{
-		Folders: list, AsRelay: asRelay, Admin: admin, Approve: !noApprove, TTL: ttl})
+		Folders: list, AsRelay: asRelay, Approve: confirm, TTL: ttl})
 	check(err)
 	code := inv.Encode()
 	qr, err := pairing.QRText(code)
@@ -96,10 +54,7 @@ func cmdNetworkInvite(home string, cfg *config.Config, folders string, asRelay, 
 	if asRelay {
 		role = "a temporary relay"
 	}
-	if admin {
-		role += " and an admin"
-	}
-	fmt.Printf("Invitation to this network: folders %s, as %s. Valid until %s, usable once.\n",
+	fmt.Printf("Invitation to your network: folders %s, as %s. Valid until %s, usable once.\n",
 		strings.Join(inv.Folders, ", "), role, time.Unix(inv.Exp, 0).Format("15:04:05"))
 	if inv.Approve {
 		fmt.Println("When the new device connects, accept it with `p2psync requests` / `p2psync accept <request>` (or on the local page).")
@@ -111,7 +66,7 @@ func cmdNetworkInvite(home string, cfg *config.Config, folders string, asRelay, 
 	fmt.Println("Treat it like a password. It lets a device ask to join: it can only be completed with this device's agreement.")
 }
 
-// cmdPairNetwork joins a network through an admin.
+// cmdPairNetwork joins the network of the device that made the code.
 func cmdPairNetwork(home string, inv pairing.Invite, dir string, yes bool) {
 	_, err := app.Init(home, "", 0, "")
 	check(err)
@@ -136,11 +91,8 @@ func cmdPairNetwork(home string, inv pairing.Invite, dir string, yes bool) {
 	if !yes {
 		fmt.Printf("%s (%s) invites this device to its network.\n", orID(inv.Name, inv.ID), identity.Format(inv.ID))
 		fmt.Printf("  folders offered : %s\n  stored in       : %s\n", strings.Join(inv.Folders, ", "), dir)
-		fmt.Println("  You will trust it as a network admin: it can introduce this device to its other devices,")
-		fmt.Println("  and it chooses what is shared with you. Only accept if you made this code yourself.")
-		if inv.Admin {
-			fmt.Println("  It also makes THIS device an admin.")
-		}
+		fmt.Println("  It will introduce this device to its other devices (and them to this one), and you will")
+		fmt.Println("  trust it to do so for the folders you share. Only accept if you made this code yourself.")
 		fmt.Print("Continue? [y/N] ")
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		if a := strings.ToLower(strings.TrimSpace(line)); a != "y" && a != "yes" {
@@ -150,11 +102,13 @@ func cmdPairNetwork(home string, inv pairing.Invite, dir string, yes bool) {
 	m := app.LoadMembership(home, id, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	check(app.PreflightNetwork(cfg, inv))
 
-	fmt.Printf("This device's ID is %s: the admin sees the same ID when it is asked to accept. Compare them.\n", identity.Format(id.ID))
+	if inv.Approve {
+		fmt.Printf("This device's ID is %s: the other device's owner sees the same ID in the request. Compare them.\n", identity.Format(id.ID))
+	}
 	fmt.Printf("Connecting to %s…\n", orID(inv.Name, inv.ID))
 	wait := 45 * time.Second
 	if inv.Approve {
-		fmt.Printf("The admin has to accept this request (up to %d minutes)…\n", int(pairing.MaxApprovalWait.Minutes()))
+		fmt.Printf("The other device's owner has to accept this request (up to %d minutes)…\n", int(pairing.MaxApprovalWait.Minutes()))
 		wait += pairing.MaxApprovalWait
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), wait)
@@ -170,7 +124,7 @@ func cmdPairNetwork(home string, inv pairing.Invite, dir string, yes bool) {
 		}
 	})
 	if jerr != nil {
-		fmt.Fprintf(os.Stderr, "The admin accepted this device, but the result could not be saved: %v\n", jerr)
+		fmt.Fprintf(os.Stderr, "The other device accepted this one, but the result could not be saved: %v\n", jerr)
 		fmt.Fprintf(os.Stderr, "Ask for a new invitation after fixing the problem above (the previous one is spent).\n")
 		os.Exit(1)
 	}
@@ -196,7 +150,6 @@ type request struct {
 	IP       string    `json:"ip"`
 	Folders  []string  `json:"folders"`
 	AsRelay  bool      `json:"as_relay"`
-	Admin    bool      `json:"admin"`
 	Since    time.Time `json:"since"`
 }
 
@@ -229,9 +182,6 @@ func cmdRequests(home string) {
 		extra := ""
 		if r.AsRelay {
 			extra += " as a relay"
-		}
-		if r.Admin {
-			extra += " and as an admin"
 		}
 		fmt.Printf("%s  %q wants to join%s\n    device %s  from %s\n    folders: %s\n    accept: p2psync accept %s   reject: p2psync reject %s\n",
 			r.ID, r.Name, extra, identity.Format(r.DeviceID), firstNonEmpty(r.IP, "a relayed connection"), strings.Join(r.Folders, ", "), r.ID, r.ID)
@@ -274,22 +224,15 @@ func cmdNetwork(home string) {
 	cfg := loadForEdit(home)
 	id, err := identity.LoadOrCreate(home)
 	check(err)
-	role := "member"
-	if cfg.Admin {
-		role = "admin"
-	}
-	fmt.Printf("This device: %s (%s), %s\n", cfg.DeviceName, identity.Format(id.ID), role)
+	fmt.Printf("This device: %s (%s)\n", cfg.DeviceName, identity.Format(id.ID))
 	if cfg.NetworkDir != "" {
-		fmt.Println("Folders granted by an admin are created in:", cfg.NetworkDir)
+		fmt.Println("Folders introduced by the device you paired with are created in:", cfg.NetworkDir)
 	}
 	fmt.Println("\nDevices:")
 	for _, d := range cfg.Devices {
 		var tags []string
-		if d.Admin {
-			tags = append(tags, "trusted admin")
-		}
 		if d.Managed {
-			tags = append(tags, "introduced by an admin")
+			tags = append(tags, "introduced by another device")
 		} else {
 			tags = append(tags, "paired directly")
 		}

@@ -20,7 +20,7 @@ func startTest(t *testing.T) (*Server, *int) {
 			*calls++
 			return InviteResult{Code: "p2psync://pair/x", PNG: []byte("png"), Expires: time.Now().Add(time.Minute)}, nil
 		},
-		NetInvite: func(folders []string, asRelay, admin, approve bool) (InviteResult, error) {
+		NetInvite: func(folders []string, asRelay, approve bool) (InviteResult, error) {
 			*calls++
 			return InviteResult{Code: "p2psync://pair/y", PNG: []byte("png"), Expires: time.Now().Add(time.Minute)}, nil
 		},

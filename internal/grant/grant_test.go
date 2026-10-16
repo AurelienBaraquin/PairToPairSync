@@ -28,7 +28,7 @@ var now = time.Unix(1_800_000_000, 0)
 
 func issue(t *testing.T, by dev, sub dev, admin bool, seq int64, folders ...Share) Signed {
 	t.Helper()
-	sg, err := Sign(by.key, Grant{Subject: sub.id, Admin: admin, Folders: folders, Seq: seq}, now)
+	sg, err := Sign(by.key, Grant{Subject: sub.id, Introducer: admin, Folders: folders, Seq: seq}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,5 +303,21 @@ func TestNarrowedGrantStillMentionsItsOldFolders(t *testing.T) {
 	}
 	if again := Load(s.path).All()[0]; !again.Mentions(map[string]bool{"F": true}) {
 		t.Fatal("the memory of old folders was not persisted")
+	}
+}
+
+// A relay is never trusted to introduce, whatever a grant claims about it.
+func TestARelayCannotBecomeAnIntroducer(t *testing.T) {
+	root, phone, n := newDev(t), newDev(t), newDev(t)
+	s := Load(filepath.Join(t.TempDir(), "g.json"))
+	trust := pin(root)
+	if _, _, err := s.Offer(issue(t, root, phone, true, 1, Share{ID: "docs", Relay: true}), trust, now); err != nil {
+		t.Fatal(err)
+	}
+	if s.Trusted(trust)[phone.id] {
+		t.Fatal("a relay-only device was made a trusted introducer")
+	}
+	if _, _, err := s.Offer(issue(t, phone, n, false, 2, Share{ID: "docs", Relay: true}), trust, now); err != ErrUntrusted {
+		t.Fatalf("a relay's introduction was accepted: %v", err)
 	}
 }
