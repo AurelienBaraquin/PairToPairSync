@@ -15,11 +15,11 @@ $Exe = (Resolve-Path -LiteralPath $Exe).Path
 
 $dataPath = if ($DataDir) { $DataDir } else { Join-Path $env:LOCALAPPDATA "p2psync" }
 $log = Join-Path $dataPath "p2psync.log"
-$args = @()
-if ($DataDir) { $args += "--home", "`"$DataDir`"" }
-$args += "run", "--log", "`"$log`""
+$argList = @()
+if ($DataDir) { $argList += "--home", "`"$DataDir`"" }
+$argList += "run", "--log", "`"$log`""
 
-$action   = New-ScheduledTaskAction -Execute $Exe -Argument ($args -join " ")
+$action   = New-ScheduledTaskAction -Execute $Exe -Argument ($argList -join " ")
 $trigger  = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) `

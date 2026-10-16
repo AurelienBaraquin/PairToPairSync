@@ -52,9 +52,9 @@ func ParseSecret(s string) ([]byte, error) {
 
 // Sealer holds the keys derived from a folder secret.
 type Sealer struct {
-	nameKey, metaKey, blockKey, idKey []byte
-	meta                              cipherAEAD
-	block                             cipherAEAD
+	nameKey, metaKey, blockKey, idKey, nonceKey []byte
+	meta                                        cipherAEAD
+	block                                       cipherAEAD
 }
 
 type cipherAEAD interface {
@@ -77,7 +77,7 @@ func New(secret string) (*Sealer, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Sealer{nameKey: derive(raw, "name"), metaKey: derive(raw, "meta"), blockKey: derive(raw, "block"), idKey: derive(raw, "blockid")}
+	s := &Sealer{nameKey: derive(raw, "name"), metaKey: derive(raw, "meta"), blockKey: derive(raw, "block"), idKey: derive(raw, "blockid"), nonceKey: derive(raw, "blocknonce")}
 	if s.meta, err = chacha20poly1305.NewX(s.metaKey); err != nil {
 		return nil, err
 	}
@@ -124,7 +124,8 @@ func (s *Sealer) BlockID(plainHash []byte) []byte {
 }
 
 func (s *Sealer) blockNonce(plainHash []byte) []byte {
-	m := hmac.New(sha256.New, s.blockKey)
+	// A key of its own: the encryption key is never also used as a MAC key.
+	m := hmac.New(sha256.New, s.nonceKey)
 	m.Write(plainHash)
 	return m.Sum(nil)[:s.block.NonceSize()]
 }

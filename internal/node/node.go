@@ -143,7 +143,7 @@ func New(o Options) *Node {
 			n.known[pid] = d
 			// Known before the host exists, so AutoRelay finds relay candidates at once.
 			for _, a := range d.Addresses {
-				n.disco[pid] = append(n.disco[pid], ParseAddr(a)...)
+				n.addDisco(pid, ParseAddr(a))
 			}
 		}
 	}
@@ -247,7 +247,9 @@ func (n *Node) libp2pOptions() []libp2p.Option {
 		opts = append(opts, libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			d, err := dht.New(gatedHost{Host: h, allow: n.isKnown},
 				dht.ProtocolPrefix("/p2psync"), // a private DHT: only our devices can join it
-				dht.Mode(dht.ModeAutoServer), dht.DisableProviders(), dht.DisableValues())
+				dht.Mode(dht.ModeAutoServer), dht.DisableProviders(), dht.DisableValues(),
+				// Only our own devices belong in the routing table.
+				dht.RoutingTableFilter(func(_ interface{}, p peer.ID) bool { return n.isKnown(p) }))
 			n.dht = d
 			return d, err
 		}))
@@ -455,9 +457,32 @@ func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	}
 	m.n.host.Peerstore().AddAddrs(pi.ID, pi.Addrs, peerstore.TempAddrTTL)
 	m.n.mu.Lock()
-	m.n.disco[pi.ID] = append(m.n.disco[pi.ID], pi.Addrs...)
+	m.n.addDisco(pi.ID, pi.Addrs)
 	m.n.mu.Unlock()
 	m.n.wake(pi.ID)
+}
+
+// maxDisco bounds the addresses remembered per device: mDNS repeats itself for
+// as long as the other device is on the network.
+const maxDisco = 32
+
+// addDisco remembers addresses of a known device, without duplicates. The
+// caller holds n.mu (or is still constructing the node).
+func (n *Node) addDisco(pid peer.ID, addrs []ma.Multiaddr) {
+	have := n.disco[pid]
+next:
+	for _, a := range addrs {
+		for _, h := range have {
+			if h.Equal(a) {
+				continue next
+			}
+		}
+		if len(have) >= maxDisco {
+			have = have[1:] // forget the oldest
+		}
+		have = append(have, a)
+	}
+	n.disco[pid] = have
 }
 
 func (n *Node) wake(pid peer.ID) {

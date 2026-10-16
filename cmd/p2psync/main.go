@@ -242,14 +242,22 @@ func cmdFolder(home string, args []string) {
 		fs.IntVar(&retention, "retention-hours", 0, "relay: drop undelivered changes after this many hours (default 720)")
 		pos := parse(fs, args[1:])
 		if len(pos) != 1 {
-			fatal(fmt.Errorf("usage: folder %s <PATH> [--id ID] [--device ID[:relay]]...", args[0]))
+			fatal(fmt.Errorf("usage: folder %s <PATH> [--id ID] [--device ID[:relay]]", args[0]))
 		}
 		role := config.RoleFull
 		if isRelay {
 			role = config.RoleRelay
 			if id == "" {
-				fatal(fmt.Errorf("a relay needs --id <folder ID> matching the folder it relays"))
+				fatal(fmt.Errorf("a relay needs --id with the ID of the folder it relays"))
 			}
+		}
+		if secretFile != "" {
+			if secret != "" {
+				fatal(fmt.Errorf("use either --secret or --secret-file"))
+			}
+			var err error
+			secret, err = readSecret(secretFile)
+			check(err)
 		}
 		cfg := loadForEdit(home)
 		sec, err := app.AddFolder(cfg, id, pos[0], role, quota, retention, secret)
@@ -265,7 +273,7 @@ func cmdFolder(home string, args []string) {
 		check(app.SaveConfig(home, cfg))
 		fmt.Printf("folder %q added (%s)\n", fid, role)
 		if sec != "" && secret == "" {
-			fmt.Printf("\nFolder secret (give it ONLY to your other full devices, with --secret; never to a relay):\n  %s\n", sec)
+			fmt.Printf("\nFolder secret (give it ONLY to your other full devices (--secret-file -); never to a relay):\n  %s\n", sec)
 		}
 	case "share":
 		fs := flag.NewFlagSet("folder share", flag.ExitOnError)
