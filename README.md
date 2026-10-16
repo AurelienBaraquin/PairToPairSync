@@ -196,3 +196,8 @@ make check     # gofmt + go vet (Linux et Windows) + tests
 make windows   # dist/p2psync.exe + dist/p2psyncd.exe
 make android   # bibliothèque Go (gomobile) + tests JVM + lint + APK de debug
 ```
+
+## Licence
+
+[MIT](LICENSE). Les dépendances (libp2p, fsnotify, x/crypto, ZXing, AndroidX…) ont leurs propres licences, toutes
+permissives (MIT, BSD ou Apache 2.0).
