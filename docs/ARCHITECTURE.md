@@ -14,7 +14,7 @@ internal/seal        chiffrement du relais : HKDF, HMAC, XChaCha20-Poly1305
 internal/model       vecteurs de versions, FileInfo, blocs SHA-256
 internal/pairing     invitations QR : format, jetons à usage unique, client d'appairage
 internal/identity    clé Ed25519, ID d'appareil = peer ID libp2p
-internal/api         page d'état locale (127.0.0.1)
+internal/api         page d'état locale (127.0.0.1, jeton, CSP) et création d'invitations
 mobile               API compatible gomobile
 ```
 
@@ -46,15 +46,22 @@ mobile               API compatible gomobile
    l'invitation (libp2p refuse un autre ID : l'invitant est authentifié) et ouvre le flux
    `/p2psync/1.0/pair` avec `{token, name, port}`.
 3. Côté invitant, le gater admet un inconnu **uniquement si** `invites/` contient une invitation non
-   expirée. Il peut parler le seul flux `pair` (les flux session/block/probe exigent un pair connu) ; au plus
-   4 inconnus simultanés, coupés après 20 s.
+   expirée (lecture mise en cache 1 s) et qu'il n'est pas banni. Il peut parler le seul flux `pair` (les
+   flux session/block/probe exigent un pair connu ; le DHT, enveloppé par `gatedHost`, ne répond qu'aux
+   appareils configurés). Limites : 6 inconnus simultanés dont 2 par IP, coupés après 15 s, un échange
+   `pair` à la fois par appareil, requête lue avec `RecvMax(4096)` (la taille est vérifiée avant toute
+   allocation).
 4. `Consume` supprime le fichier du jeton : la suppression est atomique, un seul des appelants
-   concurrents réussit (testé à 20 en parallèle). Après 5 échecs, `Purge` annule tout.
+   concurrents réussit (testé à 20 en parallèle). Les échecs sont comptés **par appareil** (3 → banni
+   10 min) ; une identité qui échoue ne peut donc pas annuler les invitations des autres.
 5. Si le jeton est valide, la réponse contient le nom, le dossier et — **seulement si l'invité est un
    appareil complet** — le secret. Le changement de configuration (`commit`) est exécuté 500 ms *après*
    l'envoi de la réponse, car il redémarre le démon.
 6. L'invité applique `PreflightJoin` **avant** de dépenser le jeton (dossier requis, rôles compatibles),
-   puis `Join` : ajout de l'appareil, création du dossier (ou refus si un autre secret existe déjà).
+   puis `Join`, qui ne fait pas confiance à l'invitant : la réponse doit porter sur le dossier invité, un
+   appareil complet doit recevoir un secret (identique à celui qu'il possède déjà s'il a le dossier), un relais
+   n'en reçoit jamais ; l'identifiant de dossier (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`) devient un nom de
+   fichier et est validé partout (`Decode`, `AddFolder`, `Validate`, `folder.New`).
 
 Cas gérés : invitant complet → invité complet (secret transmis) ; invitant complet → invité relais
 (pas de secret) ; invitant relais → invité complet (qui possède déjà le dossier et son secret). Un relais

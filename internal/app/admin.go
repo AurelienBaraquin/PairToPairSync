@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+	"slices"
 
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
@@ -58,14 +58,19 @@ func AddDevice(cfg *config.Config, ref, name string, addrs []string) error {
 	if addr != "" {
 		addrs = append(addrs, addr)
 	}
+	name = config.Clean(name)
 	if d := cfg.Device(id); d != nil {
 		if name != "" {
 			d.Name = name
 		}
-		d.Addresses = append(d.Addresses, addrs...)
+		for _, a := range addrs {
+			if !slices.Contains(d.Addresses, a) {
+				d.Addresses = append(d.Addresses, a)
+			}
+		}
 		return nil
 	}
-	cfg.Devices = append(cfg.Devices, config.Device{ID: id, Name: name, Addresses: addrs})
+	cfg.Devices = append(cfg.Devices, config.Device{ID: id, Name: name, Addresses: slices.Compact(addrs)})
 	return nil
 }
 
@@ -100,7 +105,10 @@ func ShareFolder(cfg *config.Config, folderID, rawDevID string, relay bool) erro
 // the user once. A relay never gets one.
 func AddFolder(cfg *config.Config, id, path, role string, quotaMB int64, retentionHours int, secret string) (string, error) {
 	if id == "" {
-		id = strings.ToLower(filepath.Base(path))
+		id = config.SlugID(filepath.Base(path))
+	}
+	if !config.ValidFolderID(id) {
+		return "", fmt.Errorf("invalid folder id %q: use 1-64 letters, digits, '.', '_' or '-'", id)
 	}
 	if cfg.Folder(id) != nil {
 		return "", fmt.Errorf("folder %q already exists", id)
@@ -122,7 +130,7 @@ func AddFolder(cfg *config.Config, id, path, role string, quotaMB int64, retenti
 		return "", err
 	}
 	cfg.Folders = append(cfg.Folders, config.Folder{
-		ID: id, Label: filepath.Base(abs), Path: abs, Role: role, QuotaMB: quotaMB, RetentionHours: retentionHours, Secret: secret,
+		ID: id, Label: config.Clean(filepath.Base(abs)), Path: abs, Role: role, QuotaMB: quotaMB, RetentionHours: retentionHours, Secret: secret,
 	})
 	return secret, nil
 }

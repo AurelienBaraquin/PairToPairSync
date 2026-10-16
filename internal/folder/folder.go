@@ -77,6 +77,9 @@ type Folder struct {
 
 // New creates the engine. stateDir is where the index of this folder is kept.
 func New(cfg config.Folder, selfID, stateDir string, log *slog.Logger) (*Folder, error) {
+	if !config.ValidFolderID(cfg.ID) { // it becomes part of a file name
+		return nil, fmt.Errorf("invalid folder id %q", cfg.ID)
+	}
 	store, err := openStore(filepath.Join(stateDir, "index-"+cfg.ID+".json"))
 	if err != nil {
 		return nil, fmt.Errorf("open index: %w", err)

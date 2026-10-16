@@ -51,6 +51,7 @@ Pairing with a QR code (no IDs to copy, the folder secret is handed over securel
 Running:
   run                                   run the sync daemon in the foreground
   status                                show what the running daemon is doing
+  ui                                    print the link of the local web page (status, QR invitations)
   version
 
 The daemon reloads its configuration automatically when config.json changes.
@@ -86,6 +87,8 @@ func main() {
 		cmdDevice(home, args)
 	case "folder":
 		cmdFolder(home, args)
+	case "ui":
+		cmdUI(home)
 	case "invite":
 		cmdInvite(home, args)
 	case "pair":
@@ -248,7 +251,7 @@ func cmdFolder(home string, args []string) {
 		check(err)
 		fid := id
 		if fid == "" {
-			fid = strings.ToLower(filepath.Base(pos[0]))
+			fid = config.SlugID(filepath.Base(pos[0]))
 		}
 		for _, d := range devs {
 			dev, isRel := strings.CutSuffix(d, ":relay")
@@ -361,7 +364,7 @@ func status(home string) error {
 	if addr == "" || addr == "-" {
 		return fmt.Errorf("status API is disabled in the configuration")
 	}
-	resp, err := http.Get("http://" + addr + "/api/status")
+	resp, err := apiGet(home, addr)
 	if err != nil {
 		return fmt.Errorf("daemon not reachable at %s (is `p2psync run` started?)", addr)
 	}
@@ -416,11 +419,11 @@ func num(v any) float64 { f, _ := v.(float64); return f }
 // ---- QR pairing ---------------------------------------------------------------------
 
 // daemonStatus fetches the running daemon's status document.
-func daemonStatus(cfg *config.Config) (id string, addrs []string, err error) {
+func daemonStatus(home string, cfg *config.Config) (id string, addrs []string, err error) {
 	if cfg.APIAddr == "" || cfg.APIAddr == "-" {
 		return "", nil, fmt.Errorf("the status API is disabled in the configuration; it is needed to learn this device's addresses")
 	}
-	resp, err := http.Get("http://" + cfg.APIAddr + "/api/status")
+	resp, err := apiGet(home, cfg.APIAddr)
 	if err != nil {
 		return "", nil, pairing.ErrNoDaemon
 	}
@@ -453,7 +456,7 @@ func cmdInvite(home string, args []string) {
 		}
 		folder = cfg.Folders[0].ID
 	}
-	selfID, addrs, err := daemonStatus(cfg)
+	selfID, addrs, err := daemonStatus(home, cfg)
 	check(err)
 	inv, err := app.CreateInvite(home, cfg, selfID, addrs, folder, asRelay, ttl)
 	check(err)
@@ -535,4 +538,30 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// apiGet queries the daemon's status endpoint with the local access token.
+func apiGet(home, addr string) (*http.Response, error) {
+	tok, err := app.APIToken(home)
+	if err != nil {
+		return nil, err
+	}
+	req, _ := http.NewRequest("GET", "http://"+addr+"/api/status", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil && resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("daemon answered %s", resp.Status)
+	}
+	return resp, err
+}
+
+func cmdUI(home string) {
+	cfg := loadForEdit(home)
+	tok, err := app.APIToken(home)
+	check(err)
+	if cfg.APIAddr == "" || cfg.APIAddr == "-" {
+		fatal(fmt.Errorf("the status page is disabled in the configuration"))
+	}
+	fmt.Printf("Open this link in your browser (it contains your local access token):\n  http://%s/#t=%s\n", cfg.APIAddr, tok)
 }

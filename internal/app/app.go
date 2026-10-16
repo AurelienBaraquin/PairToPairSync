@@ -4,10 +4,13 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/aurelienbaraquin/pairtopairsync/internal/api"
@@ -74,7 +77,7 @@ func Start(ctx context.Context, home string, cfg *config.Config, id *identity.Id
 	}
 
 	opts := node.Options{Config: cfg, Identity: id, Handlers: a.handlers, Logger: log, RedialMax: RedialMax,
-		Pairing: newPairer(home)}
+		Pairing: newPairer(home, log)}
 	if NodeHook != nil {
 		NodeHook(&opts)
 	}
@@ -84,7 +87,12 @@ func Start(ctx context.Context, home string, cfg *config.Config, id *identity.Id
 		return nil, err
 	}
 	if cfg.APIAddr != "" && cfg.APIAddr != "-" {
-		srv, err := api.Start(cfg.APIAddr, a.Status, a.inviteForAPI, log)
+		tok, terr := APIToken(home)
+		if terr != nil {
+			log.Warn("status API unavailable", "err", terr)
+			return a, nil
+		}
+		srv, err := api.Start(cfg.APIAddr, tok, a.Status, a.inviteForAPI, log)
 		if err != nil {
 			log.Warn("status API unavailable", "err", err)
 		} else {
@@ -136,4 +144,23 @@ func (a *App) inviteForAPI(folder string, asRelay bool) (api.InviteResult, error
 		return api.InviteResult{}, err
 	}
 	return api.InviteResult{Code: code, PNG: png, Expires: time.Unix(inv.Exp, 0)}, nil
+}
+
+// APIToken returns the secret that protects the local status API, creating it
+// (0600) on first use. Only someone who can read the user's config directory can
+// talk to the API.
+func APIToken(home string) (string, error) {
+	path := filepath.Join(home, "api-token")
+	if b, err := os.ReadFile(path); err == nil && len(b) >= 32 {
+		return strings.TrimSpace(string(b)), nil
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	tok := hex.EncodeToString(raw)
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return "", err
+	}
+	return tok, os.WriteFile(path, []byte(tok), 0o600)
 }

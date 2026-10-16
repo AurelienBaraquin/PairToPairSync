@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
 )
 
@@ -79,9 +80,19 @@ func Decode(s string) (Invite, error) {
 	} else {
 		i.ID = id
 	}
-	if i.Token == "" || i.Folder == "" || len(i.Addrs) > 8 {
+	if i.Token == "" || len(i.Token) > 64 || len(i.Addrs) > 8 {
 		return Invite{}, errors.New("malformed invitation")
 	}
+	for _, a := range i.Addrs {
+		if len(a) > 300 {
+			return Invite{}, errors.New("malformed invitation")
+		}
+	}
+	// Names and IDs come from whoever made the QR code: treat them as hostile.
+	if !config.ValidFolderID(i.Folder) {
+		return Invite{}, errors.New("the invitation names an invalid folder")
+	}
+	i.Name, i.Label = config.Clean(i.Name), config.Clean(i.Label)
 	if i.InviterRelay && i.InviteeRelay {
 		return Invite{}, errors.New("a relay cannot invite another relay")
 	}

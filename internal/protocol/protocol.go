@@ -186,13 +186,18 @@ func (c *Conn) Send(t Type, hdr any, body []byte) error {
 }
 
 // Recv reads one frame.
-func (c *Conn) Recv() (t Type, hdr, body []byte, err error) {
+func (c *Conn) Recv() (t Type, hdr, body []byte, err error) { return c.RecvMax(MaxFrame) }
+
+// RecvMax reads one frame of at most max bytes. The size is checked before
+// anything is allocated, so a peer that has not authenticated yet cannot make
+// us buffer megabytes by merely claiming a large frame.
+func (c *Conn) RecvMax(max int) (t Type, hdr, body []byte, err error) {
 	var p [4]byte
 	if _, err = io.ReadFull(c.r, p[:]); err != nil {
 		return
 	}
 	total := binary.BigEndian.Uint32(p[:])
-	if total < 5 || total > MaxFrame {
+	if total < 5 || total > uint32(max) {
 		return 0, nil, nil, fmt.Errorf("bad frame length %d", total)
 	}
 	buf := make([]byte, total)

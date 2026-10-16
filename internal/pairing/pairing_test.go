@@ -115,3 +115,21 @@ func TestQRRendering(t *testing.T) {
 		t.Fatalf("png QR: %v", err)
 	}
 }
+
+func TestDecodeSanitisesHostileInvitations(t *testing.T) {
+	for _, folder := range []string{"x/../../../tmp/y", "../x", "a/b", "", ".", "a b"} {
+		if _, err := Decode(Invite{V: 1, ID: id, Token: "t", Folder: folder}.Encode()); err == nil {
+			t.Errorf("folder id %q accepted", folder)
+		}
+	}
+	inv, err := Decode(Invite{V: 1, ID: id, Token: "t", Folder: "docs", Name: "<script>x</script>", Label: `"><img src=x>`}.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(inv.Name+inv.Label, `<>"`) {
+		t.Fatalf("markup survived: %q %q", inv.Name, inv.Label)
+	}
+	if _, err := Decode(Invite{V: 1, ID: id, Token: strings.Repeat("a", 200), Folder: "d"}.Encode()); err == nil {
+		t.Error("oversized token accepted")
+	}
+}

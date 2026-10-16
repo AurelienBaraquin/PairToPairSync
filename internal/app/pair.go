@@ -3,12 +3,12 @@ package app
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 
@@ -16,39 +16,80 @@ import (
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/pairing"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/protocol"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/seal"
 )
 
 // ---- inviter side -------------------------------------------------------------------
+
+// cfgMu serialises read-modify-write cycles of config.json made by the daemon.
+var cfgMu sync.Mutex
+
+const (
+	maxBadTokens = 3                // failures before a device is shut out
+	banDuration  = 10 * time.Minute // ... for this long
+)
 
 // pairer answers invitations on behalf of the running daemon.
 type pairer struct {
 	home  string
 	store *pairing.Store
+	log   *slog.Logger
 
-	mu    sync.Mutex
-	fails int
+	mu       sync.Mutex
+	fails    map[peer.ID]int
+	banned   map[peer.ID]time.Time
+	cachedAt time.Time
+	cached   bool
 }
 
-func newPairer(home string) *pairer { return &pairer{home: home, store: pairing.NewStore(home)} }
+func newPairer(home string, log *slog.Logger) *pairer {
+	return &pairer{home: home, store: pairing.NewStore(home), log: log,
+		fails: map[peer.ID]int{}, banned: map[peer.ID]time.Time{}}
+}
 
-func (p *pairer) Active() bool { return p.store.Active(time.Now()) }
+// Active is consulted on every inbound handshake from a stranger. A positive
+// answer is cached for a second (reading and parsing invitation files is the
+// costly part, and a scanner could otherwise force it); a negative one never is,
+// so a freshly created invitation is honoured immediately and an empty directory
+// costs almost nothing to re-check.
+func (p *pairer) Active() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	if p.cached && now.Sub(p.cachedAt) < time.Second {
+		return true
+	}
+	p.cached, p.cachedAt = p.store.Active(now), now
+	return p.cached
+}
 
-const maxBadTokens = 5
+func (p *pairer) Banned(id peer.ID) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	until, ok := p.banned[id]
+	return ok && time.Now().Before(until)
+}
+
+// fail records a bad token. Failures are counted per device, never globally: a
+// stranger must not be able to cancel everybody's invitations just by failing.
+func (p *pairer) fail(id peer.ID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.fails) > 1000 || len(p.banned) > 1000 { // bound memory against identity floods
+		p.fails, p.banned = map[peer.ID]int{}, map[peer.ID]time.Time{}
+	}
+	if p.fails[id]++; p.fails[id] >= maxBadTokens {
+		p.banned[id] = time.Now().Add(banDuration)
+		delete(p.fails, id)
+	}
+}
 
 func (p *pairer) Accept(remote peer.ID, remoteIP string, req protocol.PairRequest) (protocol.PairResponse, func()) {
-	p.mu.Lock()
 	pend, ok := p.store.Consume(req.Token, time.Now())
 	if !ok {
-		p.fails++
-		if p.fails >= maxBadTokens { // someone is guessing: cancel every invitation
-			p.store.Purge()
-			p.fails = 0
-		}
-		p.mu.Unlock()
+		p.fail(remote)
 		return protocol.PairResponse{Err: "invalid, expired or already used invitation"}, nil
 	}
-	p.fails = 0
-	p.mu.Unlock()
 
 	cfg, err := LoadConfig(p.home)
 	if err != nil {
@@ -65,37 +106,32 @@ func (p *pairer) Accept(remote peer.ID, remoteIP string, req protocol.PairReques
 		resp.Secret = f.Secret // only a full guest ever receives the folder secret
 	}
 
-	guestName := cleanName(req.Name)
+	guestName := config.Clean(req.Name)
 	var addr string
 	if remoteIP != "" && req.Port > 0 && req.Port < 65536 {
 		addr = net.JoinHostPort(remoteIP, strconv.Itoa(req.Port))
 	}
 	commit := func() {
+		cfgMu.Lock()
+		defer cfgMu.Unlock()
 		cfg, err := LoadConfig(p.home)
+		if err == nil {
+			var addrs []string
+			if addr != "" {
+				addrs = []string{addr}
+			}
+			if err = AddDevice(cfg, remote.String(), guestName, addrs); err == nil {
+				err = ShareFolder(cfg, pend.Folder, remote.String(), guestRelay)
+			}
+			if err == nil {
+				err = SaveConfig(p.home, cfg) // the daemon notices and reloads
+			}
+		}
 		if err != nil {
-			return
+			p.log.Error("pairing succeeded but the device could not be recorded; run the invitation again", "err", err)
 		}
-		var addrs []string
-		if addr != "" {
-			addrs = []string{addr}
-		}
-		if AddDevice(cfg, remote.String(), guestName, addrs) != nil ||
-			ShareFolder(cfg, pend.Folder, remote.String(), guestRelay) != nil {
-			return
-		}
-		_ = SaveConfig(p.home, cfg) // the daemon notices and reloads
 	}
 	return resp, commit
-}
-
-func cleanName(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if unicode.IsPrint(r) && b.Len() < 64 {
-			b.WriteRune(r)
-		}
-	}
-	return strings.TrimSpace(b.String())
 }
 
 // CreateInvite issues a single-use invitation for folderID. addrs are the
@@ -120,6 +156,7 @@ func CreateInvite(home string, cfg *config.Config, selfID string, addrs []string
 	if ttl <= 0 {
 		ttl = pairing.DefaultTTL
 	}
+	ttl = min(ttl, 24*time.Hour)
 	exp := time.Now().Add(ttl)
 	inv := pairing.Invite{V: 1, ID: selfID, Name: cfg.DeviceName, Addrs: sel, Token: tok, Folder: f.ID, Label: f.Label,
 		InviterRelay: inviterRelay, InviteeRelay: asRelay, Exp: exp.Unix()}
@@ -200,20 +237,36 @@ func PreflightJoin(cfg *config.Config, inv pairing.Invite, o JoinOptions) error 
 	return nil
 }
 
-// Join applies the inviter's answer to the local configuration.
+// Join applies the inviter's answer to the local configuration. The answer is
+// checked against the invitation first: whoever made the QR code is not trusted.
 func Join(cfg *config.Config, inv pairing.Invite, resp protocol.PairResponse, o JoinOptions) error {
-	name := resp.Name
+	if resp.Folder != inv.Folder {
+		return errors.New("the other device answered about a different folder than the one it invited us to")
+	}
+	switch {
+	case inv.InviteeRelay && resp.Secret != "", inv.InviterRelay && resp.Secret != "":
+		return errors.New("a relay must never be given the folder secret; refusing")
+	case !inv.InviteeRelay && !inv.InviterRelay && resp.Secret == "":
+		return errors.New("the other device did not provide the folder secret")
+	}
+	if resp.Secret != "" {
+		if _, err := seal.ParseSecret(resp.Secret); err != nil {
+			return err
+		}
+	}
+	name := config.Clean(resp.Name)
 	if name == "" {
 		name = inv.Name
 	}
-	var addrs []string
-	for _, a := range inv.Addrs {
-		addrs = append(addrs, a)
+	f := cfg.Folder(inv.Folder)
+	// A full device that already has this folder must receive the very same
+	// secret: that is what proves the inviter really belongs to it.
+	if f != nil && f.Role == config.RoleFull && !inv.InviterRelay && f.Secret != "" && f.Secret != resp.Secret {
+		return fmt.Errorf("folder %q already has a different secret on this device; refusing to mix two folders", inv.Folder)
 	}
-	if err := AddDevice(cfg, inv.ID, name, addrs); err != nil {
+	if err := AddDevice(cfg, inv.ID, name, inv.Addrs); err != nil {
 		return err
 	}
-	f := cfg.Folder(inv.Folder)
 	if f == nil {
 		role, secret := config.RoleFull, resp.Secret
 		if inv.InviteeRelay {
@@ -222,10 +275,8 @@ func Join(cfg *config.Config, inv pairing.Invite, resp protocol.PairResponse, o 
 		if _, err := AddFolder(cfg, inv.Folder, o.Path, role, o.QuotaMB, 0, secret); err != nil {
 			return err
 		}
-		cfg.Folder(inv.Folder).Label = inv.Label
-	} else if resp.Secret != "" && f.Secret != "" && f.Secret != resp.Secret {
-		return fmt.Errorf("folder %q already has a different secret on this device; refusing to mix two folders", inv.Folder)
-	} else if resp.Secret != "" && f.Secret == "" && f.Role == config.RoleFull {
+		cfg.Folder(inv.Folder).Label = config.Clean(inv.Label)
+	} else if f.Role == config.RoleFull && f.Secret == "" && resp.Secret != "" {
 		f.Secret = resp.Secret
 	}
 	return ShareFolder(cfg, inv.Folder, inv.ID, inv.InviterRelay)

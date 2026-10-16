@@ -116,14 +116,19 @@ func (c *Config) Validate() error {
 			return err
 		}
 		c.Devices[i].ID = id
+		c.Devices[i].Name = Clean(c.Devices[i].Name)
 		known[id] = true
 	}
 	seen := map[string]bool{}
 	for i := range c.Folders {
 		f := &c.Folders[i]
-		if f.ID == "" || f.Path == "" {
-			return errors.New("folder needs an id and a path")
+		if f.Path == "" {
+			return errors.New("folder needs a path")
 		}
+		if !ValidFolderID(f.ID) {
+			return fmt.Errorf("invalid folder id %q: use 1-64 letters, digits, '.', '_' or '-'", f.ID)
+		}
+		f.Label = Clean(f.Label)
 		if seen[f.ID] {
 			return fmt.Errorf("duplicate folder id %q", f.ID)
 		}

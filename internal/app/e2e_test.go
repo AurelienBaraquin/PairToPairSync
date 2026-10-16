@@ -838,14 +838,36 @@ func TestQRRejectsReuseExpiryAndBadTokens(t *testing.T) {
 		t.Fatal("a device with a bad token was added to the configuration")
 	}
 
-	// Guessing is punished: after repeated failures every invitation is cancelled.
-	for i := 0; i < 6; i++ {
-		gx, cx := freshGuest(t, root, fmt.Sprintf("X%d", i))
-		_, _ = scan(gx, cx, forged)
+	// A device that keeps presenting wrong tokens is shut out...
+	bad, badCfg := freshGuest(t, root, "Bad")
+	for i := 0; i < 3; i++ {
+		_, _ = scan(bad, badCfg, forged)
 	}
+	if _, err := scan(bad, badCfg, valid); err == nil {
+		t.Fatal("a banned device got in, even with a valid token")
+	}
+	// ...but it cannot cancel anybody else's invitation: a stranger must not be
+	// able to deny pairing to the real guest just by failing on purpose.
 	g5, c5 := freshGuest(t, root, "G5")
-	if _, err := scan(g5, c5, valid); err == nil {
-		t.Fatal("outstanding invitation survived a brute-force attempt")
+	if _, err := scan(g5, c5, valid); err != nil {
+		t.Fatalf("the legitimate guest was locked out by someone else's failures: %v", err)
+	}
+}
+
+// A malicious QR code cannot plant files outside the state directory.
+func TestInvitationWithTraversalFolderIDIsRejected(t *testing.T) {
+	root := t.TempDir()
+	a := newDev(t, root, "A", false)
+	a.start(t)
+	inv := a.invite(t, false, 0)
+	inv.Folder = "x/../../../../tmp/pwned"
+	if _, err := pairing.Decode(inv.Encode()); err == nil {
+		t.Fatal("invitation with a traversal folder id decoded")
+	}
+	g, gc := freshGuest(t, root, "G")
+	err := app.Join(gc, inv, protocol.PairResponse{OK: true, Folder: inv.Folder, Secret: testSecret}, app.JoinOptions{Path: g.dir})
+	if err == nil {
+		t.Fatal("Join accepted a traversal folder id")
 	}
 }
 
@@ -859,5 +881,70 @@ func TestQRNoInvitationNoEntry(t *testing.T) {
 	g, gc := freshGuest(t, root, "G")
 	if _, err := scan(g, gc, inv); err == nil {
 		t.Fatal("stranger paired without an outstanding invitation")
+	}
+}
+
+func TestJoinDoesNotTrustTheInviter(t *testing.T) {
+	root := t.TempDir()
+	mk := func() (*config.Config, string) {
+		g, cfg := freshGuest(t, root, fmt.Sprintf("J%d", time.Now().UnixNano()))
+		return cfg, g.dir
+	}
+	base := pairing.Invite{V: 1, ID: "12D3KooWDAKocJYhkhxMyDZ4SL1SRTvkUagXCVpapAsz788yQNqX", Token: "t", Folder: "docs", Label: `<b>x</b>`}
+	good := protocol.PairResponse{OK: true, Folder: "docs", Secret: testSecret, Name: "<script>alert(1)</script>PC"}
+
+	// Sanity: a normal full-device join works, and hostile text is neutralised.
+	cfg, dir := mk()
+	if err := app.Join(cfg, base, good, app.JoinOptions{Path: dir}); err != nil {
+		t.Fatal(err)
+	}
+	if l := cfg.Folder("docs").Label; strings.ContainsAny(l, "<>") {
+		t.Fatalf("label not cleaned: %q", l)
+	}
+	if n := cfg.Devices[0].Name; strings.ContainsAny(n, "<>") {
+		t.Fatalf("device name not cleaned: %q", n)
+	}
+
+	cases := map[string]func() (pairing.Invite, protocol.PairResponse, func(*config.Config)){
+		"answer about another folder": func() (pairing.Invite, protocol.PairResponse, func(*config.Config)) {
+			r := good
+			r.Folder = "other"
+			return base, r, nil
+		},
+		"full guest receives no secret": func() (pairing.Invite, protocol.PairResponse, func(*config.Config)) {
+			r := good
+			r.Secret = ""
+			return base, r, nil
+		},
+		"relay guest is sent the secret": func() (pairing.Invite, protocol.PairResponse, func(*config.Config)) {
+			i := base
+			i.InviteeRelay = true
+			return i, good, nil
+		},
+		"a relay inviter sends a secret": func() (pairing.Invite, protocol.PairResponse, func(*config.Config)) {
+			i := base
+			i.InviterRelay = true
+			return i, good, nil
+		},
+		"existing folder, different secret": func() (pairing.Invite, protocol.PairResponse, func(*config.Config)) {
+			return base, good, func(c *config.Config) {
+				c.Folders = []config.Folder{{ID: "docs", Path: dir, Role: config.RoleFull, Secret: "ZZECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"}}
+			}
+		},
+		"invalid secret": func() (pairing.Invite, protocol.PairResponse, func(*config.Config)) {
+			r := good
+			r.Secret = "not-a-secret"
+			return base, r, nil
+		},
+	}
+	for name, build := range cases {
+		cfg, _ := mk()
+		inv, resp, prep := build()
+		if prep != nil {
+			prep(cfg)
+		}
+		if err := app.Join(cfg, inv, resp, app.JoinOptions{Path: dir}); err == nil {
+			t.Errorf("%s: Join accepted it", name)
+		}
 	}
 }

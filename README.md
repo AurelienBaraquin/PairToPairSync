@@ -43,8 +43,9 @@ p2psync invite --as-relay
 #   (téléphone) p2psync invite     ->     (portable) p2psync pair <texte du QR>
 ```
 
-Le QR code est aussi disponible dans la page d'état locale (<http://127.0.0.1:8384>, bouton
-« Inviter un appareil »). Un téléphone scanne le QR avec son appareil photo ; le texte qu'il affiche
+Le QR code est aussi disponible dans la page d'état locale : `p2psync ui` affiche son lien (il contient un
+jeton d'accès propre à votre session, lu dans un fichier `0600` — un autre compte de la machine ne peut
+ni lire l'état ni créer d'invitation), bouton « Inviter un appareil ». Un téléphone scanne le QR avec son appareil photo ; le texte qu'il affiche
 (`p2psync://pair/…`) se colle dans `p2psync pair`. Une future application Android pourra ouvrir ce lien
 directement.
 
@@ -54,7 +55,8 @@ l'invitant (dont l'identité est vérifiée par sa clé : personne ne peut se fa
 le jeton, et les deux appareils s'ajoutent mutuellement. Si l'invité est un appareil complet, le **secret
 du dossier** lui est remis dans ce canal chiffré ; si c'est un relais, il ne le reçoit **jamais**. Rien
 n'est à recopier à la main. Traitez le QR comme un mot de passe : quiconque le voit avant son expiration
-peut rejoindre le dossier. Après 5 jetons erronés, toutes les invitations sont annulées.
+peut rejoindre le dossier. Un appareil qui présente 3 jetons erronés est
+refusé pendant 10 minutes, sans pouvoir gêner les autres invités.
 
 Le démon recharge `config.json` tout seul. Les commandes manuelles (`device add`, `folder add --secret`,
 `folder add-relay`…) restent disponibles : voir `p2psync` sans argument.
@@ -68,8 +70,9 @@ Le démon recharge `config.json` tout seul. Les commandes manuelles (`device add
 | Contrôle d'accès | Un appareil **absent de la configuration est refusé pendant la poignée de main**, avant tout échange. |
 | Intégrité | Chaque bloc de fichier est vérifié par SHA-256 ; les chemins reçus sont validés (pas de `..`, pas de liens symboliques suivis). |
 | Relais | **Chiffré de bout en bout, à connaissance nulle** (ci-dessous). |
-| Appairage | Invitation à usage unique (128 bits, 10 min). Les inconnus ne sont acceptés **que pendant une invitation**, 4 au plus, 20 s au plus, et ne peuvent faire qu'une chose : présenter le jeton. |
-| Page locale | Écoute sur `127.0.0.1` seulement ; refuse tout en-tête `Host` non local (anti DNS-rebinding) ; la création d'invitation exige une requête POST JSON de même origine. |
+| Appairage | Invitation à usage unique (128 bits, 10 min). Les inconnus ne sont acceptés **que pendant une invitation**, 6 au plus (2 par adresse IP), 15 s au plus, un seul échange à la fois, et ne peuvent faire qu'une chose : présenter le jeton (requête limitée à 4 Ko). L'annuaire DHT leur est fermé. |
+| Contenu venu d'un autre appareil | Identifiants de dossier, noms et libellés sont validés/filtrés (pas de `/`, `..`, ni balisage) ; un invité vérifie la réponse de l'invitant avant d'appliquer quoi que ce soit. |
+| Page locale | `127.0.0.1` seulement ; jeton d'accès obligatoire ; refuse tout `Host` non local (anti DNS-rebinding) ; création d'invitation = POST JSON de même origine ; aucun script en ligne, texte inséré via `textContent`, politique CSP stricte. |
 | Fichiers de config | `config.json`, clé, index : permissions `0600`. |
 
 **Le relais est aveugle.** Tous les appareils *complets* d'un dossier partagent un secret de 256 bits que

@@ -70,6 +70,8 @@ type FolderHandler interface {
 type PairHandler interface {
 	// Active reports whether any invitation is outstanding.
 	Active() bool
+	// Banned reports whether this device has failed too many times to be let in again.
+	Banned(peer.ID) bool
 	// Accept validates the request. remoteIP is the guest's IP when it connected
 	// directly ("" if relayed). On success it returns commit, which the node runs
 	// *after* the reply has been delivered (it changes the configuration, which
@@ -107,12 +109,15 @@ type Node struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu        sync.Mutex
-	peers     map[string]*Peer
-	opening   map[peer.ID]bool
-	strangers int
-	kick      map[peer.ID]chan struct{}
-	disco     map[peer.ID][]ma.Multiaddr // addresses learnt from configuration / mDNS (relay candidates)
+	mu          sync.Mutex
+	peers       map[string]*Peer
+	opening     map[peer.ID]bool
+	strangers   int
+	strangerIPs map[string]int
+	pairing     map[peer.ID]bool        // strangers with a pairing exchange in progress
+	slots       map[network.Conn]func() // release functions of stranger connections
+	kick        map[peer.ID]chan struct{}
+	disco       map[peer.ID][]ma.Multiaddr // addresses learnt from configuration / mDNS (relay candidates)
 }
 
 func New(o Options) *Node {
@@ -124,7 +129,7 @@ func New(o Options) *Node {
 	}
 	n := &Node{cfg: o.Config, id: o.Identity, log: o.Logger, opts: o, redial: o.RedialMax,
 		handlers: map[string]FolderHandler{}, known: map[peer.ID]config.Device{},
-		peers: map[string]*Peer{}, opening: map[peer.ID]bool{}, kick: map[peer.ID]chan struct{}{},
+		peers: map[string]*Peer{}, opening: map[peer.ID]bool{}, strangerIPs: map[string]int{}, pairing: map[peer.ID]bool{}, slots: map[network.Conn]func(){}, kick: map[peer.ID]chan struct{}{},
 		disco: map[peer.ID][]ma.Multiaddr{}}
 	for _, h := range o.Handlers {
 		n.handlers[h.ID()] = h
@@ -208,7 +213,7 @@ func (n *Node) libp2pOptions() []libp2p.Option {
 	opts := []libp2p.Option{
 		libp2p.Identity(n.id.Key),
 		libp2p.ListenAddrStrings(n.listenAddrs()...),
-		libp2p.ConnectionGater(&gater{allowed: n.isKnown, pairing: n.pairingActive}),
+		libp2p.ConnectionGater(&gater{allowed: n.isKnown, pairing: n.pairingActive, banned: n.pairingBanned}),
 		libp2p.UserAgent("p2psync/0.2"),
 		libp2p.EnableRelay(),
 		libp2p.WithDialTimeout(12 * time.Second),
@@ -236,7 +241,7 @@ func (n *Node) libp2pOptions() []libp2p.Option {
 	}
 	if n.cfg.DHT {
 		opts = append(opts, libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
-			d, err := dht.New(h,
+			d, err := dht.New(gatedHost{Host: h, allow: n.isKnown},
 				dht.ProtocolPrefix("/p2psync"), // a private DHT: only our devices can join it
 				dht.Mode(dht.ModeAutoServer), dht.DisableProviders(), dht.DisableValues())
 			n.dht = d
@@ -249,6 +254,36 @@ func (n *Node) libp2pOptions() []libp2p.Option {
 func (n *Node) isKnown(p peer.ID) bool { _, ok := n.known[p]; return ok }
 
 func (n *Node) pairingActive() bool { return n.opts.Pairing != nil && n.opts.Pairing.Active() }
+
+func (n *Node) pairingBanned(p peer.ID) bool {
+	return n.opts.Pairing != nil && n.opts.Pairing.Banned(p)
+}
+
+// gatedHost wraps the host handed to the DHT so that its inbound protocol is
+// answered for configured devices only. Without this, a stranger admitted for
+// pairing could query the DHT and learn the addresses of our other devices.
+type gatedHost struct {
+	host.Host
+	allow func(peer.ID) bool
+}
+
+func (g gatedHost) gate(h network.StreamHandler) network.StreamHandler {
+	return func(s network.Stream) {
+		if !g.allow(s.Conn().RemotePeer()) {
+			_ = s.Reset()
+			return
+		}
+		h(s)
+	}
+}
+
+func (g gatedHost) SetStreamHandler(pid protocolID, h network.StreamHandler) {
+	g.Host.SetStreamHandler(pid, g.gate(h))
+}
+
+func (g gatedHost) SetStreamHandlerMatch(pid protocolID, m func(protocolID) bool, h network.StreamHandler) {
+	g.Host.SetStreamHandlerMatch(pid, m, g.gate(h))
+}
 
 // relayACL lets only configured devices use this device as a circuit relay.
 type relayACL struct{ n *Node }
@@ -568,7 +603,7 @@ func (n *Node) runSession(s network.Stream, outbound bool) {
 		n.log.Warn("incompatible peer", "device", dev.Name)
 		return
 	}
-	name := hello.Name
+	name := config.Clean(hello.Name) // shown in the UI: never trust it as markup
 	if dev.Name != "" {
 		name = dev.Name
 	}
@@ -797,28 +832,57 @@ func (nf *notifee) ListenClose(network.Network, ma.Multiaddr) {}
 // ---- pairing ---------------------------------------------------------------------
 
 const (
-	maxStrangers   = 4
-	strangerWindow = 20 * time.Second
+	maxStrangers      = 6
+	maxStrangersPerIP = 2
+	strangerWindow    = 15 * time.Second
 )
 
 // limitStranger bounds what a device admitted only because an invitation is
-// open can do: few at a time, and each is dropped after a short window unless
-// it has paired by then.
+// open can do: few at a time (and few per address), and each is dropped after a
+// short window unless it has paired by then. The place it occupies is freed as
+// soon as its pairing exchange ends (see releaseStranger), not only when the
+// window elapses, so one guest never blocks the next.
 func (n *Node) limitStranger(c network.Conn) {
+	ip := remoteIP(c)
 	n.mu.Lock()
-	if n.strangers >= maxStrangers {
+	if n.strangers >= maxStrangers || (ip != "" && n.strangerIPs[ip] >= maxStrangersPerIP) {
 		n.mu.Unlock()
 		_ = c.Close()
 		return
 	}
 	n.strangers++
+	if ip != "" {
+		n.strangerIPs[ip]++
+	}
+	var once sync.Once
+	n.slots[c] = func() {
+		once.Do(func() {
+			n.mu.Lock()
+			n.strangers--
+			if ip != "" {
+				if n.strangerIPs[ip]--; n.strangerIPs[ip] <= 0 {
+					delete(n.strangerIPs, ip)
+				}
+			}
+			n.mu.Unlock()
+		})
+	}
 	n.mu.Unlock()
 	time.AfterFunc(strangerWindow, func() {
 		_ = c.Close()
-		n.mu.Lock()
-		n.strangers--
-		n.mu.Unlock()
+		n.releaseStranger(c)
 	})
+}
+
+// releaseStranger frees the place held by a stranger's connection.
+func (n *Node) releaseStranger(c network.Conn) {
+	n.mu.Lock()
+	release := n.slots[c]
+	delete(n.slots, c)
+	n.mu.Unlock()
+	if release != nil {
+		release()
+	}
 }
 
 func remoteIP(c network.Conn) string {
@@ -843,17 +907,42 @@ func (n *Node) servePair(s network.Stream) {
 		_ = s.Reset()
 		return
 	}
-	n.wg.Add(1)
-	defer n.wg.Done()
-	_ = s.SetDeadline(time.Now().Add(20 * time.Second))
-	c := protocol.NewConn(s)
-	t, hb, _, err := c.Recv()
-	var req protocol.PairRequest
-	if err != nil || t != protocol.TypePair || len(hb) > 4096 || json.Unmarshal(hb, &req) != nil {
+	remote := s.Conn().RemotePeer()
+	// One pairing exchange at a time per device: parallel streams would only
+	// multiply memory use and token guesses.
+	n.mu.Lock()
+	if n.pairing[remote] {
+		n.mu.Unlock()
 		_ = s.Reset()
 		return
 	}
-	resp, commit := n.opts.Pairing.Accept(s.Conn().RemotePeer(), remoteIP(s.Conn()), req)
+	n.pairing[remote] = true
+	n.mu.Unlock()
+	defer func() {
+		n.mu.Lock()
+		delete(n.pairing, remote)
+		n.mu.Unlock()
+	}()
+	n.wg.Add(1)
+	defer n.wg.Done()
+	_ = s.SetDeadline(time.Now().Add(15 * time.Second))
+	c := protocol.NewConn(s)
+	t, hb, _, err := c.RecvMax(4096) // a request is a few dozen bytes
+	var req protocol.PairRequest
+	if err != nil || t != protocol.TypePair || json.Unmarshal(hb, &req) != nil {
+		_ = s.Reset()
+		return
+	}
+	conn := s.Conn()
+	if !n.isKnown(remote) {
+		// This exchange is all a stranger is allowed: once the reply is out, free
+		// its place and drop the connection (after the guest had time to read).
+		defer func() {
+			n.releaseStranger(conn)
+			time.AfterFunc(time.Second, func() { _ = conn.Close() })
+		}()
+	}
+	resp, commit := n.opts.Pairing.Accept(remote, remoteIP(conn), req)
 	if c.Send(protocol.TypePair, resp, nil) != nil {
 		return
 	}

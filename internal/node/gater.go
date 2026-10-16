@@ -15,6 +15,7 @@ type gater struct {
 	// pairing reports whether an invitation is outstanding. Only then are
 	// unknown devices let in, and they can do nothing but present a token.
 	pairing func() bool
+	banned  func(peer.ID) bool
 }
 
 func (g *gater) InterceptPeerDial(p peer.ID) bool { return g.allowed(p) }
@@ -29,7 +30,7 @@ func (g *gater) InterceptSecured(dir network.Direction, p peer.ID, _ network.Con
 	if g.allowed(p) {
 		return true
 	}
-	return dir == network.DirInbound && g.pairing != nil && g.pairing()
+	return dir == network.DirInbound && g.pairing != nil && g.pairing() && !(g.banned != nil && g.banned(p))
 }
 
 func (g *gater) InterceptUpgraded(network.Conn) (bool, control.DisconnectReason) { return true, 0 }
