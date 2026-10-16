@@ -2,6 +2,8 @@ module github.com/aurelienbaraquin/pairtopairsync
 
 go 1.26.0
 
+toolchain go1.26.9
+
 require (
 	github.com/fsnotify/fsnotify v1.8.0
 	github.com/libp2p/go-libp2p v0.50.0
