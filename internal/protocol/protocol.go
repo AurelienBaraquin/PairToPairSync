@@ -206,3 +206,28 @@ func (c *Conn) Recv() (t Type, hdr, body []byte, err error) {
 	}
 	return t, buf[5 : 5+hl], buf[5+hl:], nil
 }
+
+// PairRequest is sent by a device that scanned an invitation. It is the only
+// thing a not-yet-trusted device is allowed to say.
+type PairRequest struct {
+	Token string `json:"token"`
+	Name  string `json:"name"`
+	Port  int    `json:"port,omitempty"` // port this device listens on, so the inviter can dial back
+}
+
+// PairResponse is the inviter's answer. Secret is only ever sent to a full
+// device, over the authenticated, encrypted connection, in reply to a valid token.
+type PairResponse struct {
+	OK           bool   `json:"ok"`
+	Err          string `json:"err,omitempty"`
+	Name         string `json:"name,omitempty"`
+	Folder       string `json:"folder,omitempty"`
+	Label        string `json:"label,omitempty"`
+	Secret       string `json:"secret,omitempty"`
+	InviterRelay bool   `json:"inviter_relay,omitempty"`
+}
+
+const TypePair Type = 20
+
+// PairProtocol is the libp2p protocol ID of the pairing stream.
+const PairProtocol = "/p2psync/1.0/pair"

@@ -47,6 +47,7 @@ const (
 	protoSession protocolID = "/p2psync/1.0/session"
 	protoBlock   protocolID = "/p2psync/1.0/block"
 	protoProbe   protocolID = "/p2psync/1.0/probe"
+	protoPair    protocolID = protocol.PairProtocol
 )
 
 // FolderHandler is implemented by the folder engines (full copy and relay).
@@ -65,6 +66,17 @@ type FolderHandler interface {
 	Status() any
 }
 
+// PairHandler answers invitations (see package pairing).
+type PairHandler interface {
+	// Active reports whether any invitation is outstanding.
+	Active() bool
+	// Accept validates the request. remoteIP is the guest's IP when it connected
+	// directly ("" if relayed). On success it returns commit, which the node runs
+	// *after* the reply has been delivered (it changes the configuration, which
+	// restarts the daemon).
+	Accept(remote peer.ID, remoteIP string, req protocol.PairRequest) (resp protocol.PairResponse, commit func())
+}
+
 type Options struct {
 	Config   *config.Config
 	Identity *identity.Identity
@@ -72,6 +84,8 @@ type Options struct {
 	Logger   *slog.Logger
 	// RedialMax caps the reconnect back-off (default 60s).
 	RedialMax time.Duration
+	// Pairing, if set, lets a device that presents a valid invitation token join.
+	Pairing PairHandler
 	// Reachability forces "public" or "private" instead of auto-detecting
 	// (testing, or a server that knows better).
 	Reachability string
@@ -93,11 +107,12 @@ type Node struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu      sync.Mutex
-	peers   map[string]*Peer
-	opening map[peer.ID]bool
-	kick    map[peer.ID]chan struct{}
-	disco   map[peer.ID][]ma.Multiaddr // addresses learnt from configuration / mDNS (relay candidates)
+	mu        sync.Mutex
+	peers     map[string]*Peer
+	opening   map[peer.ID]bool
+	strangers int
+	kick      map[peer.ID]chan struct{}
+	disco     map[peer.ID][]ma.Multiaddr // addresses learnt from configuration / mDNS (relay candidates)
 }
 
 func New(o Options) *Node {
@@ -148,6 +163,7 @@ func (n *Node) Start(parent context.Context) error {
 	h.SetStreamHandler(protoSession, func(s network.Stream) { n.wg.Add(1); defer n.wg.Done(); n.runSession(s, false) })
 	h.SetStreamHandler(protoBlock, n.serveBlock)
 	h.SetStreamHandler(protoProbe, n.serveProbe)
+	h.SetStreamHandler(protoPair, n.servePair)
 	h.Network().Notify(&notifee{n})
 
 	// Static addresses from the configuration.
@@ -192,7 +208,7 @@ func (n *Node) libp2pOptions() []libp2p.Option {
 	opts := []libp2p.Option{
 		libp2p.Identity(n.id.Key),
 		libp2p.ListenAddrStrings(n.listenAddrs()...),
-		libp2p.ConnectionGater(&gater{allowed: n.isKnown}),
+		libp2p.ConnectionGater(&gater{allowed: n.isKnown, pairing: n.pairingActive}),
 		libp2p.UserAgent("p2psync/0.2"),
 		libp2p.EnableRelay(),
 		libp2p.WithDialTimeout(12 * time.Second),
@@ -231,6 +247,8 @@ func (n *Node) libp2pOptions() []libp2p.Option {
 }
 
 func (n *Node) isKnown(p peer.ID) bool { _, ok := n.known[p]; return ok }
+
+func (n *Node) pairingActive() bool { return n.opts.Pairing != nil && n.opts.Pairing.Active() }
 
 // relayACL lets only configured devices use this device as a circuit relay.
 type relayACL struct{ n *Node }
@@ -742,7 +760,11 @@ type notifee struct{ n *Node }
 func (nf *notifee) Connected(_ network.Network, c network.Conn) {
 	n := nf.n
 	pid := c.RemotePeer()
-	if !n.isKnown(pid) || n.ctx.Err() != nil {
+	if n.ctx.Err() != nil {
+		return
+	}
+	if !n.isKnown(pid) {
+		n.limitStranger(c)
 		return
 	}
 	// A direct connection appeared while the session runs through a relay (hole
@@ -771,3 +793,72 @@ func (nf *notifee) Disconnected(_ network.Network, c network.Conn) {
 }
 func (nf *notifee) Listen(network.Network, ma.Multiaddr)      {}
 func (nf *notifee) ListenClose(network.Network, ma.Multiaddr) {}
+
+// ---- pairing ---------------------------------------------------------------------
+
+const (
+	maxStrangers   = 4
+	strangerWindow = 20 * time.Second
+)
+
+// limitStranger bounds what a device admitted only because an invitation is
+// open can do: few at a time, and each is dropped after a short window unless
+// it has paired by then.
+func (n *Node) limitStranger(c network.Conn) {
+	n.mu.Lock()
+	if n.strangers >= maxStrangers {
+		n.mu.Unlock()
+		_ = c.Close()
+		return
+	}
+	n.strangers++
+	n.mu.Unlock()
+	time.AfterFunc(strangerWindow, func() {
+		_ = c.Close()
+		n.mu.Lock()
+		n.strangers--
+		n.mu.Unlock()
+	})
+}
+
+func remoteIP(c network.Conn) string {
+	if isRelayedConn(c) {
+		return ""
+	}
+	first, _ := ma.SplitFirst(c.RemoteMultiaddr())
+	if first == nil {
+		return ""
+	}
+	switch first.Protocol().Code {
+	case ma.P_IP4, ma.P_IP6:
+		return first.Value()
+	}
+	return ""
+}
+
+// servePair handles the only conversation a stranger may have with us.
+func (n *Node) servePair(s network.Stream) {
+	defer s.Close()
+	if !n.pairingActive() {
+		_ = s.Reset()
+		return
+	}
+	n.wg.Add(1)
+	defer n.wg.Done()
+	_ = s.SetDeadline(time.Now().Add(20 * time.Second))
+	c := protocol.NewConn(s)
+	t, hb, _, err := c.Recv()
+	var req protocol.PairRequest
+	if err != nil || t != protocol.TypePair || len(hb) > 4096 || json.Unmarshal(hb, &req) != nil {
+		_ = s.Reset()
+		return
+	}
+	resp, commit := n.opts.Pairing.Accept(s.Conn().RemotePeer(), remoteIP(s.Conn()), req)
+	if c.Send(protocol.TypePair, resp, nil) != nil {
+		return
+	}
+	if resp.OK && commit != nil {
+		// Let the guest read the reply before the configuration change restarts us.
+		time.AfterFunc(500*time.Millisecond, commit)
+	}
+}

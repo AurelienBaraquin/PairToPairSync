@@ -21,38 +21,43 @@ le Finder ou n'importe quel gestionnaire de fichiers, fonctionne hors-ligne et a
 Un démon en arrière-plan surveille les changements (inotify / FSEvents / ReadDirectoryChangesW) et
 synchronise en une fraction de seconde. Pas de lecteur virtuel, pas de format propriétaire.
 
-## Démarrage rapide
+## Démarrage rapide (avec QR code)
 
 ```sh
 go build -o p2psync ./cmd/p2psync        # ou: make build   (binaire unique)
-p2psync init --name portable             # sur CHAQUE appareil : crée la clé d'identité
-p2psync id                               # l'ID de cet appareil (clé publique)
+
+# Sur le premier appareil (le PC) : créer le dossier et lancer le démon
+p2psync init --name pc
+p2psync folder add ~/Documents/Projets --id projets
+p2psync run
+
+# Inviter le portable (copie complète) : un QR code s'affiche
+p2psync invite
+#   Sur le portable :   p2psync pair <texte du QR> --path ~/Projets
+
+# Inviter le téléphone comme relais temporaire
+p2psync invite --as-relay
+#   Sur le téléphone :  p2psync pair <texte du QR> --path ~/relais
+
+# Pour que le portable aussi passe par le téléphone, le téléphone l'invite à son tour
+#   (téléphone) p2psync invite     ->     (portable) p2psync pair <texte du QR>
 ```
 
-Les appareils se déclarent mutuellement. Le plus simple : coller **une seule adresse** par appareil
-(elle contient l'ID *et* un moyen de le joindre ; `p2psync status` les affiche) :
+Le QR code est aussi disponible dans la page d'état locale (<http://127.0.0.1:8384>, bouton
+« Inviter un appareil »). Un téléphone scanne le QR avec son appareil photo ; le texte qu'il affiche
+(`p2psync://pair/…`) se colle dans `p2psync pair`. Une future application Android pourra ouvrir ce lien
+directement.
 
-```sh
-# PC : le portable est une copie complète, le téléphone un relais
-p2psync device add /ip4/192.168.1.20/udp/22000/quic-v1/p2p/<ID_PORTABLE> --name portable
-p2psync device add /ip4/192.168.1.30/udp/22000/quic-v1/p2p/<ID_TEL>      --name telephone
-p2psync folder add ~/Documents/Projets --id projets --device <ID_PORTABLE> --device <ID_TEL>:relay
-#   -> affiche le SECRET du dossier. À donner uniquement à vos autres appareils complets.
+**Ce que fait un scan.** L'invitation contient l'ID de l'appareil invitant, de quoi le joindre et un
+**jeton aléatoire de 128 bits, valable 10 minutes, utilisable une seule fois**. L'invité se connecte à
+l'invitant (dont l'identité est vérifiée par sa clé : personne ne peut se faire passer pour lui), présente
+le jeton, et les deux appareils s'ajoutent mutuellement. Si l'invité est un appareil complet, le **secret
+du dossier** lui est remis dans ce canal chiffré ; si c'est un relais, il ne le reçoit **jamais**. Rien
+n'est à recopier à la main. Traitez le QR comme un mot de passe : quiconque le voit avant son expiration
+peut rejoindre le dossier. Après 5 jetons erronés, toutes les invitations sont annulées.
 
-# Portable : même dossier, même secret
-p2psync device add <adresse-du-PC> --name pc ;  p2psync device add <adresse-du-tel> --name telephone
-p2psync folder add ~/Projets --id projets --secret <SECRET> --device <ID_PC> --device <ID_TEL>:relay
-
-# Téléphone (relais) : il ne reçoit JAMAIS le secret
-p2psync device add <adresse-du-PC> --name pc ;  p2psync device add <adresse-du-portable> --name portable
-p2psync folder add-relay ~/relais --id projets --device <ID_PC> --device <ID_PORTABLE> --quota-mb 2048
-
-p2psync run        # sur chaque appareil (voir packaging/ pour le lancer au démarrage)
-p2psync status     # ou http://127.0.0.1:8384
-```
-
-Le démon recharge `config.json` tout seul. Après la première connexion, les adresses sont mémorisées et
-retrouvées automatiquement (voir *Connectivité*).
+Le démon recharge `config.json` tout seul. Les commandes manuelles (`device add`, `folder add --secret`,
+`folder add-relay`…) restent disponibles : voir `p2psync` sans argument.
 
 ## Sécurité
 
@@ -63,6 +68,8 @@ retrouvées automatiquement (voir *Connectivité*).
 | Contrôle d'accès | Un appareil **absent de la configuration est refusé pendant la poignée de main**, avant tout échange. |
 | Intégrité | Chaque bloc de fichier est vérifié par SHA-256 ; les chemins reçus sont validés (pas de `..`, pas de liens symboliques suivis). |
 | Relais | **Chiffré de bout en bout, à connaissance nulle** (ci-dessous). |
+| Appairage | Invitation à usage unique (128 bits, 10 min). Les inconnus ne sont acceptés **que pendant une invitation**, 4 au plus, 20 s au plus, et ne peuvent faire qu'une chose : présenter le jeton. |
+| Page locale | Écoute sur `127.0.0.1` seulement ; refuse tout en-tête `Host` non local (anti DNS-rebinding) ; la création d'invitation exige une requête POST JSON de même origine. |
 | Fichiers de config | `config.json`, clé, index : permissions `0600`. |
 
 **Le relais est aveugle.** Tous les appareils *complets* d'un dossier partagent un secret de 256 bits que
@@ -139,8 +146,10 @@ Fichier `.p2pignore` à la racine du dossier (`*.tmp`, `build/`, `/brouillons/*`
 - L'index complet est échangé à chaque connexion entre appareils complets ; les suppressions ne sont
   jamais purgées ; pas de détection de renommage (retransfert complet) ; liens symboliques ignorés ; pas de
   corbeille/versionnage ; seuls les bits de permission sont propagés.
-- Le secret du dossier se copie à la main entre appareils complets (ou `--secret`) ; il n'y a pas encore
-  d'échange assisté (QR code) ni de rotation de secret.
+- Le scan du QR se fait avec l'appareil photo d'un téléphone puis un copier-coller du texte : il n'y a pas
+  encore d'application mobile qui scanne et appaire en un geste. Pas de rotation du secret du dossier.
+- Un appairage est bilatéral (deux appareils) : relier trois appareils demande plusieurs invitations
+  (A↔B, A↔relais, B↔relais), comme dans l'exemple ci-dessus.
 
 Détails techniques : [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 

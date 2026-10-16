@@ -19,6 +19,7 @@ import (
 	"github.com/aurelienbaraquin/pairtopairsync/internal/app"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/pairing"
 )
 
 const version = "0.1.0"
@@ -40,6 +41,12 @@ Setup:
                                         turn THIS device into a temporary relay for folder ID
   folder share <FOLDER_ID> <DEVICE_ID> [--relay]
   folder list
+
+Pairing with a QR code (no IDs to copy, the folder secret is handed over securely):
+  invite [--folder ID] [--as-relay] [--png FILE]
+                                        show a single-use QR code (valid 10 min) for a new device
+  pair <CODE> [--path DIR] [--quota-mb N]
+                                        use the code shown by 'invite' (scan it with a phone, then paste its text)
 
 Running:
   run                                   run the sync daemon in the foreground
@@ -79,6 +86,10 @@ func main() {
 		cmdDevice(home, args)
 	case "folder":
 		cmdFolder(home, args)
+	case "invite":
+		cmdInvite(home, args)
+	case "pair":
+		cmdPair(home, args)
 	case "run":
 		check(run(home))
 	case "status":
@@ -401,3 +412,127 @@ func status(home string) error {
 }
 
 func num(v any) float64 { f, _ := v.(float64); return f }
+
+// ---- QR pairing ---------------------------------------------------------------------
+
+// daemonStatus fetches the running daemon's status document.
+func daemonStatus(cfg *config.Config) (id string, addrs []string, err error) {
+	if cfg.APIAddr == "" || cfg.APIAddr == "-" {
+		return "", nil, fmt.Errorf("the status API is disabled in the configuration; it is needed to learn this device's addresses")
+	}
+	resp, err := http.Get("http://" + cfg.APIAddr + "/api/status")
+	if err != nil {
+		return "", nil, pairing.ErrNoDaemon
+	}
+	defer resp.Body.Close()
+	var st struct {
+		DeviceID  string   `json:"device_id"`
+		Addresses []string `json:"addresses"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		return "", nil, err
+	}
+	return st.DeviceID, st.Addresses, nil
+}
+
+func cmdInvite(home string, args []string) {
+	fs := flag.NewFlagSet("invite", flag.ExitOnError)
+	var folder, png string
+	var asRelay bool
+	var ttl time.Duration
+	fs.StringVar(&folder, "folder", "", "folder to invite the device to (default: the only folder)")
+	fs.BoolVar(&asRelay, "as-relay", false, "the new device will be a temporary relay (e.g. a phone), not a full copy")
+	fs.StringVar(&png, "png", "", "also write the QR code to this PNG file")
+	fs.DurationVar(&ttl, "ttl", pairing.DefaultTTL, "how long the invitation stays valid")
+	parse(fs, args)
+
+	cfg := loadForEdit(home)
+	if folder == "" {
+		if len(cfg.Folders) != 1 {
+			fatal(fmt.Errorf("several folders exist: choose one with --folder"))
+		}
+		folder = cfg.Folders[0].ID
+	}
+	selfID, addrs, err := daemonStatus(cfg)
+	check(err)
+	inv, err := app.CreateInvite(home, cfg, selfID, addrs, folder, asRelay, ttl)
+	check(err)
+	code := inv.Encode()
+	qr, err := pairing.QRText(code)
+	check(err)
+	fmt.Println(qr)
+	if png != "" {
+		b, err := pairing.QRPNG(code, 512)
+		check(err)
+		check(os.WriteFile(png, b, 0o600))
+		fmt.Println("QR code saved to", png)
+	}
+	role := "a full copy"
+	if inv.InviteeRelay {
+		role = "a temporary relay"
+	}
+	if inv.InviterRelay {
+		role = "a full copy (this device is the relay)"
+	}
+	fmt.Printf("Invitation to folder %q as %s. Valid until %s, usable once.\n", inv.Folder, role, time.Unix(inv.Exp, 0).Format("15:04:05"))
+	fmt.Println("Scan the QR code with a phone and paste the text it shows into `p2psync pair`, or give this text directly:")
+	fmt.Println()
+	fmt.Println(code)
+	fmt.Println()
+	fmt.Println("Treat it like a password: anyone who has it before it expires can join this folder.")
+}
+
+func cmdPair(home string, args []string) {
+	fs := flag.NewFlagSet("pair", flag.ExitOnError)
+	var path string
+	var quota int64
+	fs.StringVar(&path, "path", "", "where to put the folder (or the relay's temporary storage) on this device")
+	fs.Int64Var(&quota, "quota-mb", 0, "relay: maximum temporary storage in MB")
+	pos := parse(fs, args)
+	if len(pos) != 1 {
+		fatal(fmt.Errorf("usage: pair <CODE> [--path DIR]"))
+	}
+	inv, err := pairing.Decode(pos[0])
+	check(err)
+	if inv.Expired(time.Now()) {
+		fatal(fmt.Errorf("this invitation has expired; ask for a new one"))
+	}
+
+	// Create the identity and a default config on first use.
+	_, err = app.Init(home, "", 0, "")
+	check(err)
+	id, err := identity.LoadOrCreate(home)
+	check(err)
+	cfg, err := app.LoadConfig(home)
+	check(err)
+	opts := app.JoinOptions{Path: path, QuotaMB: quota}
+	if opts.Path == "" && inv.InviteeRelay {
+		opts.Path = filepath.Join(home, "relay", inv.Folder)
+	}
+	check(app.PreflightJoin(cfg, inv, opts)) // before the invitation is spent
+
+	fmt.Printf("Connecting to %s…\n", firstNonEmpty(inv.Name, identity.Format(inv.ID)))
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	resp, err := pairing.Dial(ctx, id.Key, inv, app.GuestRequest(cfg))
+	check(err)
+
+	check(app.Join(cfg, inv, resp, opts))
+	check(app.SaveConfig(home, cfg))
+	switch {
+	case inv.InviteeRelay:
+		fmt.Printf("Paired. This device is now a temporary relay for %q (storage: %s).\n", inv.Folder, opts.Path)
+	case inv.InviterRelay:
+		fmt.Printf("Paired. %s is now a temporary relay for your folder %q.\n", firstNonEmpty(resp.Name, "The other device"), inv.Folder)
+	default:
+		fmt.Printf("Paired with %s. Folder %q will sync into %s.\n", firstNonEmpty(resp.Name, "the other device"), inv.Folder, cfg.Folder(inv.Folder).Path)
+	}
+	fmt.Println("If the daemon is running it reloads by itself; otherwise start it with `p2psync run`.")
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}

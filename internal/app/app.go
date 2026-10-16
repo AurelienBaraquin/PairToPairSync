@@ -15,6 +15,7 @@ import (
 	"github.com/aurelienbaraquin/pairtopairsync/internal/folder"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/node"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/pairing"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/relay"
 )
 
@@ -72,7 +73,8 @@ func Start(ctx context.Context, home string, cfg *config.Config, id *identity.Id
 		}
 	}
 
-	opts := node.Options{Config: cfg, Identity: id, Handlers: a.handlers, Logger: log, RedialMax: RedialMax}
+	opts := node.Options{Config: cfg, Identity: id, Handlers: a.handlers, Logger: log, RedialMax: RedialMax,
+		Pairing: newPairer(home)}
 	if NodeHook != nil {
 		NodeHook(&opts)
 	}
@@ -82,7 +84,7 @@ func Start(ctx context.Context, home string, cfg *config.Config, id *identity.Id
 		return nil, err
 	}
 	if cfg.APIAddr != "" && cfg.APIAddr != "-" {
-		srv, err := api.Start(cfg.APIAddr, a.Status, log)
+		srv, err := api.Start(cfg.APIAddr, a.Status, a.inviteForAPI, log)
 		if err != nil {
 			log.Warn("status API unavailable", "err", err)
 		} else {
@@ -116,4 +118,22 @@ func (a *App) Status() any {
 		st.Folders = append(st.Folders, h.Status())
 	}
 	return st
+}
+
+// inviteForAPI creates an invitation on behalf of the local web page.
+func (a *App) inviteForAPI(folder string, asRelay bool) (api.InviteResult, error) {
+	cfg, err := LoadConfig(a.Home)
+	if err != nil {
+		return api.InviteResult{}, err
+	}
+	inv, err := CreateInvite(a.Home, cfg, a.Identity.ID, a.Node.Addrs(), folder, asRelay, 0)
+	if err != nil {
+		return api.InviteResult{}, err
+	}
+	code := inv.Encode()
+	png, err := pairing.QRPNG(code, 320)
+	if err != nil {
+		return api.InviteResult{}, err
+	}
+	return api.InviteResult{Code: code, PNG: png, Expires: time.Unix(inv.Exp, 0)}, nil
 }

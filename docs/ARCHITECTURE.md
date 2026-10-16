@@ -12,6 +12,7 @@ internal/folder      moteur « copie complète » : scan, watcher, index, télé
 internal/relay       moteur « relais » : changements scellés en attente, acquittements, purge
 internal/seal        chiffrement du relais : HKDF, HMAC, XChaCha20-Poly1305
 internal/model       vecteurs de versions, FileInfo, blocs SHA-256
+internal/pairing     invitations QR : format, jetons à usage unique, client d'appairage
 internal/identity    clé Ed25519, ID d'appareil = peer ID libp2p
 internal/api         page d'état locale (127.0.0.1)
 mobile               API compatible gomobile
@@ -35,6 +36,29 @@ mobile               API compatible gomobile
 - **Supervision** : `dialLoop` par appareil, délai 1 s → 30 s avec gigue, réveillé par mDNS ou une connexion
   entrante ; pings toutes les 8 s, délai de lecture 30 s. `Stop()` borne dans le temps chaque composant tiers
   (un `Close` qui ne revient pas ne peut pas garder le démon en vie).
+
+## Appairage par QR code (`internal/pairing`, `app/pair.go`, `node.servePair`)
+
+1. `invite` (CLI ou page locale) lit les adresses du démon, génère un jeton aléatoire et écrit
+   `invites/<sha256(jeton)>.json` (le jeton lui-même n'est pas stocké). Le texte `p2psync://pair/<base64url JSON>`
+   (≈ 400 octets) est affiché en QR.
+2. `pair` ouvre un hôte libp2p éphémère **avec la clé d'identité de l'invité**, se connecte à l'ID de
+   l'invitation (libp2p refuse un autre ID : l'invitant est authentifié) et ouvre le flux
+   `/p2psync/1.0/pair` avec `{token, name, port}`.
+3. Côté invitant, le gater admet un inconnu **uniquement si** `invites/` contient une invitation non
+   expirée. Il peut parler le seul flux `pair` (les flux session/block/probe exigent un pair connu) ; au plus
+   4 inconnus simultanés, coupés après 20 s.
+4. `Consume` supprime le fichier du jeton : la suppression est atomique, un seul des appelants
+   concurrents réussit (testé à 20 en parallèle). Après 5 échecs, `Purge` annule tout.
+5. Si le jeton est valide, la réponse contient le nom, le dossier et — **seulement si l'invité est un
+   appareil complet** — le secret. Le changement de configuration (`commit`) est exécuté 500 ms *après*
+   l'envoi de la réponse, car il redémarre le démon.
+6. L'invité applique `PreflightJoin` **avant** de dépenser le jeton (dossier requis, rôles compatibles),
+   puis `Join` : ajout de l'appareil, création du dossier (ou refus si un autre secret existe déjà).
+
+Cas gérés : invitant complet → invité complet (secret transmis) ; invitant complet → invité relais
+(pas de secret) ; invitant relais → invité complet (qui possède déjà le dossier et son secret). Un relais
+ne peut pas inviter un relais.
 
 ## Modèle de données
 

@@ -10,7 +10,12 @@ import (
 // gater is the first line of defence: only devices present in the configuration
 // may connect, in either direction. Anyone else is dropped during the secure
 // handshake, so they cannot even open a protocol stream.
-type gater struct{ allowed func(peer.ID) bool }
+type gater struct {
+	allowed func(peer.ID) bool
+	// pairing reports whether an invitation is outstanding. Only then are
+	// unknown devices let in, and they can do nothing but present a token.
+	pairing func() bool
+}
 
 func (g *gater) InterceptPeerDial(p peer.ID) bool { return g.allowed(p) }
 
@@ -20,8 +25,11 @@ func (g *gater) InterceptAddrDial(p peer.ID, _ ma.Multiaddr) bool { return g.all
 // calling; InterceptSecured does it.
 func (g *gater) InterceptAccept(network.ConnMultiaddrs) bool { return true }
 
-func (g *gater) InterceptSecured(_ network.Direction, p peer.ID, _ network.ConnMultiaddrs) bool {
-	return g.allowed(p)
+func (g *gater) InterceptSecured(dir network.Direction, p peer.ID, _ network.ConnMultiaddrs) bool {
+	if g.allowed(p) {
+		return true
+	}
+	return dir == network.DirInbound && g.pairing != nil && g.pairing()
 }
 
 func (g *gater) InterceptUpgraded(network.Conn) (bool, control.DisconnectReason) { return true, 0 }

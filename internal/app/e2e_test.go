@@ -19,6 +19,8 @@ import (
 	"github.com/aurelienbaraquin/pairtopairsync/internal/folder"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/node"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/pairing"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/protocol"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/relay"
 )
 
@@ -97,6 +99,14 @@ func (d *dev) start(t *testing.T, peers ...*dev) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	if err := cfg.Save(filepath.Join(d.home, app.ConfigFile)); err != nil {
+		t.Fatal(err)
+	}
+	d.launch(t, cfg)
+}
+
+func (d *dev) launch(t *testing.T, cfg *config.Config) {
+	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	if os.Getenv("P2P_TEST_LOG") != "" {
 		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})).With("dev", d.name)
@@ -581,5 +591,273 @@ func TestStopIsBounded(t *testing.T) {
 	case <-done:
 	case <-time.After(20 * time.Second):
 		t.Fatal("Stop did not return")
+	}
+}
+
+// ---- QR pairing --------------------------------------------------------------------
+
+// reload restarts a device from the configuration on disk, as the daemon does
+// when it notices config.json changed.
+func (d *dev) reload(t *testing.T) {
+	t.Helper()
+	d.stop()
+	cfg, err := app.LoadConfig(d.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.launch(t, cfg)
+}
+
+// freshGuest is a brand-new device with no configuration besides its own ports.
+func freshGuest(t *testing.T, root, name string) (*dev, *config.Config) {
+	t.Helper()
+	g := newDev(t, root, name, false)
+	cfg := config.Default()
+	cfg.DeviceName, cfg.ListenPort, cfg.APIAddr = name, g.port, "-"
+	cfg.LANDiscover, cfg.NATTraversal, cfg.DHT, cfg.RelayService = false, false, false, false
+	cfg.ListenAddresses = []string{fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1", g.port), fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", g.port)}
+	return g, cfg
+}
+
+func (d *dev) invite(t *testing.T, asRelay bool, ttl time.Duration) pairing.Invite {
+	t.Helper()
+	cfg, err := app.LoadConfig(d.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv, err := app.CreateInvite(d.home, cfg, d.id.ID, d.a.Node.Addrs(), "docs", asRelay, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What the QR code carries must survive being printed and scanned.
+	back, err := pairing.Decode(inv.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return back
+}
+
+func scan(g *dev, cfg *config.Config, inv pairing.Invite) (protocol.PairResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	return pairing.Dial(ctx, g.id.Key, inv, app.GuestRequest(cfg))
+}
+
+func waitConfigHas(t *testing.T, d *dev, other *dev) {
+	t.Helper()
+	eventually(t, d.name+" recorded the new device", func() bool {
+		cfg, err := app.LoadConfig(d.home)
+		return err == nil && cfg.Device(other.id.ID) != nil
+	})
+}
+
+// One scan pairs two computers: both trust each other, the guest receives the
+// folder secret, and files start flowing.
+func TestQRPairFullDevices(t *testing.T) {
+	root := t.TempDir()
+	a := newDev(t, root, "A", false)
+	a.start(t) // A knows nobody yet
+	g, gcfg := freshGuest(t, root, "G")
+
+	inv := a.invite(t, false, 0)
+	resp, err := scan(g, gcfg, inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Secret != testSecret || resp.Folder != "docs" {
+		t.Fatalf("guest did not receive the folder: %+v", resp)
+	}
+	if err := app.PreflightJoin(gcfg, inv, app.JoinOptions{Path: g.dir}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Join(gcfg, inv, resp, app.JoinOptions{Path: g.dir}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SaveConfig(g.home, gcfg); err != nil {
+		t.Fatal(err)
+	}
+	waitConfigHas(t, a, g)
+	a.reload(t)
+	g.reload(t)
+
+	a.write(t, "after-pairing.txt", []byte("hello guest"))
+	eventually(t, "file flows after QR pairing", g.hasContent("after-pairing.txt", []byte("hello guest")))
+	g.write(t, "reply.txt", []byte("hello A"))
+	eventually(t, "and back", a.hasContent("reply.txt", []byte("hello A")))
+}
+
+// A phone invited "as relay" never receives the folder secret, and the relay
+// workflow works straight after pairing.
+func TestQRPairRelayNeverGetsSecret(t *testing.T) {
+	root := t.TempDir()
+	a := newDev(t, root, "A", false)
+	a.start(t)
+	phone, pcfg := freshGuest(t, root, "Phone")
+
+	inv := a.invite(t, true, 0)
+	if !inv.InviteeRelay {
+		t.Fatal("invitation lost the relay role")
+	}
+	resp, err := scan(phone, pcfg, inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Secret != "" {
+		t.Fatal("the folder secret was sent to a relay")
+	}
+	opts := app.JoinOptions{Path: phone.dir}
+	if err := app.Join(pcfg, inv, resp, opts); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SaveConfig(phone.home, pcfg); err != nil {
+		t.Fatal(err)
+	}
+	if f := pcfg.Folder("docs"); f.Role != config.RoleRelay || f.Secret != "" {
+		t.Fatalf("relay folder misconfigured: %+v", f)
+	}
+	waitConfigHas(t, a, phone)
+	acfg, _ := app.LoadConfig(a.home)
+	if !acfg.Folder("docs").IsRelay(phone.id.ID) {
+		t.Fatal("inviter did not register the guest as a relay")
+	}
+	phone.relay = true
+	a.reload(t)
+	phone.reload(t)
+
+	// A second computer joins through two more scans: A's QR (full copy), then the
+	// phone's QR (the phone, as inviter, becomes B's relay). B then stays offline.
+	b, bcfg := freshGuest(t, root, "B")
+	invA := a.invite(t, false, 0)
+	respA, err := scan(b, bcfg, invA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Join(bcfg, invA, respA, app.JoinOptions{Path: b.dir}); err != nil {
+		t.Fatal(err)
+	}
+	invP := phone.invite(t, false, 0)
+	if err := app.PreflightJoin(bcfg, invP, app.JoinOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	respP, err := scan(b, bcfg, invP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Join(bcfg, invP, respP, app.JoinOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SaveConfig(b.home, bcfg); err != nil {
+		t.Fatal(err)
+	}
+	waitConfigHas(t, a, b)
+	waitConfigHas(t, phone, b)
+	a.reload(t)
+	phone.reload(t)
+
+	a.write(t, "via-phone.txt", []byte("stored on the phone"))
+	eventually(t, "relay holds the sealed change for absent B", func() bool { return storeHasBlocks(phone) })
+
+	// B finally comes online and gets the file through the phone alone.
+	a.stop()
+	b.reload(t)
+	eventually(t, "B receives it from the relay", b.hasContent("via-phone.txt", []byte("stored on the phone")))
+	eventually(t, "phone forgets it", func() bool { return storeEmpty(phone) })
+}
+
+// A relay can invite a full device too (the phone shows the QR, the PC scans).
+func TestQRInviteFromRelay(t *testing.T) {
+	root := t.TempDir()
+	relayDev := newDev(t, root, "R", true)
+	relayDev.start(t)
+	g, gcfg := freshGuest(t, root, "G")
+	// The guest already has the folder (and its secret) from elsewhere.
+	gcfg.Folders = []config.Folder{{ID: "docs", Path: g.dir, Role: config.RoleFull, Secret: testSecret}}
+
+	inv := relayDev.invite(t, false, 0)
+	if !inv.InviterRelay {
+		t.Fatal("invitation should say the inviter is a relay")
+	}
+	if err := app.PreflightJoin(gcfg, inv, app.JoinOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := scan(g, gcfg, inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Secret != "" {
+		t.Fatal("a relay has no secret to hand out")
+	}
+	if err := app.Join(gcfg, inv, resp, app.JoinOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !gcfg.Folder("docs").IsRelay(relayDev.id.ID) {
+		t.Fatal("guest did not register the inviter as relay")
+	}
+	waitConfigHas(t, relayDev, g)
+	rcfg, _ := app.LoadConfig(relayDev.home)
+	if rcfg.Folder("docs").IsRelay(g.id.ID) || !rcfg.Folder("docs").SharesWith(g.id.ID) {
+		t.Fatal("relay must list the guest as a full device")
+	}
+}
+
+func TestQRRejectsReuseExpiryAndBadTokens(t *testing.T) {
+	root := t.TempDir()
+	a := newDev(t, root, "A", false)
+	a.start(t)
+
+	// Single use.
+	g1, c1 := freshGuest(t, root, "G1")
+	inv := a.invite(t, false, 0)
+	if _, err := scan(g1, c1, inv); err != nil {
+		t.Fatal(err)
+	}
+	g2, c2 := freshGuest(t, root, "G2")
+	if _, err := scan(g2, c2, inv); err == nil {
+		t.Fatal("the same invitation worked twice")
+	}
+
+	// Expiry.
+	short := a.invite(t, false, time.Second)
+	time.Sleep(2200 * time.Millisecond)
+	g3, c3 := freshGuest(t, root, "G3")
+	if _, err := scan(g3, c3, short); err == nil {
+		t.Fatal("expired invitation accepted")
+	}
+
+	// Wrong token while another invitation is outstanding: refused, nothing leaked, nothing added.
+	valid := a.invite(t, false, 0)
+	forged := valid
+	forged.Token = "AAAAAAAAAAAAAAAAAAAAAA"
+	g4, c4 := freshGuest(t, root, "G4")
+	resp, err := scan(g4, c4, forged)
+	if err == nil || resp.Secret != "" {
+		t.Fatalf("forged token accepted: %+v", resp)
+	}
+	acfg, _ := app.LoadConfig(a.home)
+	if acfg.Device(g4.id.ID) != nil || acfg.Device(g3.id.ID) != nil {
+		t.Fatal("a device with a bad token was added to the configuration")
+	}
+
+	// Guessing is punished: after repeated failures every invitation is cancelled.
+	for i := 0; i < 6; i++ {
+		gx, cx := freshGuest(t, root, fmt.Sprintf("X%d", i))
+		_, _ = scan(gx, cx, forged)
+	}
+	g5, c5 := freshGuest(t, root, "G5")
+	if _, err := scan(g5, c5, valid); err == nil {
+		t.Fatal("outstanding invitation survived a brute-force attempt")
+	}
+}
+
+// Without an outstanding invitation a stranger cannot even complete the handshake.
+func TestQRNoInvitationNoEntry(t *testing.T) {
+	root := t.TempDir()
+	a := newDev(t, root, "A", false)
+	a.start(t)
+	inv := a.invite(t, false, 0)
+	pairing.NewStore(a.home).Purge() // invitation withdrawn
+	g, gc := freshGuest(t, root, "G")
+	if _, err := scan(g, gc, inv); err == nil {
+		t.Fatal("stranger paired without an outstanding invitation")
 	}
 }
