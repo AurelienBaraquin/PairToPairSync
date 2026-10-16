@@ -75,20 +75,24 @@ func TestTokenIsSingleUseAndExpires(t *testing.T) {
 
 func TestOnlyOneConcurrentConsumerWins(t *testing.T) {
 	s := NewStore(t.TempDir())
-	tok, _ := NewToken()
-	_ = s.Add(tok, Pending{Folder: "f", Exp: time.Now().Add(time.Minute).Unix()})
-	wins := make(chan bool, 20)
-	for i := 0; i < 20; i++ {
-		go func() { _, ok := s.Consume(tok, time.Now()); wins <- ok }()
-	}
-	n := 0
-	for i := 0; i < 20; i++ {
-		if <-wins {
-			n++
+	// Many rounds: the failure this guards against (several callers all believing
+	// they removed the file, seen on Windows) depends on timing.
+	for round := 0; round < 100; round++ {
+		tok, _ := NewToken()
+		_ = s.Add(tok, Pending{Folder: "f", Exp: time.Now().Add(time.Minute).Unix()})
+		wins := make(chan bool, 20)
+		for i := 0; i < 20; i++ {
+			go func() { _, ok := s.Consume(tok, time.Now()); wins <- ok }()
 		}
-	}
-	if n != 1 {
-		t.Fatalf("%d consumers succeeded, want exactly 1", n)
+		n := 0
+		for i := 0; i < 20; i++ {
+			if <-wins {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Fatalf("round %d: %d consumers succeeded, want exactly 1", round, n)
+		}
 	}
 }
 

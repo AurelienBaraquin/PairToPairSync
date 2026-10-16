@@ -48,17 +48,35 @@ func (s *Store) Add(token string, p Pending) error {
 
 // Consume validates a token and burns it. It returns false for an unknown,
 // already used or expired token. An expired token is removed as well.
+//
+// Exactly one caller can win, on every operating system: the winner is whoever
+// creates the marker file first (an exclusive create is atomic everywhere, while the
+// outcome of two concurrent deletions of the same file is not: on Windows several
+// callers could all be told that they had removed it).
 func (s *Store) Consume(token string, now time.Time) (Pending, bool) {
 	if token == "" || len(token) > 64 {
 		return Pending{}, false
 	}
 	path := s.path(token)
+	if _, err := os.Stat(path); err != nil {
+		return Pending{}, false
+	}
+	marker := filepath.Join(s.dir, ".used", TokenKey(token))
+	if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+		return Pending{}, false
+	}
+	f, err := os.OpenFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return Pending{}, false // someone else is consuming (or has consumed) it
+	}
+	_ = f.Close()
+	defer func() { _ = fsutil.Remove(marker) }()
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return Pending{}, false
 	}
-	if err := fsutil.Remove(path); err != nil {
-		return Pending{}, false // someone else consumed it first
+	if err := fsutil.Remove(path); err != nil && !os.IsNotExist(err) {
+		return Pending{}, false
 	}
 	var p Pending
 	if json.Unmarshal(b, &p) != nil || now.Unix() > p.Exp {
