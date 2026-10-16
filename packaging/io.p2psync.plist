@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- macOS: cp io.p2psync.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/io.p2psync.plist -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>io.p2psync</string>
+  <key>ProgramArguments</key><array><string>/usr/local/bin/p2psync</string><string>run</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>

@@ -37,6 +37,7 @@ type dev struct {
 	port  int
 	dir   string // synced directory (full) or storage directory (relay)
 	relay bool
+	quota int64 // relay quota in MB (0 = default)
 	a     *app.App
 }
 
@@ -65,6 +66,7 @@ func (d *dev) start(t *testing.T, peers ...*dev) {
 	fc := config.Folder{ID: "docs", Path: d.dir, Role: config.RoleFull, ScanIntervalSec: 1}
 	if d.relay {
 		fc.Role = config.RoleRelay
+		fc.QuotaMB = d.quota
 	}
 	for _, p := range peers {
 		cfg.Devices = append(cfg.Devices, config.Device{ID: p.id.ID, Name: p.name, Addresses: []string{fmt.Sprintf("127.0.0.1:%d", p.port)}})
@@ -307,5 +309,55 @@ func TestIgnoredFilesAreNotSynced(t *testing.T) {
 		if _, err := os.Stat(b.path(p)); err == nil {
 			t.Fatalf("%s should not have been synced", p)
 		}
+	}
+}
+
+// When the relay's quota is too small it simply does not store the change; the
+// devices still converge by syncing directly and the relay cleans up afterwards.
+func TestRelayQuotaIsRespected(t *testing.T) {
+	root := t.TempDir()
+	a, b := newDev(t, root, "A", false), newDev(t, root, "B", false)
+	r := newDev(t, root, "R", true)
+	r.quota = 1 // MB
+	a.start(t, b, r)
+	r.start(t, a, b)
+
+	big := randBytes(2 << 20)
+	a.write(t, "big.bin", big)
+	time.Sleep(2 * time.Second)
+	if n := countBlocks(r); n != 0 {
+		t.Fatalf("relay stored %d blocks despite its 1 MB quota", n)
+	}
+
+	b.start(t, a, r)
+	eventually(t, "B gets the file directly from A", b.hasContent("big.bin", big))
+	eventually(t, "relay cleaned up after B confirmed", func() bool { return storeEmpty(r) })
+}
+
+func countBlocks(d *dev) int {
+	n := 0
+	_ = filepath.WalkDir(filepath.Join(d.dir, "blocks"), func(_ string, e os.DirEntry, err error) error {
+		if err == nil && !e.IsDir() {
+			n++
+		}
+		return nil
+	})
+	return n
+}
+
+// A device that is not in the configuration must not be able to read anything,
+// even though it speaks the protocol and has a valid certificate.
+func TestUnknownDeviceIsRefused(t *testing.T) {
+	root := t.TempDir()
+	a, intruder := newDev(t, root, "A", false), newDev(t, root, "X", false)
+	a.write(t, "secret.txt", []byte("top secret"))
+	a.start(t) // knows nobody
+	intruder.start(t, a)
+	time.Sleep(2 * time.Second)
+	if _, err := os.Stat(intruder.path("secret.txt")); err == nil {
+		t.Fatal("an unknown device received data")
+	}
+	if peers := a.a.Node.Peers(); len(peers) != 0 {
+		t.Fatalf("unknown device was accepted: %v", peers)
 	}
 }
