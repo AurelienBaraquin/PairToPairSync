@@ -55,8 +55,9 @@ p2psync status                           # ou ouvrir http://127.0.0.1:8384
 
 Le démon recharge `config.json` tout seul : pas besoin de le redémarrer après un `device add`.
 Les appareils s'authentifient mutuellement par l'empreinte de leur certificat : **un appareil absent de
-la configuration est refusé**. Sur un même réseau local, les adresses sont trouvées automatiquement
-(`--addr` devient facultatif).
+la configuration est refusé**. Sur un même réseau local, les adresses sont censées être trouvées automatiquement
+par diffusion UDP (`--addr` facultatif) — **fonction écrite mais pas encore testée sur un vrai réseau** ;
+en attendant, indiquez `--addr`.
 
 ## Comment fonctionne le relais
 
@@ -91,8 +92,8 @@ Fichier `.p2pignore` à la racine du dossier (`*.tmp`, `build/`, `/brouillons/*`
   interface) reste à écrire.
 - L'index complet est échangé à chaque connexion entre appareils complets (métadonnées seulement) ; les
   suppressions (« pierres tombales ») ne sont jamais purgées ; pas de détection de renommage (un renommage
-  = suppression + création, mais les blocs identiques ne sont pas retransférés s'ils existent déjà dans le
-  fichier précédent) ; liens symboliques ignorés ; pas de corbeille/versionnage ; seuls les bits de
+  = suppression + création : le fichier est retransféré en entier ; seules les modifications d'un fichier
+  existant ne transfèrent que les blocs changés) ; liens symboliques ignorés ; pas de corbeille/versionnage ; seuls les bits de
   permission sont propagés.
 - Testé sous Linux (tests de bout en bout avec `-race`). Windows/macOS/ARM sont compilés en CI mais pas encore testés à l'exécution.
 
