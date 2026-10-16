@@ -15,3 +15,4 @@ jobs:
           for t in linux/amd64 linux/arm64 windows/amd64 darwin/arm64 darwin/amd64; do
             GOOS=${t%/*} GOARCH=${t#*/} go build -o /dev/null ./cmd/p2psync
           done
+          GOOS=android GOARCH=arm64 go build -ldflags=-checklinkname=0 -o /dev/null ./cmd/p2psync

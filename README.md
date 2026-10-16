@@ -132,8 +132,10 @@ Fichier `.p2pignore` à la racine du dossier (`*.tmp`, `build/`, `/brouillons/*`
   environnement de test), UPnP/NAT-PMP, et le perçage de NAT entre vraies box — ce sont les fonctions
   éprouvées de libp2p, mais je n'ai pas pu les valider sur de vrais réseaux. Windows/macOS/ARM sont
   compilés en CI mais pas exécutés.
-- **Téléphone** : le binaire tourne tel quel sur Android via Termux (`GOOS=linux GOARCH=arm64`). Le paquet
-  `mobile/` est prêt pour `gomobile bind` ; l'application Android native reste à écrire.
+- **Téléphone** : `make dist` produit `p2psync-android-arm64` (et `linux-arm64`) à lancer via Termux ; la
+  compilation Android exige `-ldflags=-checklinkname=0` (déjà dans le Makefile). **Jamais exécuté sur un vrai
+  téléphone.** Le paquet `mobile/` est prêt pour `gomobile bind` ; l'application Android native (service au
+  premier plan, économie d'énergie) reste à écrire.
 - L'index complet est échangé à chaque connexion entre appareils complets ; les suppressions ne sont
   jamais purgées ; pas de détection de renommage (retransfert complet) ; liens symboliques ignorés ; pas de
   corbeille/versionnage ; seuls les bits de permission sont propagés.
