@@ -9,6 +9,7 @@ package protocol
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -189,24 +190,27 @@ func (c *Conn) Send(t Type, hdr any, body []byte) error {
 func (c *Conn) Recv() (t Type, hdr, body []byte, err error) { return c.RecvMax(MaxFrame) }
 
 // RecvMax reads one frame of at most max bytes. The size is checked before
-// anything is allocated, so a peer that has not authenticated yet cannot make
-// us buffer megabytes by merely claiming a large frame.
+// anything is allocated, and the buffer grows only as bytes really arrive: a peer
+// that merely claims a huge frame (and then trickles data) cannot make us reserve
+// that memory.
 func (c *Conn) RecvMax(max int) (t Type, hdr, body []byte, err error) {
 	var p [4]byte
 	if _, err = io.ReadFull(c.r, p[:]); err != nil {
 		return
 	}
 	total := binary.BigEndian.Uint32(p[:])
-	if total < 5 || total > uint32(max) {
+	if total < 5 || int64(total) > int64(max) || total > MaxFrame {
 		return 0, nil, nil, fmt.Errorf("bad frame length %d", total)
 	}
-	buf := make([]byte, total)
-	if _, err = io.ReadFull(c.r, buf); err != nil {
-		return
+	var b bytes.Buffer
+	b.Grow(int(min(total, 64<<10)))
+	if _, err = io.CopyN(&b, c.r, int64(total)); err != nil {
+		return 0, nil, nil, err
 	}
+	buf := b.Bytes()
 	t = Type(buf[0])
 	hl := binary.BigEndian.Uint32(buf[1:5])
-	if int(hl) > len(buf)-5 {
+	if int64(hl) > int64(len(buf)-5) {
 		return 0, nil, nil, errors.New("bad header length")
 	}
 	return t, buf[5 : 5+hl], buf[5+hl:], nil
@@ -236,3 +240,14 @@ const TypePair Type = 20
 
 // PairProtocol is the libp2p protocol ID of the pairing stream.
 const PairProtocol = "/p2psync/1.0/pair"
+
+// Approximate encoded sizes, used to keep an index message well under MaxFrame.
+const (
+	entryBase = 256 // JSON overhead of one entry
+	blockWire = 48  // one base64 SHA-256 plus quotes and comma
+)
+
+// WireSize estimates the JSON size of a sealed entry.
+func (e SealedEntry) WireSize() int {
+	return entryBase + len(e.Meta)*4/3 + len(e.CBlocks)*blockWire + len(e.Version)*24
+}

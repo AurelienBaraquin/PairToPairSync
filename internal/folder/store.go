@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/aurelienbaraquin/pairtopairsync/internal/fsutil"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/model"
 )
 
@@ -24,27 +25,48 @@ type Store struct {
 	path  string
 	st    state
 	dirty bool
+	// Recovered describes a repair done when the index was opened ("" if none).
+	Recovered string
 }
 
+// openStore loads the index. If the file is unreadable (a power cut on a system
+// without write ordering can leave it empty or truncated) it falls back to the
+// previous good copy, and as a last resort starts empty: the next scan rebuilds
+// it from the disk, and identical files merge with the other devices' versions
+// without conflicts. Refusing to start would take every folder down.
 func openStore(path string) (*Store, error) {
-	s := &Store{path: path, st: state{Files: map[string]model.FileInfo{}, RelaySent: map[string]int64{}}}
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return s, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if err := json.Unmarshal(b, &s.st); err != nil {
-		return nil, err
-	}
-	if s.st.Files == nil {
-		s.st.Files = map[string]model.FileInfo{}
-	}
-	if s.st.RelaySent == nil {
-		s.st.RelaySent = map[string]int64{}
+	s := &Store{path: path}
+	s.reset()
+	for _, candidate := range []string{path, path + ".bak"} {
+		b, err := os.ReadFile(candidate)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err == nil {
+			var st state
+			if err = json.Unmarshal(b, &st); err == nil {
+				s.st = st
+				if s.st.Files == nil {
+					s.st.Files = map[string]model.FileInfo{}
+				}
+				if s.st.RelaySent == nil {
+					s.st.RelaySent = map[string]int64{}
+				}
+				if candidate != path {
+					s.Recovered = "the index was damaged; restored the previous copy"
+					s.dirty = true
+				}
+				return s, nil
+			}
+		}
+		s.Recovered = "the index was unreadable (" + err.Error() + "); it will be rebuilt from the folder"
+		_ = os.Rename(candidate, candidate+".corrupt")
 	}
 	return s, nil
+}
+
+func (s *Store) reset() {
+	s.st = state{Files: map[string]model.FileInfo{}, RelaySent: map[string]int64{}}
 }
 
 func (s *Store) Get(name string) (model.FileInfo, bool) {
@@ -128,7 +150,9 @@ func (s *Store) SetRelaySent(dev string, seq int64) {
 	}
 }
 
-// Save writes the index atomically if it changed.
+// Save writes the index durably if it changed: flushed to disk, the previous good
+// copy kept as ".bak", and the new one swapped in atomically. If writing fails the
+// index stays marked as changed, so the next attempt retries.
 func (s *Store) Save() error {
 	s.mu.Lock()
 	if !s.dirty {
@@ -138,15 +162,17 @@ func (s *Store) Save() error {
 	b, err := json.Marshal(&s.st)
 	s.dirty = false
 	s.mu.Unlock()
+	if err == nil {
+		err = os.MkdirAll(filepath.Dir(s.path), 0o700)
+	}
+	if err == nil {
+		_ = fsutil.Rename(s.path, s.path+".bak") // keep the last good copy; absent the first time
+		err = fsutil.WriteFileAtomic(s.path, b, 0o600)
+	}
 	if err != nil {
-		return err
+		s.mu.Lock()
+		s.dirty = true
+		s.mu.Unlock()
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return err
-	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
+	return err
 }

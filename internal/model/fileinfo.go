@@ -117,3 +117,9 @@ func HashBytes(b []byte) []byte {
 	h := sha256.Sum256(b)
 	return h[:]
 }
+
+// WireSize estimates the JSON size of an entry, to keep index messages bounded.
+func (f FileInfo) WireSize() int { return 256 + len(f.Name)*2 + len(f.Blocks)*48 + len(f.Version)*24 }
+
+// MaxIndexMessage is the target maximum size of one index message (well under the frame limit).
+const MaxIndexMessage = 8 << 20

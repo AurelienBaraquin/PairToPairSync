@@ -1,9 +1,11 @@
 package folder
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -75,6 +77,11 @@ func (f *Folder) ScanNow() {
 func (f *Folder) scan(sub string) {
 	f.scanMu.Lock()
 	defer f.scanMu.Unlock()
+	defer func() {
+		if r := recover(); r != nil {
+			f.log.Error("recovered from a panic while scanning", "path", sub, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+		}
+	}()
 	if f.isBroken() {
 		return
 	}
@@ -90,6 +97,7 @@ func (f *Folder) scan(sub string) {
 	defer f.setStatus("idle")
 
 	seen := map[string]bool{}
+	seenFold := map[string]string{} // lower-case name -> name as found on disk (case-insensitive systems only)
 	var errPaths []string
 	var changed []model.FileInfo
 
@@ -127,6 +135,9 @@ func (f *Folder) scan(sub string) {
 				return fs.SkipDir
 			}
 			seen[rel] = true
+			if caseInsensitive {
+				seenFold[strings.ToLower(rel)] = rel
+			}
 			fi, ok, retry := f.scanEntry(rel, p, d)
 			if ok {
 				changed = append(changed, fi)
@@ -144,7 +155,11 @@ func (f *Folder) scan(sub string) {
 		if cur.Deleted || seen[cur.Name] || underAny(cur.Name, errPaths) || ig.Ignored(cur.Name, cur.Type == model.TypeDir) {
 			continue
 		}
-		if _, err := os.Lstat(filepath.Join(f.root, filepath.FromSlash(cur.Name))); err == nil {
+		if now, renamed := seenFold[strings.ToLower(cur.Name)]; caseInsensitive && renamed && now != cur.Name {
+			// "a.txt" became "A.txt": Lstat still finds the old spelling, but the entry
+			// for it is stale. Without this, both names stay alive in the index and the
+			// other devices end up with a conflict copy of every renamed file.
+		} else if _, err := os.Lstat(filepath.Join(f.root, filepath.FromSlash(cur.Name))); err == nil {
 			continue // exists but was not walked (e.g. symlink swapped in); leave it alone
 		}
 		cur.Deleted = true

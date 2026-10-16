@@ -59,11 +59,12 @@ type Folder struct {
 
 	ignore atomic.Pointer[Matcher]
 
-	mu     sync.Mutex
-	peers  map[string]*node.Peer
-	wanted map[string]*want
-	status string // idle | scanning | syncing | error
-	err    string
+	mu      sync.Mutex
+	peers   map[string]*node.Peer
+	senders map[string]*sender // one ordered outgoing queue per connected peer
+	wanted  map[string]*want
+	status  string // idle | scanning | syncing | error
+	err     string
 
 	scanMu  sync.Mutex
 	scanned chan struct{}
@@ -87,10 +88,13 @@ func New(cfg config.Folder, selfID, stateDir string, log *slog.Logger) (*Folder,
 	f := &Folder{
 		cfg: cfg, self: selfID, short: identity.Short(selfID), root: filepath.Clean(cfg.Path),
 		log: log.With("folder", cfg.ID), store: store,
-		peers: map[string]*node.Peer{}, wanted: map[string]*want{}, status: "idle",
+		peers: map[string]*node.Peer{}, senders: map[string]*sender{}, wanted: map[string]*want{}, status: "idle",
 		scanned: make(chan struct{}), kick: make(chan struct{}, 1), dirty: make(chan string, 4096),
 	}
 	f.ignore.Store(&Matcher{})
+	if store.Recovered != "" {
+		f.log.Warn("index repaired", "detail", store.Recovered)
+	}
 	if cfg.Secret != "" {
 		if f.sealer, err = seal.New(cfg.Secret); err != nil {
 			return nil, fmt.Errorf("folder secret: %w", err)
@@ -215,8 +219,11 @@ func (f *Folder) PeerUp(p *node.Peer) {
 	default:
 	}
 	f.peers[p.ID()] = p
-	f.mu.Unlock()
 
+	// The initial index is the first thing queued for this peer, computed while the
+	// peer is being registered: any later change is queued behind it, so batches
+	// leave in sequence order and an acknowledgement for a high sequence number can
+	// never stand in for a lower batch that has not been sent.
 	var entries []model.FileInfo
 	if f.cfg.IsRelay(p.ID()) {
 		// A relay only needs what changed since it last confirmed receipt. When
@@ -231,7 +238,13 @@ func (f *Folder) PeerUp(p *node.Peer) {
 	} else {
 		entries = f.store.All()
 	}
-	f.sendTo(p, entries)
+	sd := newSender(p)
+	sd.enqueue(entries)
+	f.senders[p.ID()] = sd
+	f.mu.Unlock()
+
+	// Not tracked by the folder's WaitGroup: it ends with the connection or the folder context.
+	go sd.run(f)
 	f.kickPull()
 }
 
@@ -239,6 +252,9 @@ func (f *Folder) PeerDown(p *node.Peer) {
 	f.mu.Lock()
 	if f.peers[p.ID()] == p {
 		delete(f.peers, p.ID())
+	}
+	if sd := f.senders[p.ID()]; sd != nil && sd.peer == p {
+		delete(f.senders, p.ID())
 	}
 	f.mu.Unlock()
 }
@@ -249,10 +265,24 @@ func (f *Folder) isBroken() bool {
 	return f.status == "error"
 }
 
-func (f *Folder) sendTo(p *node.Peer, entries []model.FileInfo) {
+// sendTo sends entries in messages of bounded size: a thousand large files can
+// otherwise add up to more than a frame may hold, which would drop the session
+// and make it retry forever.
+func (f *Folder) sendTo(p *node.Peer, entries []model.FileInfo, sentMax *atomic.Int64) bool {
 	toRelay := f.isRelay(p)
 	for len(entries) > 0 {
-		n := min(indexBatch, len(entries))
+		n, size := 0, 0
+		for n < len(entries) && n < indexBatch {
+			w := entries[n].WireSize()
+			if toRelay {
+				w = w * 3 / 2 // sealed entries are a little larger
+			}
+			if n > 0 && size+w > model.MaxIndexMessage {
+				break
+			}
+			size += w
+			n++
+		}
 		batch := entries[:n]
 		entries = entries[n:]
 		var maxSeq int64
@@ -262,13 +292,13 @@ func (f *Folder) sendTo(p *node.Peer, entries []model.FileInfo) {
 		idx := protocol.Index{Folder: f.cfg.ID, MaxSeq: maxSeq}
 		if toRelay {
 			if f.sealer == nil {
-				return
+				return true // nothing to send to a relay without a secret
 			}
 			for _, e := range batch {
 				se, err := f.sealEntry(e)
 				if err != nil {
 					f.log.Error("cannot seal entry for relay", "err", err)
-					return
+					return false
 				}
 				idx.Sealed = append(idx.Sealed, se)
 			}
@@ -276,32 +306,43 @@ func (f *Folder) sendTo(p *node.Peer, entries []model.FileInfo) {
 			idx.Entries = batch
 		}
 		if err := p.SendIndex(idx); err != nil {
-			return
+			return false
+		}
+		if sentMax != nil && maxSeq > sentMax.Load() {
+			sentMax.Store(maxSeq)
 		}
 	}
+	return true
 }
 
 // broadcast announces local changes to every connected peer, relays included
 // (for a relay, receiving an entry is also how it learns we hold that version).
+// Entries are queued per peer and sent in order by that peer's sender.
 func (f *Folder) broadcast(entries []model.FileInfo) {
 	if len(entries) == 0 {
 		return
 	}
 	f.mu.Lock()
-	peers := make([]*node.Peer, 0, len(f.peers))
-	for _, p := range f.peers {
-		peers = append(peers, p)
+	for _, sd := range f.senders {
+		sd.enqueue(entries)
 	}
 	f.mu.Unlock()
-	for _, p := range peers {
-		go f.sendTo(p, entries)
-	}
 }
 
 func (f *Folder) HandleIndexAck(p *node.Peer, ack protocol.IndexAck) {
-	if f.cfg.IsRelay(p.ID()) && ack.MaxSeq > 0 {
-		f.store.SetRelaySent(p.ID(), ack.MaxSeq)
+	if !f.cfg.IsRelay(p.ID()) || ack.MaxSeq <= 0 {
+		return
 	}
+	f.mu.Lock()
+	sd := f.senders[p.ID()]
+	f.mu.Unlock()
+	if sd == nil {
+		return
+	}
+	// Never trust an acknowledgement beyond what we really sent: a buggy or hostile
+	// relay claiming a huge number would silence all future uploads to it, and
+	// the claim is persisted.
+	f.store.SetRelaySent(p.ID(), min(ack.MaxSeq, sd.sentMax.Load()))
 }
 
 func (f *Folder) HandleProbe(p *node.Peer, items []protocol.ProbeItem) []bool {
@@ -324,7 +365,7 @@ func (f *Folder) HandleProbe(p *node.Peer, items []protocol.ProbeItem) []bool {
 // HandleRequest serves one block of a file we hold. Relays only ever get
 // encrypted blocks; full devices get plain ones.
 func (f *Folder) HandleRequest(p *node.Peer, r protocol.Request) ([]byte, string) {
-	if f.isBroken() || r.Size <= 0 || r.Size > 32<<20 || r.Offset < 0 {
+	if f.isBroken() || r.Size <= 0 || r.Size > maxBlockSize || r.Offset < 0 {
 		return nil, protocol.ErrNotFound
 	}
 	if d := time.Duration(serveDelay.Load()); d > 0 {

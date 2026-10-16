@@ -56,7 +56,7 @@ func loadIgnore(root string) *Matcher {
 // ignored when it or any of its parent directories matches.
 func (m *Matcher) Ignored(rel string, isDir bool) bool {
 	parts := strings.Split(rel, "/")
-	if parts[0] == MetaDir || rel == IgnoreFile {
+	if strings.EqualFold(parts[0], MetaDir) || rel == IgnoreFile {
 		return true
 	}
 	for i := range parts {

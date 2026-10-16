@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"sync"
@@ -58,7 +59,9 @@ type FolderHandler interface {
 	Stop()
 	PeerUp(p *Peer)
 	PeerDown(p *Peer)
-	HandleIndex(p *Peer, idx protocol.Index)
+	// HandleIndex returns true when the entries were processed (and, for a relay,
+	// durably stored): only then does the node acknowledge them to the sender.
+	HandleIndex(p *Peer, idx protocol.Index) (acknowledge bool)
 	HandleIndexAck(p *Peer, ack protocol.IndexAck)
 	// HandleRequest returns the requested block or an error code from protocol.Err*.
 	HandleRequest(p *Peer, r protocol.Request) ([]byte, string)
@@ -102,12 +105,13 @@ type Node struct {
 	redial   time.Duration
 	known    map[peer.ID]config.Device
 
-	host   host.Host
-	dht    *dht.IpfsDHT
-	mdns   mdns.Service
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	host     host.Host
+	dht      *dht.IpfsDHT
+	mdns     mdns.Service
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	serveSem chan struct{} // bounds concurrently served block/probe streams
 
 	mu          sync.Mutex
 	peers       map[string]*Peer
@@ -129,7 +133,7 @@ func New(o Options) *Node {
 	}
 	n := &Node{cfg: o.Config, id: o.Identity, log: o.Logger, opts: o, redial: o.RedialMax,
 		handlers: map[string]FolderHandler{}, known: map[peer.ID]config.Device{},
-		peers: map[string]*Peer{}, opening: map[peer.ID]bool{}, strangerIPs: map[string]int{}, pairing: map[peer.ID]bool{}, slots: map[network.Conn]func(){}, kick: map[peer.ID]chan struct{}{},
+		peers: map[string]*Peer{}, serveSem: make(chan struct{}, 32), opening: map[peer.ID]bool{}, strangerIPs: map[string]int{}, pairing: map[peer.ID]bool{}, slots: map[network.Conn]func(){}, kick: map[peer.ID]chan struct{}{},
 		disco: map[peer.ID][]ma.Multiaddr{}}
 	for _, h := range o.Handlers {
 		n.handlers[h.ID()] = h
@@ -590,6 +594,7 @@ func (n *Node) openStream(ctx context.Context, pid peer.ID, proto protocolID, pa
 
 func (n *Node) runSession(s network.Stream, outbound bool) {
 	defer s.Reset()
+	defer n.recoverPanic("session")
 	pid := s.Conn().RemotePeer()
 	dev, ok := n.known[pid]
 	if !ok {
@@ -606,7 +611,7 @@ func (n *Node) runSession(s network.Stream, outbound bool) {
 		return
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-	t, hb, _, err := conn.Recv()
+	t, hb, _, err := conn.RecvMax(64 << 10) // a hello is a few hundred bytes
 	if err != nil || t != protocol.TypeHello {
 		return
 	}
@@ -654,6 +659,7 @@ func (n *Node) runSession(s network.Stream, outbound bool) {
 
 	go func() {
 		defer close(upDone)
+		defer n.recoverPanic("PeerUp")
 		for f := range p.shared {
 			select {
 			case <-p.done: // replaced or closed before we got here
@@ -733,8 +739,9 @@ func (n *Node) readLoop(p *Peer) {
 				return
 			}
 			if h := n.handler(p, idx.Folder); h != nil {
-				h.HandleIndex(p, idx)
-				_ = p.sendIndexAck(idx.Folder, idx.MaxSeq)
+				if h.HandleIndex(p, idx) {
+					_ = p.sendIndexAck(idx.Folder, idx.MaxSeq)
+				}
 			}
 		case protocol.TypeIndexAck:
 			var ack protocol.IndexAck
@@ -766,16 +773,18 @@ func (n *Node) sessionPeer(s network.Stream) *Peer {
 // serveBlock answers one block request on its own stream.
 func (n *Node) serveBlock(s network.Stream) {
 	defer s.Close()
+	defer n.recoverPanic("serveBlock")
 	p := n.sessionPeer(s)
-	if p == nil {
+	if p == nil || !n.acquireServe() {
 		_ = s.Reset()
 		return
 	}
+	defer n.releaseServe()
 	n.wg.Add(1)
 	defer n.wg.Done()
 	_ = s.SetDeadline(time.Now().Add(3 * time.Minute))
 	c := protocol.NewConn(s)
-	t, hb, _, err := c.Recv()
+	t, hb, _, err := c.RecvMax(64 << 10) // a request is a few hundred bytes
 	var r protocol.Request
 	if err != nil || t != protocol.TypeRequest || json.Unmarshal(hb, &r) != nil {
 		_ = s.Reset()
@@ -791,16 +800,18 @@ func (n *Node) serveBlock(s network.Stream) {
 
 func (n *Node) serveProbe(s network.Stream) {
 	defer s.Close()
+	defer n.recoverPanic("serveProbe")
 	p := n.sessionPeer(s)
-	if p == nil {
+	if p == nil || !n.acquireServe() {
 		_ = s.Reset()
 		return
 	}
+	defer n.releaseServe()
 	n.wg.Add(1)
 	defer n.wg.Done()
 	_ = s.SetDeadline(time.Now().Add(time.Minute))
 	c := protocol.NewConn(s)
-	t, hb, _, err := c.Recv()
+	t, hb, _, err := c.RecvMax(8 << 20) // a probe lists versions: bounded, but can be long
 	var pr protocol.Probe
 	if err != nil || t != protocol.TypeProbe || json.Unmarshal(hb, &pr) != nil {
 		_ = s.Reset()
@@ -812,6 +823,29 @@ func (n *Node) serveProbe(s network.Stream) {
 	}
 	_ = c.Send(protocol.TypeProbeReply, protocol.ProbeReply{Have: have}, nil)
 }
+
+// recoverPanic turns a panic in a per-connection goroutine into a logged error
+// and a closed stream instead of a crashed daemon. A malformed message from a
+// peer must never be able to take the whole device down.
+func (n *Node) recoverPanic(what string) {
+	if r := recover(); r != nil {
+		n.log.Error("recovered from a panic; the connection was dropped", "where", what, "panic", fmt.Sprint(r),
+			"stack", string(debug.Stack()))
+	}
+}
+
+// acquireServe limits concurrent block/probe streams being served, so a peer
+// opening many streams cannot exhaust memory. It returns false when saturated.
+func (n *Node) acquireServe() bool {
+	select {
+	case n.serveSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (n *Node) releaseServe() { <-n.serveSem }
 
 // notifee reacts to connections appearing and disappearing.
 type notifee struct{ n *Node }
@@ -924,6 +958,7 @@ func remoteIP(c network.Conn) string {
 // servePair handles the only conversation a stranger may have with us.
 func (n *Node) servePair(s network.Stream) {
 	defer s.Close()
+	defer n.recoverPanic("servePair")
 	if !n.pairingActive() {
 		_ = s.Reset()
 		return

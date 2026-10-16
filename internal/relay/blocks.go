@@ -2,10 +2,21 @@ package relay
 
 import (
 	"encoding/hex"
+	"time"
+
+	"github.com/aurelienbaraquin/pairtopairsync/internal/fsutil"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
+
+func isTemp(name string) bool {
+	return strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, ".part")
+}
+
+// partGrace is how long an unreferenced temporary file is left alone.
+const partGrace = 10 * time.Minute
 
 func (r *Relay) blockPath(hash []byte) string {
 	h := hex.EncodeToString(hash)
@@ -25,11 +36,9 @@ func (r *Relay) writeBlock(hash, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
-	tmp := p + ".part"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, p)
+	// A block is written to its final name only once complete and flushed, so a
+	// crash can leave a stray ".part" (cleaned later) but never a short block.
+	return fsutil.WriteFileAtomic(p, data, 0o600)
 }
 
 func (r *Relay) storeBytesLocked() int64 {
@@ -59,9 +68,17 @@ func (r *Relay) gcBlocksLocked() {
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		if !keep[d.Name()] {
-			_ = os.Remove(p)
+		if keep[d.Name()] {
+			return nil
 		}
+		// A temporary file may belong to a download in progress (a 16 MB block over a
+		// slow link takes minutes): only remove ones that have clearly been abandoned.
+		if isTemp(d.Name()) {
+			if info, e := d.Info(); e == nil && time.Since(info.ModTime()) < partGrace {
+				return nil
+			}
+		}
+		_ = os.Remove(p)
 		return nil
 	})
 	// Remove now-empty shard directories.

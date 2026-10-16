@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -184,5 +185,126 @@ func TestDeliveredTableSurvivesRestartAndIsBounded(t *testing.T) {
 	r2.mu.Unlock()
 	if size != 3 {
 		t.Fatalf("table not bounded: %d", size)
+	}
+}
+
+func newTestRelay(t *testing.T, dir string) *Relay {
+	t.Helper()
+	return New(config.Folder{ID: "f", Path: dir, Role: config.RoleRelay,
+		Devices: []config.FolderDevice{{ID: "A"}, {ID: "B"}}}, "SELF", slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// A power cut can truncate pending.json. That must not stop the device from
+// starting (it would take every folder down with it).
+func TestCorruptPendingFileIsSetAsideNotFatal(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "pending.json"), []byte(`{"abc": {"entry": {"id": "tru`), 0o600)
+	r := newTestRelay(t, dir)
+	if err := r.Start(t.Context()); err != nil {
+		t.Fatalf("a corrupt pending.json prevented startup: %v", err)
+	}
+	defer r.Stop()
+	if len(r.pending) != 0 {
+		t.Fatal("expected an empty table")
+	}
+	kept, _ := filepath.Glob(filepath.Join(dir, "pending.json.corrupt-*"))
+	if len(kept) != 1 {
+		t.Fatalf("the damaged file should be kept for inspection, found %v", kept)
+	}
+}
+
+// After a crash, metadata may claim data that is not on disk. It must be re-checked.
+func TestMissingBlocksAreDetectedAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	r := newTestRelay(t, dir)
+	id := "0123456789abcdef0123456789abcdef"
+	h := bytes.Repeat([]byte{7}, 32)
+	pending := map[string]*Pending{id: {Entry: protocol.SealedEntry{ID: id, Size: 10, BlockSize: 128 << 10,
+		CBlocks: [][]byte{h}, Version: model.Vector{"A": 1}, Meta: []byte("m")}, Acked: map[string]bool{"A": true}, Have: true, Since: time.Now()}}
+	b, _ := json.Marshal(pending)
+	os.WriteFile(filepath.Join(dir, "pending.json"), b, 0o600)
+	// A short block: the file exists but is truncated.
+	os.MkdirAll(filepath.Dir(r.blockPath(h)), 0o700)
+	os.WriteFile(r.blockPath(h), []byte("short"), 0o600)
+	if err := r.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Stop()
+	if r.pending[id].Have {
+		t.Fatal("a truncated block was trusted as complete")
+	}
+	// A complete one is accepted.
+	full := make([]byte, 10+protocol.SealOverhead)
+	os.WriteFile(r.blockPath(h), full, 0o600)
+	r.mu.Lock()
+	r.verifyBlocksLocked()
+	r.mu.Unlock()
+	if !r.pending[id].Have {
+		t.Fatal("a complete block was not recognised")
+	}
+}
+
+// The sender may only forget a change once the relay has really stored it.
+func TestNoAcknowledgementWhenTheChangeCannotBeStored(t *testing.T) {
+	dir := t.TempDir()
+	r := newTestRelay(t, dir)
+	if err := r.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Stop()
+	if _, ok := r.ingest("A", []protocol.SealedEntry{sealedEntry("0123456789abcdef0123456789abcdef", model.Vector{"A": 1})}); !ok {
+		t.Fatal("a normal change must be acknowledged")
+	}
+	// Make storing impossible: a directory where the file should go.
+	os.Remove(filepath.Join(dir, "pending.json"))
+	os.Mkdir(filepath.Join(dir, "pending.json"), 0o700)
+	if _, ok := r.ingest("A", []protocol.SealedEntry{sealedEntry("fedcba9876543210fedcba9876543210", model.Vector{"A": 1})}); ok {
+		t.Fatal("a change that could not be stored was acknowledged: the sender would forget it")
+	}
+}
+
+func TestPendingTableIsBounded(t *testing.T) {
+	old := maxPending
+	maxPending = 3
+	defer func() { maxPending = old }()
+	r := newTestRelay(t, t.TempDir())
+	if err := r.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Stop()
+	var es []protocol.SealedEntry
+	for i := 0; i < 6; i++ {
+		es = append(es, sealedEntry(fmt.Sprintf("%032d", i), model.Vector{"A": 1}))
+	}
+	if _, ok := r.ingest("A", es); ok {
+		t.Fatal("entries beyond the cap must not be acknowledged")
+	}
+	if len(r.pending) != 3 {
+		t.Fatalf("table holds %d entries, cap is 3", len(r.pending))
+	}
+}
+
+// The garbage collector must not delete a block that is still being downloaded.
+func TestGCSparesDownloadsInProgress(t *testing.T) {
+	r := newTestRelay(t, t.TempDir())
+	if err := r.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Stop()
+	dir := filepath.Join(r.dir, "blocks", "ab")
+	os.MkdirAll(dir, 0o700)
+	young, old := filepath.Join(dir, "abcd.1.tmp"), filepath.Join(dir, "abcd.2.tmp")
+	os.WriteFile(young, []byte("x"), 0o600)
+	os.WriteFile(old, []byte("x"), 0o600)
+	past := time.Now().Add(-2 * partGrace)
+	os.Chtimes(old, past, past)
+	r.mu.Lock()
+	r.gcBlocksLocked()
+	r.mu.Unlock()
+	if _, err := os.Stat(young); err != nil {
+		t.Fatal("a download in progress was deleted")
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatal("an abandoned temporary file was not cleaned up")
 	}
 }

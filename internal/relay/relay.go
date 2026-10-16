@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/fsutil"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/model"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/node"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/protocol"
@@ -101,13 +102,21 @@ func (r *Relay) Start(ctx context.Context) error {
 	if err := os.MkdirAll(filepath.Join(r.dir, "blocks"), 0o700); err != nil {
 		return err
 	}
-	if b, err := os.ReadFile(filepath.Join(r.dir, "pending.json")); err == nil {
-		if err := json.Unmarshal(b, &r.pending); err != nil {
-			return fmt.Errorf("corrupt pending.json: %w", err)
+	pendingPath := filepath.Join(r.dir, "pending.json")
+	if b, err := os.ReadFile(pendingPath); err == nil {
+		if err := json.Unmarshal(b, &r.pending); err != nil || r.pending == nil {
+			// A power cut can leave a truncated file. Refusing to start would take every
+			// folder of the device down with it: set the damaged file aside and start
+			// empty. Devices still hold their changes and will announce them again.
+			quarantine := fmt.Sprintf("%s.corrupt-%d", pendingPath, time.Now().Unix())
+			_ = os.Rename(pendingPath, quarantine)
+			r.log.Error("pending.json was unreadable; set aside and starting empty", "err", err, "kept_as", filepath.Base(quarantine))
+			r.pending = map[string]*Pending{}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	r.verifyBlocksLocked()
 	if b, err := os.ReadFile(filepath.Join(r.dir, "delivered.json")); err == nil {
 		_ = json.Unmarshal(b, &r.delivered) // best effort: a lost table only costs a redundant fetch
 		if r.delivered == nil {
@@ -180,9 +189,16 @@ func (r *Relay) announceableLocked(dev string) []protocol.SealedEntry {
 }
 
 func (r *Relay) send(p *node.Peer, entries []protocol.SealedEntry) {
-	const batch = 500
 	for len(entries) > 0 {
-		n := min(batch, len(entries))
+		n, size := 0, 0
+		for n < len(entries) && n < 500 {
+			w := entries[n].WireSize()
+			if n > 0 && size+w > model.MaxIndexMessage {
+				break
+			}
+			size += w
+			n++
+		}
 		if p.SendIndex(protocol.Index{Folder: r.cfg.ID, Sealed: entries[:n]}) != nil {
 			return
 		}
@@ -217,23 +233,29 @@ func (r *Relay) announce(names ...string) {
 
 // HandleIndex receives sealed changes announced by a full device. Plaintext
 // entries are refused outright: a relay has no business seeing them.
-func (r *Relay) HandleIndex(p *node.Peer, idx protocol.Index) {
+func (r *Relay) HandleIndex(p *node.Peer, idx protocol.Index) bool {
 	if r.cfg.IsRelay(p.ID()) {
-		return
+		return false
 	}
 	if len(idx.Entries) > 0 {
 		r.log.Warn("refusing plaintext entries: this device only accepts encrypted ones", "from", p.Name())
 	}
-	announce := r.ingest(p.ID(), idx.Sealed)
+	announce, ok := r.ingest(p.ID(), idx.Sealed)
 	r.announce(announce...)
 	r.kick()
+	return ok
 }
 
 // ingest records sealed changes announced by the full device `from` and returns
 // the IDs that should be announced to the other devices.
-func (r *Relay) ingest(from string, entries []protocol.SealedEntry) (announce []string) {
+//
+// ok is false when the changes could not be stored durably (disk full, I/O
+// error) or were refused for lack of room: the sender must then not be told
+// they were received, so that it offers them again later instead of forgetting.
+func (r *Relay) ingest(from string, entries []protocol.SealedEntry) (announce []string, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	ok = true
 	for _, e := range entries {
 		if !validSealed(e) {
 			continue
@@ -242,6 +264,10 @@ func (r *Relay) ingest(from string, entries []protocol.SealedEntry) (announce []
 			continue // already delivered to everyone: a late acknowledgement, not a new change
 		}
 		cur := r.pending[e.ID]
+		if cur == nil && len(r.pending) >= maxPending {
+			ok = false // table full: a flood of entries must not exhaust the phone
+			continue
+		}
 		switch {
 		case cur == nil:
 			r.pending[e.ID] = r.newPendingLocked(e, from)
@@ -266,10 +292,17 @@ func (r *Relay) ingest(from string, entries []protocol.SealedEntry) (announce []
 			}
 		}
 	}
+	// Save first, then collect garbage: after a crash between the two, an old entry
+	// reappearing with its data deleted would be worse than a few orphan blocks.
+	if err := r.saveLocked(); err != nil {
+		ok = false
+	}
 	r.gcBlocksLocked()
-	r.saveLocked() // durable before the node acknowledges the index
-	return announce
+	return announce, ok
 }
+
+// maxPending bounds the number of undelivered changes a relay will hold.
+var maxPending = 50000
 
 func (r *Relay) newPendingLocked(e protocol.SealedEntry, from string) *Pending {
 	pd := &Pending{Entry: e, Acked: map[string]bool{from: true}, Since: time.Now(), Have: true}
@@ -390,8 +423,8 @@ func (r *Relay) evaluate() {
 		go func() { defer r.wg.Done(); r.fetch(name, pd) }()
 	}
 	if removed {
+		_ = r.saveLocked() // then collect: see ingest
 		r.gcBlocksLocked()
-		r.saveLocked()
 	}
 	r.mu.Unlock()
 }
@@ -518,7 +551,7 @@ feed:
 	if r.pending[name] == pd { // not superseded meanwhile
 		pd.Have = true
 		r.overflow = false
-		r.saveLocked()
+		_ = r.saveLocked()
 		r.mu.Unlock()
 		r.log.Info("change stored on relay, waiting for absent devices", "change", short(name))
 		r.announce(name)
@@ -580,32 +613,50 @@ func (r *Relay) probePeer(p *node.Peer) {
 			pd.Acked[p.ID()] = true
 		}
 	}
-	r.saveLocked()
+	_ = r.saveLocked()
 	r.mu.Unlock()
 	r.kick()
 }
 
 // ---- persistence and block store -------------------------------------------
 
-func (r *Relay) saveLocked() {
+// saveLocked writes pending.json (and the delivered table) durably: a unique
+// temporary file, flushed to disk, then renamed. It returns the error so that a
+// caller can refuse to acknowledge a change that was not actually stored.
+func (r *Relay) saveLocked() error {
 	b, err := json.Marshal(r.pending)
 	if err != nil {
-		r.log.Error("cannot encode pending changes", "err", err)
-		return
+		return err
 	}
-	path := filepath.Join(r.dir, "pending.json")
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err == nil {
-		err = os.Rename(tmp, path)
-	}
-	if err != nil {
+	if err := fsutil.WriteFileAtomic(filepath.Join(r.dir, "pending.json"), b, 0o600); err != nil {
 		r.log.Error("cannot save pending changes", "err", err)
+		return err
 	}
 	if db, derr := json.Marshal(r.delivered); derr == nil {
-		dpath := filepath.Join(r.dir, "delivered.json")
-		if os.WriteFile(dpath+".tmp", db, 0o600) == nil {
-			_ = os.Rename(dpath+".tmp", dpath)
+		// Best effort: a lost table only costs one redundant download.
+		_ = fsutil.WriteFileAtomic(filepath.Join(r.dir, "delivered.json"), db, 0o600)
+	}
+	return nil
+}
+
+// verifyBlocksLocked recomputes, after a restart, which changes really have all
+// their data on disk. A crash can leave a missing or short block while the
+// metadata says otherwise.
+func (r *Relay) verifyBlocksLocked() {
+	for id, pd := range r.pending {
+		have := true
+		for i, h := range pd.Entry.CBlocks {
+			_, size := pd.Entry.BlockRange(i)
+			fi, err := os.Stat(r.blockPath(h))
+			if err != nil || fi.Size() != int64(size+protocol.SealOverhead) {
+				have = false
+				break
+			}
 		}
+		if pd.Have && !have {
+			r.log.Warn("stored data is incomplete after a restart; fetching it again", "change", short(id))
+		}
+		pd.Have = have
 	}
 }
 

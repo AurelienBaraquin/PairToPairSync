@@ -11,9 +11,9 @@ import (
 
 // HandleIndex compares what a peer announces with what we have and records
 // what must be downloaded. It never touches the disk itself.
-func (f *Folder) HandleIndex(p *node.Peer, idx protocol.Index) {
+func (f *Folder) HandleIndex(p *node.Peer, idx protocol.Index) bool {
 	if !f.waitScanned() || f.isBroken() {
-		return
+		return false
 	}
 	ig := f.ignore.Load()
 	var changed []model.FileInfo
@@ -24,7 +24,7 @@ func (f *Folder) HandleIndex(p *node.Peer, idx protocol.Index) {
 		// From a relay we accept sealed entries only, and only if they authenticate.
 		entries = nil
 		if f.sealer == nil {
-			return
+			return false
 		}
 		for _, se := range idx.Sealed {
 			fi, err := f.unseal(se)
@@ -38,7 +38,7 @@ func (f *Folder) HandleIndex(p *node.Peer, idx protocol.Index) {
 
 	f.mu.Lock()
 	for _, e := range entries {
-		if !validName(e.Name) || ig.Ignored(e.Name, e.Type == model.TypeDir) || e.Version == nil {
+		if !validName(e.Name) || ig.Ignored(e.Name, e.Type == model.TypeDir) || e.Version == nil || !validEntry(e) {
 			continue
 		}
 		local, have := f.store.Get(e.Name)
@@ -85,9 +85,49 @@ func (f *Folder) HandleIndex(p *node.Peer, idx protocol.Index) {
 	if needed {
 		f.kickPull()
 	}
+	return true
 }
 
-// addWant records a download; callers hold f.mu.
+const (
+	maxFileSize  = 1 << 50
+	maxBlockSize = 16 << 20
+)
+
+// validEntry checks the shape of an entry received from another device before
+// anything is derived from it. A peer is trusted to hold your files, not to be
+// bug-free: a negative block size, or a size that does not match the block list,
+// must never reach code that allocates or truncates based on those numbers.
+func validEntry(e model.FileInfo) bool {
+	if len(e.Name) > 4096 || e.Size < 0 || e.Size > maxFileSize || len(e.Version) > 256 {
+		return false
+	}
+	if e.Deleted || e.Type == model.TypeDir {
+		return e.Size == 0 && len(e.Blocks) == 0 // directories and tombstones carry no data
+	}
+	if e.Type != model.TypeFile {
+		return false
+	}
+	if e.Size == 0 {
+		return len(e.Blocks) == 0
+	}
+	if e.BlockSize <= 0 || e.BlockSize > maxBlockSize {
+		return false
+	}
+	if int64(len(e.Blocks)) != (e.Size+int64(e.BlockSize)-1)/int64(e.BlockSize) {
+		return false
+	}
+	for _, h := range e.Blocks {
+		if len(h) != 32 {
+			return false
+		}
+	}
+	return true
+}
+
+// addWant records a download; callers hold f.mu. When two devices announce
+// concurrent versions of the same file, only the canonical winner is kept pending:
+// keeping the later arrival would turn the same losing content into several
+// differently named conflict copies once three devices are involved.
 func (f *Folder) addWant(e model.FileInfo, from string, conflict bool) {
 	if cur, ok := f.wanted[e.Name]; ok {
 		switch cur.entry.Version.Compare(e.Version) {
@@ -96,6 +136,10 @@ func (f *Folder) addWant(e model.FileInfo, from string, conflict bool) {
 			return
 		case model.Greater:
 			return
+		case model.Concurrent:
+			if cur.entry.WinsOver(e) {
+				return
+			}
 		}
 	}
 	f.wanted[e.Name] = &want{entry: e, sources: map[string]bool{from: true}, conflict: conflict}

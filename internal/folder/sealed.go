@@ -113,6 +113,10 @@ func (f *Folder) readBlock(name string, off int64, size int) ([]byte, string) {
 		return nil, protocol.ErrNotFound
 	}
 	defer file.Close()
+	// Never allocate what the file cannot supply: the size comes from a peer.
+	if fi, err := file.Stat(); err != nil || size <= 0 || off < 0 || off+int64(size) > fi.Size() {
+		return nil, protocol.ErrChanged
+	}
 	buf := make([]byte, size)
 	if n, _ := file.ReadAt(buf, off); n != size {
 		return nil, protocol.ErrChanged

@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -36,5 +37,28 @@ func TestFrameRoundTrip(t *testing.T) {
 	typ, hdr, body, err := NewConn(pipeStream{b}).RecvMax(4096)
 	if err != nil || typ != TypePair || !bytes.Contains(hdr, []byte(`"token":"t"`)) || string(body) != "body" {
 		t.Fatalf("%v %v %s %v", typ, string(hdr), body, err)
+	}
+}
+
+// A peer that claims a 60 MB frame and sends 100 bytes must not make us reserve 60 MB.
+func TestRecvDoesNotAllocateTheClaimedSize(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	go func() {
+		_, _ = a.Write([]byte{0x03, 0x93, 0x87, 0x00}) // 60,000,000
+		_, _ = a.Write(make([]byte, 100))
+		a.Close() // then trickle nothing more
+	}()
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	c := NewConn(pipeStream{b})
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, _, err := c.Recv(); err == nil {
+		t.Fatal("a truncated frame was accepted")
+	}
+	runtime.ReadMemStats(&after)
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 8<<20 {
+		t.Fatalf("allocated %d MB for a frame that never arrived", grew>>20)
 	}
 }

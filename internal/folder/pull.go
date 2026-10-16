@@ -1,6 +1,7 @@
 package folder
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,9 +10,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/aurelienbaraquin/pairtopairsync/internal/fsutil"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/model"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/node"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/protocol"
@@ -63,7 +67,7 @@ func (f *Folder) pullRound() {
 			if peer == nil {
 				continue // nobody who has it is connected right now
 			}
-			err := f.apply(w, peer)
+			err := f.safeApply(w, peer)
 			f.mu.Lock()
 			if f.wanted[w.entry.Name] == w {
 				if err == nil {
@@ -109,6 +113,11 @@ type diskState struct {
 	untouched bool // exists and matches the index entry exactly
 }
 
+// mtimeSlack is how far a stored timestamp may differ from the file's own and
+// still be considered the same instant: FAT and exFAT keep 2-second resolution,
+// SMB shares and some sync clients round as well.
+const mtimeSlack = 2 * time.Second
+
 func (f *Folder) inspect(abs string, cur model.FileInfo, have bool) diskState {
 	fi, err := os.Lstat(abs)
 	if err != nil {
@@ -119,14 +128,80 @@ func (f *Folder) inspect(abs string, cur model.FileInfo, have bool) diskState {
 		switch {
 		case fi.IsDir():
 			ds.untouched = cur.Type == model.TypeDir
-		case fi.Mode().IsRegular():
-			ds.untouched = cur.Type == model.TypeFile && cur.Size == fi.Size() && cur.ModTime == fi.ModTime().UnixNano()
+		case fi.Mode().IsRegular() && cur.Type == model.TypeFile && cur.Size == fi.Size():
+			d := time.Duration(fi.ModTime().UnixNano() - cur.ModTime)
+			switch {
+			case d == 0:
+				ds.untouched = true
+			case d > -mtimeSlack && d < mtimeSlack:
+				// A rounded timestamp or a real edit within the same moment: only the
+				// content can tell. (Overwriting on a guess would lose an edit.)
+				ds.untouched = contentMatches(abs, cur)
+			}
 		}
 	}
 	return ds
 }
 
+// contentMatches hashes the file and compares it with the indexed blocks.
+func contentMatches(abs string, cur model.FileInfo) bool {
+	file, err := os.Open(abs)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	_, blocks, _, err := model.HashBlocks(file, cur.Size)
+	if err != nil || len(blocks) != len(cur.Blocks) {
+		return false
+	}
+	for i := range blocks {
+		if !bytes.Equal(blocks[i], cur.Blocks[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// inspectName is inspect, aware of case-insensitive file systems. If "a.txt" is
+// being replaced by "A.txt" (a case-only rename), the file on disk matches the
+// *old* entry, and must not be taken for an unknown local file.
+func (f *Folder) inspectName(name, abs string, cur model.FileInfo, have bool) diskState {
+	ds := f.inspect(abs, cur, have)
+	if caseInsensitive && ds.exists && !ds.untouched {
+		for _, sib := range f.foldSiblings(name) {
+			if f.inspect(abs, sib, true).untouched {
+				ds.untouched = true
+				break
+			}
+		}
+	}
+	return ds
+}
+
+// foldSiblings returns live index entries whose name differs from name only by case.
+func (f *Folder) foldSiblings(name string) []model.FileInfo {
+	if !caseInsensitive {
+		return nil
+	}
+	lower := strings.ToLower(name)
+	var out []model.FileInfo
+	for _, e := range f.store.Under("") {
+		if !e.Deleted && e.Name != name && strings.ToLower(e.Name) == lower {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+var errLocalChanged = errors.New("the local file changed while the update was being prepared")
+
 // apply brings one wanted entry to disk.
+//
+// The decision made when the change was announced may be stale by now (the
+// download queued behind a slow one, the source offline, a retry back-off): the
+// user can have edited the file since, and the scanner recorded a newer local
+// version. So it is made again here, from the index as it is *now*, and again
+// just before the file is replaced.
 func (f *Folder) apply(w *want, peer *node.Peer) error {
 	e := w.entry
 	abs, err := f.abs(e.Name)
@@ -134,7 +209,25 @@ func (f *Folder) apply(w *want, peer *node.Peer) error {
 		return err
 	}
 	cur, have := f.store.Get(e.Name)
-	ds := f.inspect(abs, cur, have)
+	conflict := false
+	if have {
+		switch cur.Version.Compare(e.Version) {
+		case model.Equal, model.Greater:
+			return nil // we already have this, or something newer: nothing to apply
+		case model.Concurrent:
+			switch {
+			case e.SameContent(cur):
+				cur.Version = cur.Version.Merge(e.Version)
+				f.broadcast([]model.FileInfo{f.store.Put(cur)})
+				return nil
+			case !e.WinsOver(cur):
+				return nil // our version wins; the other device will fetch it and keep its own as a copy
+			}
+			conflict = !cur.Deleted // the local version loses: it must be preserved
+		}
+	}
+	w.conflict = conflict
+	ds := f.inspectName(e.Name, abs, cur, have)
 
 	switch {
 	case e.Deleted:
@@ -154,8 +247,15 @@ func (f *Folder) applyDelete(e model.FileInfo, abs string, ds diskState) error {
 		f.queueScan(e.Name)
 		return nil
 	}
+	// On a case-insensitive file system "a.txt" and "A.txt" are one file. If the
+	// index holds the file under another case, this tombstone is the *old half of a
+	// rename*: removing the path would delete the renamed file.
+	if ds.exists && len(f.foldSiblings(e.Name)) > 0 {
+		f.broadcast([]model.FileInfo{f.store.Put(e)})
+		return nil
+	}
 	if ds.exists {
-		if err := os.Remove(abs); err != nil {
+		if err := fsutil.Remove(abs); err != nil {
 			return err // typically a directory that is not empty yet; retried
 		}
 	}
@@ -165,7 +265,12 @@ func (f *Folder) applyDelete(e model.FileInfo, abs string, ds diskState) error {
 
 func (f *Folder) applyDir(e model.FileInfo, abs string, ds diskState) error {
 	if ds.exists && !ds.isDir {
-		if err := f.moveAside(e.Name, abs); err != nil {
+		if ds.untouched {
+			// An unmodified file becoming a directory is a plain replacement, not a conflict.
+			if err := fsutil.Remove(abs); err != nil {
+				return err
+			}
+		} else if err := f.moveAside(e.Name, abs); err != nil {
 			return err
 		}
 	}
@@ -186,16 +291,31 @@ func (f *Folder) applyFile(w *want, peer *node.Peer, abs string, cur model.FileI
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return err
 	}
-	// Look again right before swapping: the user may have edited the file while
-	// we were downloading. Whatever is there and unknown to the index is kept.
-	ds = f.inspect(abs, cur, have)
-	if ds.exists && (!ds.untouched || w.conflict) {
+	// The download took time. Look again, at the index and at the disk, right
+	// before swapping: a local edit recorded meanwhile must be decided afresh (the
+	// next attempt will), and one not yet recorded must be kept.
+	if latest, has := f.store.Get(e.Name); has != have || (has && latest.Version.Compare(cur.Version) != model.Equal) {
+		return errLocalChanged
+	}
+	ds = f.inspectName(e.Name, abs, cur, have)
+	if ds.exists && ds.isDir {
+		// A directory is being replaced by a file: an empty one is simply removed.
+		if err := os.Remove(abs); err != nil {
+			if err := f.moveAside(e.Name, abs); err != nil {
+				return err
+			}
+		}
+	} else if ds.exists && (!ds.untouched || w.conflict) {
 		if err := f.moveAside(e.Name, abs); err != nil {
 			return err
 		}
 	}
-	if err := os.Rename(tmp, abs); err != nil {
-		return err
+	if err := fsutil.Rename(tmp, abs); err != nil {
+		// Windows refuses to replace a read-only file.
+		fsutil.ClearReadOnly(abs)
+		if err = fsutil.Rename(tmp, abs); err != nil {
+			return err
+		}
 	}
 	f.broadcast([]model.FileInfo{f.store.Put(e)})
 	return nil
@@ -203,9 +323,9 @@ func (f *Folder) applyFile(w *want, peer *node.Peer, abs string, cur model.FileI
 
 // moveAside renames the file at abs to a sync-conflict copy and asks for it to be indexed.
 func (f *Folder) moveAside(name, abs string) error {
-	cname := conflictName(name, f.short, time.Now())
+	cname := uniqueConflictName(f.root, name, f.short, time.Now())
 	dst := filepath.Join(f.root, filepath.FromSlash(cname))
-	if err := os.Rename(abs, dst); err != nil {
+	if err := fsutil.Rename(abs, dst); err != nil {
 		return err
 	}
 	f.log.Info("conflict: kept local version as a copy", "file", name, "copy", cname)
@@ -386,4 +506,16 @@ func peerAlive(p *node.Peer) bool {
 	default:
 		return true
 	}
+}
+
+// safeApply applies one entry; a panic (a bug triggered by unexpected data) fails
+// that entry, with a log, instead of taking the whole daemon down.
+func (f *Folder) safeApply(w *want, peer *node.Peer) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			f.log.Error("recovered from a panic while applying a change", "file", w.entry.Name, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			err = fmt.Errorf("internal error: %v", r)
+		}
+	}()
+	return f.apply(w, peer)
 }
