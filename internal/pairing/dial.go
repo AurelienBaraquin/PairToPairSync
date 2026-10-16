@@ -60,7 +60,11 @@ func Dial(ctx context.Context, key crypto.PrivKey, inv Invite, req protocol.Pair
 		return protocol.PairResponse{}, fmt.Errorf("the other device refused to pair (invitation expired or already used?): %w", err)
 	}
 	defer s.Close()
-	_ = s.SetDeadline(time.Now().Add(20 * time.Second))
+	wait := 20 * time.Second
+	if inv.Approve {
+		wait = MaxApprovalWait + 20*time.Second // a person has to say yes
+	}
+	_ = s.SetDeadline(time.Now().Add(wait))
 	c := protocol.NewConn(s)
 	if err := c.Send(protocol.TypePair, req, nil); err != nil {
 		return protocol.PairResponse{}, err

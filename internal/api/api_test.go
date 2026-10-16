@@ -14,11 +14,19 @@ const testToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
 func startTest(t *testing.T) (*Server, *int) {
 	t.Helper()
 	calls := new(int)
-	srv, err := Start("127.0.0.1:0", testToken, func() any { return map[string]string{"ok": "1"} },
-		func(folder string, asRelay bool) (InviteResult, error) {
+	srv, err := Start("127.0.0.1:0", testToken, Hooks{
+		Status: func() any { return map[string]string{"ok": "1"} },
+		Invite: func(folder string, asRelay bool) (InviteResult, error) {
 			*calls++
 			return InviteResult{Code: "p2psync://pair/x", PNG: []byte("png"), Expires: time.Now().Add(time.Minute)}, nil
-		}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		},
+		NetInvite: func(folders []string, asRelay, admin, approve bool) (InviteResult, error) {
+			*calls++
+			return InviteResult{Code: "p2psync://pair/y", PNG: []byte("png"), Expires: time.Now().Add(time.Minute)}, nil
+		},
+		Requests: func() any { return []string{} },
+		Decide:   func(id string, accept bool) bool { *calls++; return id == "known" },
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,5 +139,45 @@ func TestPageCannotBeUsedForScriptInjection(t *testing.T) {
 	}
 	if resp.Header.Get("X-Frame-Options") != "DENY" || resp.Header.Get("X-Content-Type-Options") != "nosniff" {
 		t.Error("missing hardening headers")
+	}
+}
+
+// Creating a network invitation and approving a device are the two most sensitive
+// actions of the page: they must obey the same rules as the plain invitation.
+func TestAdminEndpointsAreGuarded(t *testing.T) {
+	srv, calls := startTest(t)
+	good := map[string]string{"Content-Type": "application/json", "Authorization": "Bearer " + testToken}
+	for _, path := range []string{"/api/network-invite", "/api/requests/decide"} {
+		before := *calls
+		bad := map[string]map[string]string{
+			"no token":       {"Content-Type": "application/json"},
+			"other origin":   {"Content-Type": "application/json", "Authorization": "Bearer " + testToken, "Origin": "http://evil.example"},
+			"form post":      {"Content-Type": "application/x-www-form-urlencoded", "Authorization": "Bearer " + testToken},
+			"cross-site":     {"Content-Type": "application/json", "Authorization": "Bearer " + testToken, "Sec-Fetch-Site": "cross-site"},
+			"rebinding host": {"Content-Type": "application/json", "Authorization": "Bearer " + testToken, "Host": "evil.example"},
+		}
+		for name, h := range bad {
+			if c := do(t, srv, "POST", path, `{"id":"known","accept":true}`, h); c < 400 {
+				t.Errorf("%s %s: got %d", path, name, c)
+			}
+		}
+		if c := do(t, srv, "GET", path, `{}`, good); c < 400 && path != "/api/requests" {
+			t.Errorf("%s accepted a GET: %d", path, c)
+		}
+		if *calls != before {
+			t.Fatalf("%s acted on a forbidden request", path)
+		}
+	}
+	if c := do(t, srv, "POST", "/api/requests/decide", `{"id":"known","accept":true}`, good); c != http.StatusNoContent {
+		t.Fatalf("legitimate decision refused: %d", c)
+	}
+	if c := do(t, srv, "POST", "/api/requests/decide", `{"id":"nope","accept":true}`, good); c != http.StatusNotFound {
+		t.Fatalf("unknown request: %d", c)
+	}
+	if c := do(t, srv, "POST", "/api/network-invite", `{"folders":["docs"]}`, good); c != 200 {
+		t.Fatalf("legitimate network invitation refused: %d", c)
+	}
+	if c := do(t, srv, "GET", "/api/requests", "", map[string]string{}); c != http.StatusUnauthorized {
+		t.Fatalf("request list without token: %d", c)
 	}
 }

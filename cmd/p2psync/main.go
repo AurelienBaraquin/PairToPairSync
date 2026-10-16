@@ -49,6 +49,13 @@ Pairing with a QR code (no IDs to copy, the folder secret is handed over securel
   pair <CODE> [--path DIR] [--quota-mb N]
                                         use the code shown by 'invite' (scan it with a phone, then paste its text)
 
+Network (one admin introduces a new device to the others):
+  admin enable | disable | promote <ID> | demote <ID>
+  invite --network [--folders a,b] [--as-relay] [--admin] [--no-approve]
+  pair <CODE> --dir DIR [--yes]         join through the admin that made the code
+  requests | accept <ID> | reject <ID>  answer devices asking to join
+  network                               who is who
+
 Running:
   run [--log FILE]                      run the sync daemon in the foreground (--log: write the log to FILE)
   status                                show what the running daemon is doing
@@ -90,6 +97,17 @@ func main() {
 		cmdFolder(home, args)
 	case "ui":
 		cmdUI(home)
+	case "admin":
+		cmdAdmin(home, args)
+	case "network":
+		cmdNetwork(home)
+	case "requests":
+		cmdRequests(home)
+	case "accept", "reject":
+		if len(args) != 1 {
+			fatal(fmt.Errorf("usage: %s <REQUEST>", cmd))
+		}
+		cmdDecide(home, args[0], cmd == "accept")
 	case "invite":
 		cmdInvite(home, args)
 	case "pair":
@@ -546,9 +564,13 @@ func daemonStatus(home string, cfg *config.Config) (id string, addrs []string, e
 
 func cmdInvite(home string, args []string) {
 	fs := flag.NewFlagSet("invite", flag.ExitOnError)
-	var folder, png string
-	var asRelay bool
+	var folder, png, folders string
+	var asRelay, network, admin, noApprove bool
 	var ttl time.Duration
+	fs.BoolVar(&network, "network", false, "invite into the whole network through this admin (not just one folder)")
+	fs.StringVar(&folders, "folders", "", "with --network: folders to share (default: all)")
+	fs.BoolVar(&admin, "admin", false, "with --network: the new device becomes an admin too")
+	fs.BoolVar(&noApprove, "no-approve", false, "with --network: do not ask for confirmation when the device connects")
 	fs.StringVar(&folder, "folder", "", "folder to invite the device to (default: the only folder)")
 	fs.BoolVar(&asRelay, "as-relay", false, "the new device will be a temporary relay (e.g. a phone), not a full copy")
 	fs.StringVar(&png, "png", "", "also write the QR code to this PNG file")
@@ -556,6 +578,10 @@ func cmdInvite(home string, args []string) {
 	parse(fs, args)
 
 	cfg := loadForEdit(home)
+	if network {
+		cmdNetworkInvite(home, cfg, folders, asRelay, admin, noApprove, png, ttl)
+		return
+	}
 	if folder == "" {
 		if len(cfg.Folders) != 1 {
 			fatal(fmt.Errorf("several folders exist: choose one with --folder"))
@@ -593,8 +619,11 @@ func cmdInvite(home string, args []string) {
 
 func cmdPair(home string, args []string) {
 	fs := flag.NewFlagSet("pair", flag.ExitOnError)
-	var path string
+	var path, dir string
 	var quota int64
+	var yes bool
+	fs.StringVar(&dir, "dir", "", "network invitation: directory under which the granted folders are created")
+	fs.BoolVar(&yes, "yes", false, "network invitation: do not ask for confirmation")
 	fs.StringVar(&path, "path", "", "where to put the folder (or the relay's temporary storage) on this device")
 	fs.Int64Var(&quota, "quota-mb", 0, "relay: maximum temporary storage in MB")
 	pos := parse(fs, args)
@@ -605,6 +634,10 @@ func cmdPair(home string, args []string) {
 	check(err)
 	if inv.Expired(time.Now()) {
 		fatal(fmt.Errorf("this invitation has expired; ask for a new one"))
+	}
+	if inv.Net {
+		cmdPairNetwork(home, inv, dir, yes)
+		return
 	}
 
 	// Create the identity and a default config on first use.

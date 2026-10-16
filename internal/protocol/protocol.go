@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aurelienbaraquin/pairtopairsync/internal/grant"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/model"
 )
 
@@ -35,6 +36,7 @@ const (
 	TypeProbe
 	TypeProbeReply
 	TypePing
+	TypeGrants
 )
 
 const MaxFrame = 64 << 20
@@ -234,7 +236,49 @@ type PairResponse struct {
 	Label        string `json:"label,omitempty"`
 	Secret       string `json:"secret,omitempty"`
 	InviterRelay bool   `json:"inviter_relay,omitempty"`
+
+	// Joining a network through an admin (see package grant): the signed grants the
+	// guest needs (its own, and those of the devices it shares folders with), the
+	// secrets of the full folders the inviter holds, and where to find the devices.
+	Network bool                `json:"network,omitempty"`
+	Grants  []grant.Signed      `json:"grants,omitempty"`
+	Secrets map[string]string   `json:"secrets,omitempty"`
+	Hints   map[string][]string `json:"hints,omitempty"`
 }
+
+// Grants is exchanged between connected devices: the signed grants one of them
+// holds that are of interest to the other, with hints on where to reach the
+// devices they describe (addresses are untrusted: identities are verified when
+// connecting).
+type Grants struct {
+	List  []grant.Signed      `json:"list"`
+	Hints map[string][]string `json:"hints,omitempty"`
+}
+
+// Limits on what a connected device may send in a Grants message.
+const (
+	MaxGrants    = 600
+	MaxHintedIDs = 128
+	MaxHintAddrs = 4
+)
+
+// SecretRequest asks a full device of a folder for the folder secret. It is only
+// answered for a device that the folder's members were told, by an admin or by
+// the owner, to treat as a full member.
+type SecretRequest struct {
+	Folder string `json:"folder"`
+}
+
+// SecretResponse answers a SecretRequest.
+type SecretResponse struct {
+	OK     bool   `json:"ok"`
+	Secret string `json:"secret,omitempty"`
+}
+
+const TypeSecret Type = 21
+
+// SecretProtocol is the libp2p protocol ID of the secret stream.
+const SecretProtocol = "/p2psync/1.0/secret"
 
 const TypePair Type = 20
 

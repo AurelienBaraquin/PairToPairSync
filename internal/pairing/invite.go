@@ -42,7 +42,20 @@ type Invite struct {
 	InviterRelay bool   `json:"ir,omitempty"` // the inviter is a relay for this folder
 	InviteeRelay bool   `json:"er,omitempty"` // the guest will be a relay for this folder
 	Exp          int64  `json:"x"`            // unix seconds
+
+	// Joining the inviter's whole network (version 2): the inviter is an admin and
+	// vouches for the guest in Folders (which are only shown to the guest; the real
+	// list is in the signed grant it receives). Admin: the guest becomes an admin
+	// too. Approve: the inviter's owner confirms each request by hand, so the guest
+	// has to wait for an answer.
+	Net     bool     `json:"nw,omitempty"`
+	Folders []string `json:"fs,omitempty"`
+	Admin   bool     `json:"ad,omitempty"`
+	Approve bool     `json:"ap,omitempty"`
 }
+
+// MaxApprovalWait is how long a guest waits for an admin to approve its request.
+const MaxApprovalWait = 3 * time.Minute
 
 // NewToken returns a fresh random token.
 func NewToken() (string, error) {
@@ -72,8 +85,11 @@ func Decode(s string) (Invite, error) {
 	if err := json.Unmarshal(raw, &i); err != nil {
 		return Invite{}, errors.New("not a valid invitation")
 	}
-	if i.V != 1 {
+	if i.V != 1 && i.V != 2 {
 		return Invite{}, fmt.Errorf("unsupported invitation version %d (update p2psync)", i.V)
+	}
+	if i.V == 1 && (i.Net || i.Admin || i.Approve || len(i.Folders) > 0) {
+		return Invite{}, errors.New("malformed invitation")
 	}
 	if id, err := identity.Normalize(i.ID); err != nil {
 		return Invite{}, err
@@ -89,6 +105,17 @@ func Decode(s string) (Invite, error) {
 		}
 	}
 	// Names and IDs come from whoever made the QR code: treat them as hostile.
+	if i.Net {
+		if len(i.Folders) == 0 || len(i.Folders) > 64 || i.InviterRelay {
+			return Invite{}, errors.New("malformed invitation")
+		}
+		for _, f := range i.Folders {
+			if !config.ValidFolderID(f) {
+				return Invite{}, errors.New("the invitation names an invalid folder")
+			}
+		}
+		i.Folder = i.Folders[0]
+	}
 	if !config.ValidFolderID(i.Folder) {
 		return Invite{}, errors.New("the invitation names an invalid folder")
 	}

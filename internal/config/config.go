@@ -24,12 +24,20 @@ type Device struct {
 	ID        string   `json:"id"`
 	Name      string   `json:"name,omitempty"`
 	Addresses []string `json:"addresses,omitempty"` // host:port; empty = rely on LAN discovery
+
+	// Admin: this device is a network admin that the owner of this configuration
+	// chose to trust (see package grant). Managed: it was added by an admin's grant,
+	// not by hand, so a later grant may remove it again.
+	Admin   bool `json:"admin,omitempty"`
+	Managed bool `json:"managed,omitempty"`
 }
 
 // FolderDevice declares that a remote device takes part in a folder.
 type FolderDevice struct {
 	ID    string `json:"id"`
 	Relay bool   `json:"relay,omitempty"` // that device is a temporary relay for this folder
+	// Managed: added by an admin's grant rather than by hand.
+	Managed bool `json:"managed,omitempty"`
 }
 
 // Folder is one synchronised folder.
@@ -39,6 +47,13 @@ type Folder struct {
 	Path    string         `json:"path"` // full: the synced directory; relay: the temporary storage directory
 	Role    string         `json:"role,omitempty"`
 	Devices []FolderDevice `json:"devices"`
+
+	// Managed: created because an admin granted this device the folder. Such a folder
+	// is removed from the configuration (never from the disk) if the grant is withdrawn.
+	Managed bool `json:"managed,omitempty"`
+	// AwaitingSecret: a full folder whose secret has not arrived yet; it is fetched
+	// from a full device of the folder and the folder starts once it has it.
+	AwaitingSecret bool `json:"awaiting_secret,omitempty"`
 
 	// Secret (base64, 32 bytes) is shared by the full devices of the folder only.
 	// It encrypts everything that is handed to a relay, so a relay never sees file
@@ -66,6 +81,16 @@ type Config struct {
 	NATTraversal bool `json:"nat_traversal"` // UPnP/NAT-PMP port mapping, NAT detection and hole punching
 	DHT          bool `json:"dht"`           // private address book shared by your own devices
 	RelayService bool `json:"relay_service"` // let your other devices connect *through* this one when they cannot reach each other
+
+	// Admin: this device is a network admin. It vouches, with a signed grant, for the
+	// devices it shares folders with, so a new device only has to connect to one admin.
+	Admin bool `json:"admin,omitempty"`
+	// NetworkDir is where folders granted by an admin are created (<dir>/<folder ID>);
+	// for a relay it is the temporary store. Empty: such folders are only reported.
+	NetworkDir string `json:"network_dir,omitempty"`
+	// Dismissed remembers, per device, the grant that was current when the owner
+	// removed it by hand: only a newer grant brings it back.
+	Dismissed map[string]int64 `json:"dismissed,omitempty"`
 
 	Devices []Device `json:"devices"`
 	Folders []Folder `json:"folders"`
@@ -118,6 +143,9 @@ func (c *Config) Save(path string) error {
 func (c *Config) Validate() error {
 	if c.ListenPort < 0 || c.ListenPort > 65535 {
 		return fmt.Errorf("listen_port %d is out of range", c.ListenPort)
+	}
+	if c.NetworkDir != "" && !filepath.IsAbs(c.NetworkDir) {
+		return fmt.Errorf("network_dir must be an absolute path, got %q", c.NetworkDir)
 	}
 	known := map[string]bool{}
 	for i := range c.Devices {
@@ -188,6 +216,12 @@ func (f *Folder) checkSecret() error {
 	switch {
 	case f.Role == RoleRelay && f.Secret != "":
 		return fmt.Errorf("folder %q: a relay must not hold the folder secret (it would defeat end-to-end encryption)", f.ID)
+	case f.AwaitingSecret && f.Secret != "":
+		return fmt.Errorf("folder %q: marked as waiting for its secret but has one", f.ID)
+	case f.AwaitingSecret && f.Role != RoleFull:
+		return fmt.Errorf("folder %q: only a full copy waits for a secret", f.ID)
+	case f.AwaitingSecret:
+		return nil
 	case f.Role == RoleFull && f.hasRelayPeer() && f.Secret == "":
 		return fmt.Errorf("folder %q uses a relay but has no secret; run `p2psync folder add ... ` to generate one, "+
 			"or copy the `secret` of the same folder from another full device", f.ID)

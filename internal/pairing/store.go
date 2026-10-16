@@ -17,6 +17,12 @@ type Pending struct {
 	Folder       string `json:"folder"`
 	InviteeRelay bool   `json:"invitee_relay"`
 	Exp          int64  `json:"exp"`
+
+	// Network invitations (see Invite).
+	Net        bool     `json:"net,omitempty"`
+	Folders    []string `json:"folders,omitempty"`
+	GuestAdmin bool     `json:"guest_admin,omitempty"`
+	Approve    bool     `json:"approve,omitempty"`
 }
 
 // Store keeps outstanding invitations as one file each in dir. A file is

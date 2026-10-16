@@ -22,6 +22,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,6 +51,7 @@ const (
 	protoBlock   protocolID = "/p2psync/1.0/block"
 	protoProbe   protocolID = "/p2psync/1.0/probe"
 	protoPair    protocolID = protocol.PairProtocol
+	protoSecret  protocolID = protocol.SecretProtocol
 )
 
 // FolderHandler is implemented by the folder engines (full copy and relay).
@@ -80,7 +82,19 @@ type PairHandler interface {
 	// directly ("" if relayed). On success it returns commit, which the node runs
 	// *after* the reply has been delivered (it changes the configuration, which
 	// restarts the daemon).
-	Accept(remote peer.ID, remoteIP string, req protocol.PairRequest) (resp protocol.PairResponse, commit func())
+	//
+	// An exchange normally lasts a few seconds. A handler that has to wait for a
+	// person (an admin approving a new device) calls extend with how much longer it
+	// needs; the node then keeps the stream and the stranger's place that long.
+	Accept(remote peer.ID, remoteIP string, req protocol.PairRequest, extend func(time.Duration)) (resp protocol.PairResponse, commit func())
+}
+
+// NetworkHandler exchanges signed grants with connected devices (see package grant).
+type NetworkHandler interface {
+	// Outgoing returns what is worth telling that device about the network.
+	Outgoing(peerID string) protocol.Grants
+	// Incoming processes what a connected device told us.
+	Incoming(peerID string, g protocol.Grants)
 }
 
 type Options struct {
@@ -92,6 +106,11 @@ type Options struct {
 	RedialMax time.Duration
 	// Pairing, if set, lets a device that presents a valid invitation token join.
 	Pairing PairHandler
+	// Network, if set, gossips signed grants over every session.
+	Network NetworkHandler
+	// Secrets, if set, answers a device asking for a folder's secret; it must only say
+	// yes to a device that is a full member of that folder.
+	Secrets func(requester, folder string) (secret string, ok bool)
 	// Reachability forces "public" or "private" instead of auto-detecting
 	// (testing, or a server that knows better).
 	Reachability string
@@ -123,8 +142,9 @@ type Node struct {
 	opening     map[peer.ID]bool
 	strangers   int
 	strangerIPs map[string]int
-	pairing     map[peer.ID]bool        // strangers with a pairing exchange in progress
-	slots       map[network.Conn]func() // release functions of stranger connections
+	pairing     map[peer.ID]bool             // strangers with a pairing exchange in progress
+	slots       map[network.Conn]func()      // release functions of stranger connections
+	timers      map[network.Conn]*time.Timer // each stranger's deadline
 	kick        map[peer.ID]chan struct{}
 	disco       map[peer.ID][]ma.Multiaddr // addresses learnt from configuration / mDNS (relay candidates)
 }
@@ -138,7 +158,7 @@ func New(o Options) *Node {
 	}
 	n := &Node{cfg: o.Config, id: o.Identity, log: o.Logger, opts: o, redial: o.RedialMax,
 		handlers: map[string]FolderHandler{}, known: map[peer.ID]config.Device{},
-		peers: map[string]*Peer{}, serveSem: make(chan struct{}, 32), opening: map[peer.ID]bool{}, strangerIPs: map[string]int{}, pairing: map[peer.ID]bool{}, slots: map[network.Conn]func(){}, kick: map[peer.ID]chan struct{}{},
+		peers: map[string]*Peer{}, serveSem: make(chan struct{}, 32), opening: map[peer.ID]bool{}, strangerIPs: map[string]int{}, pairing: map[peer.ID]bool{}, slots: map[network.Conn]func(){}, timers: map[network.Conn]*time.Timer{}, kick: map[peer.ID]chan struct{}{},
 		disco: map[peer.ID][]ma.Multiaddr{}}
 	for _, h := range o.Handlers {
 		n.handlers[h.ID()] = h
@@ -178,6 +198,7 @@ func (n *Node) Start(parent context.Context) error {
 	h.SetStreamHandler(protoBlock, n.serveBlock)
 	h.SetStreamHandler(protoProbe, n.serveProbe)
 	h.SetStreamHandler(protoPair, n.servePair)
+	h.SetStreamHandler(protoSecret, n.serveSecret)
 	h.Network().Notify(&notifee{n})
 
 	// Static addresses from the configuration.
@@ -731,6 +752,14 @@ func (n *Node) runSession(s network.Stream, outbound bool) {
 		}
 	}()
 	go n.pinger(p)
+	if n.opts.Network != nil {
+		go func() {
+			defer n.recoverPanic("grants")
+			if g := n.opts.Network.Outgoing(p.id); len(g.List) > 0 {
+				_ = p.conn.Send(protocol.TypeGrants, g, nil)
+			}
+		}()
+	}
 	n.readLoop(p)
 }
 
@@ -811,6 +840,14 @@ func (n *Node) readLoop(p *Peer) {
 			}
 			if h := n.handler(p, ack.Folder); h != nil {
 				h.HandleIndexAck(p, ack)
+			}
+		case protocol.TypeGrants:
+			var g protocol.Grants
+			if json.Unmarshal(hb, &g) != nil || len(g.List) > protocol.MaxGrants || len(g.Hints) > protocol.MaxHintedIDs {
+				return
+			}
+			if n.opts.Network != nil {
+				n.opts.Network.Incoming(p.id, g)
 			}
 		default:
 			n.log.Debug("unexpected message on session stream", "type", t)
@@ -983,11 +1020,20 @@ func (n *Node) limitStranger(c network.Conn) {
 			n.mu.Unlock()
 		})
 	}
-	n.mu.Unlock()
-	time.AfterFunc(strangerWindow, func() {
+	n.timers[c] = time.AfterFunc(strangerWindow, func() {
 		_ = c.Close()
 		n.releaseStranger(c)
 	})
+	n.mu.Unlock()
+}
+
+// extendStranger gives a stranger that is waiting for a person's decision more time.
+func (n *Node) extendStranger(c network.Conn, d time.Duration) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if t := n.timers[c]; t != nil {
+		t.Reset(d)
+	}
 }
 
 // releaseStranger frees the place held by a stranger's connection.
@@ -995,6 +1041,10 @@ func (n *Node) releaseStranger(c network.Conn) {
 	n.mu.Lock()
 	release := n.slots[c]
 	delete(n.slots, c)
+	if t := n.timers[c]; t != nil {
+		t.Stop()
+		delete(n.timers, c)
+	}
 	n.mu.Unlock()
 	if release != nil {
 		release()
@@ -1059,7 +1109,11 @@ func (n *Node) servePair(s network.Stream) {
 			time.AfterFunc(time.Second, func() { _ = conn.Close() })
 		}()
 	}
-	resp, commit := n.opts.Pairing.Accept(remote, remoteIP(conn), req)
+	extend := func(d time.Duration) {
+		_ = s.SetDeadline(time.Now().Add(d))
+		n.extendStranger(conn, d+5*time.Second)
+	}
+	resp, commit := n.opts.Pairing.Accept(remote, remoteIP(conn), req, extend)
 	if c.Send(protocol.TypePair, resp, nil) != nil {
 		return
 	}
@@ -1067,4 +1121,109 @@ func (n *Node) servePair(s network.Stream) {
 		// Let the guest read the reply before the configuration change restarts us.
 		time.AfterFunc(500*time.Millisecond, commit)
 	}
+}
+
+// serveSecret answers a device asking for the secret of a folder. Only configured
+// devices can reach it, and the handler decides whether this one is entitled.
+func (n *Node) serveSecret(s network.Stream) {
+	defer s.Close()
+	defer n.recoverPanic("serveSecret")
+	remote := s.Conn().RemotePeer()
+	if n.opts.Secrets == nil || !n.isKnown(remote) || !n.acquireServe() {
+		_ = s.Reset()
+		return
+	}
+	defer n.releaseServe()
+	n.wg.Add(1)
+	defer n.wg.Done()
+	_ = s.SetDeadline(time.Now().Add(20 * time.Second))
+	c := protocol.NewConn(s)
+	t, hb, _, err := c.RecvMax(4096)
+	var req protocol.SecretRequest
+	if err != nil || t != protocol.TypeSecret || json.Unmarshal(hb, &req) != nil {
+		_ = s.Reset()
+		return
+	}
+	var resp protocol.SecretResponse
+	if sec, ok := n.opts.Secrets(remote.String(), req.Folder); ok {
+		resp = protocol.SecretResponse{OK: true, Secret: sec}
+	}
+	_ = c.Send(protocol.TypeSecret, resp, nil)
+}
+
+// FetchSecret asks a device for the secret of a folder.
+func (n *Node) FetchSecret(ctx context.Context, device, folder string) (string, error) {
+	pid, err := peer.Decode(device)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	s, err := n.openStream(ctx, pid, protoSecret, false)
+	if err != nil {
+		return "", err
+	}
+	defer s.Close()
+	_ = s.SetDeadline(time.Now().Add(20 * time.Second))
+	c := protocol.NewConn(s)
+	if err := c.Send(protocol.TypeSecret, protocol.SecretRequest{Folder: folder}, nil); err != nil {
+		return "", err
+	}
+	t, hb, _, err := c.RecvMax(4096)
+	if err != nil || t != protocol.TypeSecret {
+		return "", errors.New("no answer")
+	}
+	var resp protocol.SecretResponse
+	if json.Unmarshal(hb, &resp) != nil || !resp.OK || resp.Secret == "" {
+		return "", errors.New("the device refused")
+	}
+	return resp.Secret, nil
+}
+
+// AddrsOf lists addresses at which a device was reached or announced itself,
+// without the /p2p suffix; used as hints for other devices.
+func (n *Node) AddrsOf(device string) []string {
+	pid, err := peer.Decode(device)
+	if err != nil || n.host == nil {
+		return nil
+	}
+	var out []string
+	for _, a := range n.host.Peerstore().Addrs(pid) {
+		str := a.String()
+		if strings.Contains(str, "/p2p-circuit") || strings.Contains(str, "/ip4/127.") || strings.Contains(str, "/ip6/::1") {
+			continue
+		}
+		out = append(out, str)
+		if len(out) >= protocol.MaxHintAddrs {
+			break
+		}
+	}
+	return out
+}
+
+// AddHints remembers where other devices said a known device can be reached.
+// Hints are untrusted by nature: a wrong one only wastes a connection attempt,
+// because the identity of whoever answers is checked by the handshake.
+func (n *Node) AddHints(device string, addrs []string) {
+	pid, err := peer.Decode(device)
+	if err != nil || !n.isKnown(pid) || n.host == nil {
+		return
+	}
+	var ms []ma.Multiaddr
+	for _, a := range addrs {
+		if len(a) <= 200 {
+			ms = append(ms, ParseAddr(a)...)
+		}
+		if len(ms) >= 2*protocol.MaxHintAddrs {
+			break
+		}
+	}
+	if len(ms) == 0 {
+		return
+	}
+	n.host.Peerstore().AddAddrs(pid, ms, peerstore.TempAddrTTL)
+	n.mu.Lock()
+	n.addDisco(pid, ms)
+	n.mu.Unlock()
+	n.wake(pid)
 }
