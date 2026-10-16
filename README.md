@@ -1,82 +1,124 @@
 # PairToPairSync
 
-Synchronisation de dossiers **en temps réel, de pair à pair et chiffrée** (dans l'esprit de Syncthing),
-avec une fonctionnalité en plus : les **points de relais temporaires**.
+Synchronisation de dossiers **en temps réel, de pair à pair, sans aucun serveur, entièrement chiffrée**
+(dans l'esprit de Syncthing), avec une fonctionnalité en plus : les **points de relais temporaires**.
 
 Un relais (par exemple un téléphone) sert de boîte aux lettres : il reçoit les dernières modifications
 quand il est joignable, les remet aux appareils qui étaient absents, puis **les efface**. Il ne contient
-jamais une copie du dossier et n'est pas un stockage permanent.
+jamais une copie du dossier, n'est pas un stockage permanent, et **ne peut rien lire** de ce qu'il porte.
 
 ```
    PC (maison)  ──────┐                         ┌────── Portable (bureau)
    éteint le soir     ├──►  📱 Téléphone  ◄─────┤       allumé le lendemain
-                      │     (relais)            │
-   modifie un fichier ┘     garde le fichier     └── le reçoit, le relais l'efface
+                      │     (relais aveugle)    │
+   modifie un fichier ┘     garde un blob chiffré └── le reçoit, le relais l'efface
 ```
 
 ## Un dossier comme les autres
 
 Le dossier synchronisé est **un vrai dossier sur le disque** : il s'ouvre dans l'Explorateur Windows,
 le Finder ou n'importe quel gestionnaire de fichiers, fonctionne hors-ligne et avec tous vos logiciels.
-Un petit démon en arrière-plan surveille les changements (inotify / FSEvents / ReadDirectoryChangesW)
-et synchronise en une fraction de seconde. Il n'y a aucun lecteur virtuel ni format propriétaire.
+Un démon en arrière-plan surveille les changements (inotify / FSEvents / ReadDirectoryChangesW) et
+synchronise en une fraction de seconde. Pas de lecteur virtuel, pas de format propriétaire.
 
 ## Démarrage rapide
 
 ```sh
-go build -o p2psync ./cmd/p2psync       # ou: make build   (binaire unique, sans dépendance)
+go build -o p2psync ./cmd/p2psync        # ou: make build   (binaire unique)
+p2psync init --name portable             # sur CHAQUE appareil : crée la clé d'identité
+p2psync id                               # l'ID de cet appareil (clé publique)
 ```
 
-Sur **chaque** appareil :
+Les appareils se déclarent mutuellement. Le plus simple : coller **une seule adresse** par appareil
+(elle contient l'ID *et* un moyen de le joindre ; `p2psync status` les affiche) :
 
 ```sh
-p2psync init --name portable            # crée l'identité ; affiche l'ID de l'appareil
+# PC : le portable est une copie complète, le téléphone un relais
+p2psync device add /ip4/192.168.1.20/udp/22000/quic-v1/p2p/<ID_PORTABLE> --name portable
+p2psync device add /ip4/192.168.1.30/udp/22000/quic-v1/p2p/<ID_TEL>      --name telephone
+p2psync folder add ~/Documents/Projets --id projets --device <ID_PORTABLE> --device <ID_TEL>:relay
+#   -> affiche le SECRET du dossier. À donner uniquement à vos autres appareils complets.
+
+# Portable : même dossier, même secret
+p2psync device add <adresse-du-PC> --name pc ;  p2psync device add <adresse-du-tel> --name telephone
+p2psync folder add ~/Projets --id projets --secret <SECRET> --device <ID_PC> --device <ID_TEL>:relay
+
+# Téléphone (relais) : il ne reçoit JAMAIS le secret
+p2psync device add <adresse-du-PC> --name pc ;  p2psync device add <adresse-du-portable> --name portable
+p2psync folder add-relay ~/relais --id projets --device <ID_PC> --device <ID_PORTABLE> --quota-mb 2048
+
+p2psync run        # sur chaque appareil (voir packaging/ pour le lancer au démarrage)
+p2psync status     # ou http://127.0.0.1:8384
 ```
 
-Échangez les ID, puis déclarez les autres appareils et le dossier à partager (même `--id` partout) :
+Le démon recharge `config.json` tout seul. Après la première connexion, les adresses sont mémorisées et
+retrouvées automatiquement (voir *Connectivité*).
 
-```sh
-# Sur le PC (A) : B = portable (copie complète), T = téléphone (relais)
-p2psync device add <ID_B> --name portable  --addr 192.168.1.20:22000
-p2psync device add <ID_T> --name telephone --addr 192.168.1.30:22000
-p2psync folder add ~/Documents/Projets --id projets --device <ID_B> --device <ID_T>:relay
+## Sécurité
 
-# Sur le portable : symétrique
-p2psync device add <ID_A> --name pc ...  ;  p2psync device add <ID_T> --name telephone ...
-p2psync folder add ~/Projets --id projets --device <ID_A> --device <ID_T>:relay
+| Couche | Protection |
+|---|---|
+| Identité | Clé Ed25519 par appareil ; l'ID de l'appareil **est** sa clé publique. Pas d'autorité, pas de serveur. |
+| Transport | QUIC (TLS 1.3) ou TCP+Noise, authentifiés mutuellement par ces clés, confidentialité persistante. |
+| Contrôle d'accès | Un appareil **absent de la configuration est refusé pendant la poignée de main**, avant tout échange. |
+| Intégrité | Chaque bloc de fichier est vérifié par SHA-256 ; les chemins reçus sont validés (pas de `..`, pas de liens symboliques suivis). |
+| Relais | **Chiffré de bout en bout, à connaissance nulle** (ci-dessous). |
+| Fichiers de config | `config.json`, clé, index : permissions `0600`. |
 
-# Sur le téléphone (relais) : il ne partage que les appareils « complets »
-p2psync device add <ID_A> --name pc ... ;  p2psync device add <ID_B> --name portable ...
-p2psync folder add-relay ~/relais --id projets --device <ID_A> --device <ID_B> --quota-mb 2048
+**Le relais est aveugle.** Tous les appareils *complets* d'un dossier partagent un secret de 256 bits que
+le relais n'a jamais (la configuration d'un relais refuse même d'en contenir un). Ce qui est remis au
+relais : noms de fichiers → identifiants opaques (HMAC) ; métadonnées → XChaCha20-Poly1305, liées au chemin
+et à la version (le relais ne peut ni les rejouer ni les déplacer) ; blocs de données → XChaCha20-Poly1305.
+Les appareils authentifient tout ce qui vient du relais : un relais malveillant ou un disque corrompu ne
+peut pas injecter ou modifier un fichier (testé). Un téléphone perdu ou saisi révèle seulement : tailles
+approximatives, dates, compteurs de version, et que deux blocs sont identiques.
 
-p2psync run                              # sur chaque appareil (voir packaging/ pour le lancer au démarrage)
-p2psync status                           # ou ouvrir http://127.0.0.1:8384
-```
+**Ce que le chiffrement ne couvre pas.** Le dossier synchronisé lui-même est un dossier normal, en clair sur
+vos disques : activez le chiffrement du disque (BitLocker, FileVault, LUKS). Un appareil *complet*
+compromis voit tout (il est de confiance par définition). La découverte sur le réseau local (mDNS) annonce
+la présence de l'ID de votre appareil ; désactivez-la avec `"lan_discovery": false` si cela vous gêne.
+Le secret du dossier se trouve dans `config.json` des appareils complets : protégez ce fichier.
 
-Le démon recharge `config.json` tout seul : pas besoin de le redémarrer après un `device add`.
-Les appareils s'authentifient mutuellement par l'empreinte de leur certificat : **un appareil absent de
-la configuration est refusé**. Sur un même réseau local, les adresses sont censées être trouvées automatiquement
-par diffusion UDP (`--addr` facultatif) — **fonction écrite mais pas encore testée sur un vrai réseau** ;
-en attendant, indiquez `--addr`.
+## Connectivité sans serveur
+
+Aucun serveur tiers n'est jamais contacté. Les appareils se trouvent et s'entraident :
+
+1. **Réseau local** : découverte mDNS.
+2. **Adresses mémorisées** et **annuaire privé (DHT)** réservé à vos appareils : si l'adresse d'un appareil
+   change, n'importe lequel de vos autres appareils connectés peut la communiquer.
+3. **Box / routeur** : ouverture automatique de port (UPnP, NAT-PMP, PCP) et détection de joignabilité (AutoNAT).
+4. **Perçage de NAT** (DCUtR) entre deux appareils derrière des box différentes.
+5. **Relais de connexion par vos propres appareils** : si deux appareils ne peuvent pas se joindre, un
+   troisième à vous qui est joignable (PC avec port ouvert, IPv6, VPS que vous possédez…) fait transiter le
+   flux **déjà chiffré de bout en bout** (il ne peut pas le lire). Seuls vos appareils configurés peuvent
+   l'utiliser. Désactivable : `"relay_service": false`.
+
+> Limite physique : si **aucun** de vos appareils n'est joignable de l'extérieur (tous derrière un NAT
+> strict / CGNAT, sans IPv6), deux appareils ne peuvent pas s'atteindre sans aucune aide extérieure. Il
+> suffit d'un seul appareil joignable (ou d'un VPN personnel type WireGuard/Tailscale) pour tout débloquer.
+
+**Réseaux instables.** Reconnexion automatique avec délai exponentiel et gigue ; un lien mort est détecté en
+moins de 30 s (pings applicatifs) ; chaque bloc voyage dans son propre flux, donc un transfert bloqué ne gèle
+pas le reste ; les téléchargements sont **reprenables** (un fichier partiel est conservé et ses blocs
+vérifiés puis réutilisés : après une coupure, l'appareil ne retélécharge que ce qui manque) ; chaque bloc est
+retenté 3 fois ; le passage d'un chemin relayé à une connexion directe se fait tout seul.
 
 ## Comment fonctionne le relais
 
 - Il ne conserve que **la dernière version en attente** de chaque fichier (et les suppressions).
 - Chaque modification est « acquittée » par les appareils qui la possèdent. Dès que **tous** les
-  appareils complets l'ont, le relais supprime l'entrée **et les blocs de données** correspondants.
+  appareils complets l'ont, le relais supprime l'entrée **et les blocs** correspondants.
 - Si tous les appareils sont en ligne, ils se synchronisent directement et le relais **ne télécharge
-  rien** (il n'épuise ni la batterie ni le forfait du téléphone). Il ne stocke les données que
-  lorsqu'au moins un appareil est absent.
-- Garde-fous : un **quota** de stockage (`--quota-mb`) et une **durée de rétention** maximale
-  (`--retention-hours`, 30 jours par défaut) après laquelle une modification jamais récupérée est jetée.
-- Les modifications concurrentes ne perdent jamais de données (voir *Conflits*).
+  rien** (ni batterie ni forfait gaspillés). Il ne stocke que lorsqu'un appareil est absent.
+- Garde-fous : **quota** de stockage (`--quota-mb`) et **rétention** maximale (`--retention-hours`,
+  30 jours par défaut) après laquelle une modification jamais récupérée est jetée.
 
 ## Conflits
 
-Chaque fichier porte un vecteur de versions. Si deux appareils modifient le même fichier hors-ligne,
-une version gagne (la plus récente, de façon identique sur tous les appareils) et l'autre est conservée
-à côté : `rapport.sync-conflict-20261016-101500-ABC123.docx`. Une modification l'emporte toujours sur
-une suppression. Deux fichiers identiques créés des deux côtés ne produisent pas de conflit.
+Chaque fichier porte un vecteur de versions. Si deux appareils modifient le même fichier hors-ligne, une
+version gagne (de façon identique sur tous les appareils) et l'autre est conservée à côté :
+`rapport.sync-conflict-20261016-101500-ABC123.docx`. Une modification l'emporte toujours sur une suppression.
+Deux fichiers identiques créés des deux côtés ne produisent pas de conflit.
 
 ## Ignorer des fichiers
 
@@ -84,24 +126,25 @@ Fichier `.p2pignore` à la racine du dossier (`*.tmp`, `build/`, `/brouillons/*`
 
 ## Limites actuelles (honnêtes)
 
-- **Pas de traversée de NAT ni de découverte globale** : les appareils se joignent sur le réseau local,
-  par VPN (Tailscale, WireGuard…), ou via une adresse/port joignable. Un relais sur un serveur public
-  (VPS) ou sur un téléphone joignable résout le cas « jamais en ligne en même temps ».
+- **Ce qui est testé** : tests de bout en bout sous Linux avec `-race` (synchro directe, conflits, relais
+  aveugle, falsification, reprise après coupure, connexion à travers un appareil-relais, annuaire DHT,
+  quota, appareil inconnu). **Non testé en conditions réelles** : mDNS (ne fonctionne pas dans mon
+  environnement de test), UPnP/NAT-PMP, et le perçage de NAT entre vraies box — ce sont les fonctions
+  éprouvées de libp2p, mais je n'ai pas pu les valider sur de vrais réseaux. Windows/macOS/ARM sont
+  compilés en CI mais pas exécutés.
 - **Téléphone** : le binaire tourne tel quel sur Android via Termux (`GOOS=linux GOARCH=arm64`). Le paquet
-  `mobile/` est prêt pour `gomobile bind` ; l'application Android native (service au premier plan,
-  interface) reste à écrire.
-- L'index complet est échangé à chaque connexion entre appareils complets (métadonnées seulement) ; les
-  suppressions (« pierres tombales ») ne sont jamais purgées ; pas de détection de renommage (un renommage
-  = suppression + création : le fichier est retransféré en entier ; seules les modifications d'un fichier
-  existant ne transfèrent que les blocs changés) ; liens symboliques ignorés ; pas de corbeille/versionnage ; seuls les bits de
-  permission sont propagés.
-- Testé sous Linux (tests de bout en bout avec `-race`). Windows/macOS/ARM sont compilés en CI mais pas encore testés à l'exécution.
+  `mobile/` est prêt pour `gomobile bind` ; l'application Android native reste à écrire.
+- L'index complet est échangé à chaque connexion entre appareils complets ; les suppressions ne sont
+  jamais purgées ; pas de détection de renommage (retransfert complet) ; liens symboliques ignorés ; pas de
+  corbeille/versionnage ; seuls les bits de permission sont propagés.
+- Le secret du dossier se copie à la main entre appareils complets (ou `--secret`) ; il n'y a pas encore
+  d'échange assisté (QR code) ni de rotation de secret.
 
 Détails techniques : [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Développement
 
 ```sh
-make test      # go test ./... -race
+make test      # go test ./... -race     (Go 1.26)
 make dist      # binaires pour Linux/Windows/macOS (amd64/arm64)
 ```

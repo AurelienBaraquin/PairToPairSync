@@ -1,9 +1,13 @@
 // Package relay implements the temporary store-and-forward role of a folder.
 //
 // A relay (typically a phone) has no copy of the synchronised tree. It only
-// holds the latest, not yet delivered, changes: file metadata plus the data
-// blocks, addressed by hash. As soon as every full device of the folder is known
-// to hold a change, the relay deletes it. Nothing is kept permanently.
+// holds the latest, not yet delivered, changes. As soon as every full device of
+// the folder is known to hold a change, the relay deletes it. Nothing is kept
+// permanently.
+//
+// A relay is also blind: it never receives the folder secret, so file names,
+// metadata and data are ciphertext to it (see package seal). A lost or seized
+// phone reveals sizes, timing and version counters, nothing else.
 package relay
 
 import (
@@ -38,10 +42,10 @@ const fetchWorkers = 4
 
 // Pending is one change waiting to be delivered to every full device.
 type Pending struct {
-	Entry model.FileInfo  `json:"entry"`
-	Acked map[string]bool `json:"acked"` // devices known to hold this version (or a newer one)
-	Have  bool            `json:"have"`  // all data blocks are stored here
-	Since time.Time       `json:"since"`
+	Entry protocol.SealedEntry `json:"entry"`
+	Acked map[string]bool      `json:"acked"` // devices known to hold this version (or a newer one)
+	Have  bool                 `json:"have"`  // all data blocks are stored here
+	Since time.Time            `json:"since"`
 }
 
 type Relay struct {
@@ -131,22 +135,22 @@ func (r *Relay) PeerDown(p *node.Peer) {
 	r.kick() // a device going offline may require us to fetch data now
 }
 
-func (r *Relay) announceableLocked(dev string) []model.FileInfo {
-	var out []model.FileInfo
+func (r *Relay) announceableLocked(dev string) []protocol.SealedEntry {
+	var out []protocol.SealedEntry
 	for _, pd := range r.pending {
 		if pd.Have && !pd.Acked[dev] {
 			out = append(out, pd.Entry)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
-func (r *Relay) send(p *node.Peer, entries []model.FileInfo) {
+func (r *Relay) send(p *node.Peer, entries []protocol.SealedEntry) {
 	const batch = 500
 	for len(entries) > 0 {
 		n := min(batch, len(entries))
-		if p.SendIndex(protocol.Index{Folder: r.cfg.ID, Entries: entries[:n]}) != nil {
+		if p.SendIndex(protocol.Index{Folder: r.cfg.ID, Sealed: entries[:n]}) != nil {
 			return
 		}
 		entries = entries[n:]
@@ -158,11 +162,11 @@ func (r *Relay) announce(names ...string) {
 	r.mu.Lock()
 	type job struct {
 		p *node.Peer
-		e []model.FileInfo
+		e []protocol.SealedEntry
 	}
 	var jobs []job
 	for id, p := range r.peers {
-		var es []model.FileInfo
+		var es []protocol.SealedEntry
 		for _, n := range names {
 			if pd := r.pending[n]; pd != nil && pd.Have && !pd.Acked[id] {
 				es = append(es, pd.Entry)
@@ -178,41 +182,42 @@ func (r *Relay) announce(names ...string) {
 	}
 }
 
-// HandleIndex receives changes announced by a full device.
+// HandleIndex receives sealed changes announced by a full device. Plaintext
+// entries are refused outright: a relay has no business seeing them.
 func (r *Relay) HandleIndex(p *node.Peer, idx protocol.Index) {
 	if r.cfg.IsRelay(p.ID()) {
 		return
 	}
+	if len(idx.Entries) > 0 {
+		r.log.Warn("refusing plaintext entries: this device only accepts encrypted ones", "from", p.Name())
+	}
 	var announce []string
 	r.mu.Lock()
-	for _, e := range idx.Entries {
-		if e.Version == nil || !validName(e.Name) {
+	for _, e := range idx.Sealed {
+		if !validSealed(e) {
 			continue
 		}
-		e.Seq = 0
-		cur := r.pending[e.Name]
+		cur := r.pending[e.ID]
 		switch {
 		case cur == nil:
-			r.pending[e.Name] = r.newPendingLocked(e, p.ID())
-			announce = append(announce, e.Name)
+			r.pending[e.ID] = r.newPendingLocked(e, p.ID())
+			announce = append(announce, e.ID)
 		default:
 			switch cur.Entry.Version.Compare(e.Version) {
-			case model.Equal, model.Greater:
-				if cur.Entry.Version.Compare(e.Version) == model.Equal {
-					cur.Acked[p.ID()] = true
-				} else {
-					announce = append(announce, e.Name) // peer is behind: tell it
-				}
+			case model.Equal:
+				cur.Acked[p.ID()] = true
+			case model.Greater:
+				announce = append(announce, e.ID) // peer is behind: tell it
 			case model.Lesser:
-				r.pending[e.Name] = r.newPendingLocked(e, p.ID())
-				announce = append(announce, e.Name)
+				r.pending[e.ID] = r.newPendingLocked(e, p.ID())
+				announce = append(announce, e.ID)
 			case model.Concurrent:
 				// Keep only the canonical winner; the loser's device receives the
 				// winner and preserves its own file as a conflict copy.
 				if e.WinsOver(cur.Entry) {
-					r.pending[e.Name] = r.newPendingLocked(e, p.ID())
+					r.pending[e.ID] = r.newPendingLocked(e, p.ID())
 				}
-				announce = append(announce, e.Name)
+				announce = append(announce, e.ID)
 			}
 		}
 	}
@@ -223,17 +228,13 @@ func (r *Relay) HandleIndex(p *node.Peer, idx protocol.Index) {
 	r.kick()
 }
 
-func (r *Relay) newPendingLocked(e model.FileInfo, from string) *Pending {
-	pd := &Pending{Entry: e, Acked: map[string]bool{from: true}, Since: time.Now()}
-	pd.Have = true
-	for _, h := range e.Blocks {
+func (r *Relay) newPendingLocked(e protocol.SealedEntry, from string) *Pending {
+	pd := &Pending{Entry: e, Acked: map[string]bool{from: true}, Since: time.Now(), Have: true}
+	for _, h := range e.CBlocks {
 		if !r.hasBlock(h) {
 			pd.Have = false
 			break
 		}
-	}
-	if e.Deleted || e.Type == model.TypeDir {
-		pd.Have = true
 	}
 	return pd
 }
@@ -244,13 +245,13 @@ func (r *Relay) HandleProbe(_ *node.Peer, items []protocol.ProbeItem) []bool {
 	return make([]bool, len(items))
 }
 
-// HandleRequest serves a stored block by its hash.
+// HandleRequest serves a stored (encrypted) block by its identifier.
 func (r *Relay) HandleRequest(_ *node.Peer, req protocol.Request) ([]byte, string) {
-	if len(req.Hash) != 32 {
+	if !req.Sealed || len(req.Hash) != 32 {
 		return nil, protocol.ErrNotFound
 	}
 	b, err := os.ReadFile(r.blockPath(req.Hash))
-	if err != nil || len(b) != req.Size || string(model.HashBytes(b)) != string(req.Hash) {
+	if err != nil || len(b) != req.Size+protocol.SealOverhead {
 		return nil, protocol.ErrNotFound
 	}
 	return b, protocol.ErrNone
@@ -319,11 +320,11 @@ func (r *Relay) evaluate() {
 	for name, pd := range r.pending {
 		switch {
 		case now.Sub(pd.Since) > r.cfg.Retention():
-			r.log.Warn("dropping undelivered change after retention period", "file", name)
+			r.log.Warn("dropping undelivered change after retention period", "change", short(name))
 			delete(r.pending, name)
 			removed = true
 		case len(expected) > 0 && allAcked(pd, expected):
-			r.log.Info("change delivered to every device, removed from relay", "file", name)
+			r.log.Info("change delivered to every device, removed from relay", "change", short(name))
 			delete(r.pending, name)
 			removed = true
 		}
@@ -389,7 +390,7 @@ func (r *Relay) fetch(name string, pd *Pending) {
 	}
 	var missing []int
 	var need int64
-	for i, h := range pd.Entry.Blocks {
+	for i, h := range pd.Entry.CBlocks {
 		if !r.hasBlock(h) {
 			missing = append(missing, i)
 			_, sz := pd.Entry.BlockRange(i)
@@ -399,7 +400,7 @@ func (r *Relay) fetch(name string, pd *Pending) {
 	over := src != nil && r.storeBytesLocked()+need > r.cfg.Quota()
 	if over && !r.overflow {
 		r.overflow = true
-		r.log.Warn("relay storage quota reached; change not stored until space is freed", "file", name, "need_bytes", need)
+		r.log.Warn("relay storage quota reached; change not stored until space is freed", "change", short(name), "need_bytes", need)
 	}
 	r.mu.Unlock()
 	if src == nil || over {
@@ -419,10 +420,11 @@ func (r *Relay) fetch(name string, pd *Pending) {
 			for i := range jobs {
 				off, size := pd.Entry.BlockRange(i)
 				rctx, c := context.WithTimeout(ctx, 2*time.Minute)
-				data, err := src.Request(rctx, r.cfg.ID, name, off, size, pd.Entry.Blocks[i], false)
+				data, err := src.Request(rctx, protocol.Request{Folder: r.cfg.ID, Name: name, Offset: off,
+					Size: size, Hash: pd.Entry.CBlocks[i], Sealed: true})
 				c()
 				if err == nil {
-					err = r.writeBlock(pd.Entry.Blocks[i], data)
+					err = r.writeBlock(pd.Entry.CBlocks[i], data)
 				}
 				if err != nil {
 					once.Do(func() { failed = err; cancel() })
@@ -442,7 +444,7 @@ feed:
 	close(jobs)
 	wg.Wait()
 	if failed != nil {
-		r.log.Debug("fetch failed, will retry", "file", name, "err", failed)
+		r.log.Debug("fetch failed, will retry", "change", short(name), "err", failed)
 		return
 	}
 	if r.ctx.Err() != nil {
@@ -455,7 +457,7 @@ feed:
 		r.overflow = false
 		r.saveLocked()
 		r.mu.Unlock()
-		r.log.Info("change stored on relay, waiting for absent devices", "file", name)
+		r.log.Info("change stored on relay, waiting for absent devices", "change", short(name))
 		r.announce(name)
 		return
 	}
@@ -538,6 +540,29 @@ func (r *Relay) saveLocked() {
 	}
 }
 
-func validName(name string) bool {
-	return name != "" && name[0] != '/' && name != "." && len(name) < 4096
+func short(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+// validSealed rejects malformed entries from a peer before they can influence
+// storage decisions.
+func validSealed(e protocol.SealedEntry) bool {
+	if len(e.ID) != 32 || e.Version == nil || len(e.Meta) == 0 || len(e.Meta) > 1<<20 || e.Size < 0 {
+		return false
+	}
+	if e.Deleted || len(e.CBlocks) == 0 {
+		return len(e.CBlocks) == 0 && e.Size == 0
+	}
+	if e.BlockSize <= 0 || e.BlockSize > 16<<20 || int64(len(e.CBlocks)) != (e.Size+int64(e.BlockSize)-1)/int64(e.BlockSize) {
+		return false
+	}
+	for _, h := range e.CBlocks {
+		if len(h) != 32 {
+			return false
+		}
+	}
+	return true
 }

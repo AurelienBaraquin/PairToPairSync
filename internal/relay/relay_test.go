@@ -11,6 +11,7 @@ import (
 
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/model"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/protocol"
 )
 
 // A change nobody collected within the retention period must not stay on the
@@ -23,10 +24,11 @@ func TestExpiredChangesAreDroppedWithTheirData(t *testing.T) {
 		Devices: []config.FolderDevice{{ID: "DEV1"}}}, "SELF", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	r.dir = dir
 
+	id := "0123456789abcdef0123456789abcdef"
 	pending := map[string]*Pending{
-		"old.txt": {Entry: model.FileInfo{Name: "old.txt", Size: int64(len(data)), BlockSize: 128 << 10,
-			Blocks: [][]byte{hash}, Version: model.Vector{"X": 1}}, Acked: map[string]bool{"X": true}, Have: true,
-			Since: time.Now().Add(-2 * time.Hour)},
+		id: {Entry: protocol.SealedEntry{ID: id, Size: int64(len(data)), BlockSize: 128 << 10,
+			CBlocks: [][]byte{hash}, Version: model.Vector{"X": 1}, Meta: []byte("sealed")},
+			Acked: map[string]bool{"X": true}, Have: true, Since: time.Now().Add(-2 * time.Hour)},
 	}
 	b, _ := json.Marshal(pending)
 	os.WriteFile(filepath.Join(dir, "pending.json"), b, 0o600)

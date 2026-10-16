@@ -71,7 +71,7 @@ type SealedEntry struct {
 	Deleted   bool         `json:"deleted,omitempty"`
 	Size      int64        `json:"size"`
 	BlockSize int          `json:"block_size,omitempty"`
-	CBlocks   [][]byte     `json:"cblocks,omitempty"` // SHA-256 of each encrypted block
+	CBlocks   [][]byte     `json:"cblocks,omitempty"` // keyed identifier of each encrypted block
 	Meta      []byte       `json:"meta"`
 }
 
@@ -110,6 +110,9 @@ type Request struct {
 	Offset int64  `json:"offset"`
 	Size   int    `json:"size"`
 	Hash   []byte `json:"hash"`
+	// Sealed requests address a block of an encrypted relay entry: Name is the
+	// opaque path ID, Hash the keyed block ID, and the reply is ciphertext.
+	Sealed bool `json:"sealed,omitempty"`
 }
 
 // Response error codes.

@@ -19,13 +19,18 @@ import (
 	"github.com/aurelienbaraquin/pairtopairsync/internal/model"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/node"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/protocol"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/seal"
 )
 
 // Tunables, overridable in tests.
 var (
 	WatchDebounce = 300 * time.Millisecond
 	PullRetryMax  = 30 * time.Second
+	serveDelay    atomic.Int64 // nanoseconds
 )
+
+// SetServeDelay slows block serving; it exists to simulate a slow link in tests.
+func SetServeDelay(d time.Duration) { serveDelay.Store(int64(d)) }
 
 const indexBatch = 1000
 
@@ -44,6 +49,13 @@ type Folder struct {
 	root  string
 	log   *slog.Logger
 	store *Store
+
+	sent, recv atomic.Int64 // bytes of file data served / downloaded since start
+
+	sealer *seal.Sealer // nil when the folder has no relay
+	idMu   sync.Mutex
+	idMap  map[string]string
+	idSeq  int64
 
 	ignore atomic.Pointer[Matcher]
 
@@ -76,6 +88,11 @@ func New(cfg config.Folder, selfID, stateDir string, log *slog.Logger) (*Folder,
 		scanned: make(chan struct{}), kick: make(chan struct{}, 1), dirty: make(chan string, 4096),
 	}
 	f.ignore.Store(&Matcher{})
+	if cfg.Secret != "" {
+		if f.sealer, err = seal.New(cfg.Secret); err != nil {
+			return nil, fmt.Errorf("folder secret: %w", err)
+		}
+	}
 	return f, nil
 }
 
@@ -127,7 +144,19 @@ func (f *Folder) prepareRoot() error {
 	default:
 		return err
 	}
-	return os.MkdirAll(filepath.Join(marker, "tmp"), 0o755)
+	tmp := filepath.Join(marker, "tmp")
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
+		return err
+	}
+	// Forget abandoned partial downloads after a few days.
+	if entries, err := os.ReadDir(tmp); err == nil {
+		for _, e := range entries {
+			if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > 3*24*time.Hour {
+				_ = os.Remove(filepath.Join(tmp, e.Name()))
+			}
+		}
+	}
+	return nil
 }
 
 func (f *Folder) setError(err error) {
@@ -212,6 +241,7 @@ func (f *Folder) isBroken() bool {
 }
 
 func (f *Folder) sendTo(p *node.Peer, entries []model.FileInfo) {
+	toRelay := f.isRelay(p)
 	for len(entries) > 0 {
 		n := min(indexBatch, len(entries))
 		batch := entries[:n]
@@ -220,7 +250,23 @@ func (f *Folder) sendTo(p *node.Peer, entries []model.FileInfo) {
 		for _, e := range batch {
 			maxSeq = max(maxSeq, e.Seq)
 		}
-		if err := p.SendIndex(protocol.Index{Folder: f.cfg.ID, Entries: batch, MaxSeq: maxSeq}); err != nil {
+		idx := protocol.Index{Folder: f.cfg.ID, MaxSeq: maxSeq}
+		if toRelay {
+			if f.sealer == nil {
+				return
+			}
+			for _, e := range batch {
+				se, err := f.sealEntry(e)
+				if err != nil {
+					f.log.Error("cannot seal entry for relay", "err", err)
+					return
+				}
+				idx.Sealed = append(idx.Sealed, se)
+			}
+		} else {
+			idx.Entries = batch
+		}
+		if err := p.SendIndex(idx); err != nil {
 			return
 		}
 	}
@@ -249,38 +295,54 @@ func (f *Folder) HandleIndexAck(p *node.Peer, ack protocol.IndexAck) {
 	}
 }
 
-func (f *Folder) HandleProbe(_ *node.Peer, items []protocol.ProbeItem) []bool {
+func (f *Folder) HandleProbe(p *node.Peer, items []protocol.ProbeItem) []bool {
 	have := make([]bool, len(items))
+	if !f.isRelay(p) || f.sealer == nil {
+		return have // only relays probe, and they speak in opaque IDs
+	}
 	for i, it := range items {
-		if cur, ok := f.store.Get(it.Name); ok && cur.Version.Dominates(it.Version) {
+		name, ok := f.resolveID(it.Name)
+		if !ok {
+			continue
+		}
+		if cur, ok := f.store.Get(name); ok && cur.Version.Dominates(it.Version) {
 			have[i] = true
 		}
 	}
 	return have
 }
 
-// HandleRequest serves one block of a file we hold.
-func (f *Folder) HandleRequest(_ *node.Peer, r protocol.Request) ([]byte, string) {
+// HandleRequest serves one block of a file we hold. Relays only ever get
+// encrypted blocks; full devices get plain ones.
+func (f *Folder) HandleRequest(p *node.Peer, r protocol.Request) ([]byte, string) {
 	if f.isBroken() || r.Size <= 0 || r.Size > 32<<20 || r.Offset < 0 {
 		return nil, protocol.ErrNotFound
+	}
+	if d := time.Duration(serveDelay.Load()); d > 0 {
+		time.Sleep(d)
+	}
+	data, code := f.serveBlock(p, r)
+	f.sent.Add(int64(len(data)))
+	return data, code
+}
+
+func (f *Folder) serveBlock(p *node.Peer, r protocol.Request) ([]byte, string) {
+	if f.isRelay(p) != r.Sealed {
+		return nil, protocol.ErrNotFound // a relay must not receive plaintext, nor a full device ciphertext
+	}
+	if r.Sealed {
+		if f.sealer == nil {
+			return nil, protocol.ErrNotFound
+		}
+		return f.serveSealedBlock(r)
 	}
 	cur, ok := f.store.Get(r.Name)
 	if !ok || cur.Deleted || cur.Type != model.TypeFile {
 		return nil, protocol.ErrNotFound
 	}
-	p, err := f.abs(r.Name)
-	if err != nil {
-		return nil, protocol.ErrNotFound
-	}
-	file, err := os.Open(p)
-	if err != nil {
-		return nil, protocol.ErrNotFound
-	}
-	defer file.Close()
-	buf := make([]byte, r.Size)
-	if n, err := file.ReadAt(buf, r.Offset); n != r.Size {
-		_ = err
-		return nil, protocol.ErrChanged
+	buf, code := f.readBlock(r.Name, r.Offset, r.Size)
+	if code != protocol.ErrNone {
+		return nil, code
 	}
 	if string(model.HashBytes(buf)) != string(r.Hash) {
 		return nil, protocol.ErrChanged // file was edited since it was indexed
@@ -300,11 +362,14 @@ type Status struct {
 	LocalBytes int64    `json:"local_bytes"`
 	NeedFiles  int      `json:"need_files"`
 	NeedBytes  int64    `json:"need_bytes"`
+	SentBytes  int64    `json:"sent_bytes"`
+	RecvBytes  int64    `json:"received_bytes"`
 	Peers      []string `json:"connected_peers"`
 }
 
 func (f *Folder) Status() any {
-	st := Status{ID: f.cfg.ID, Label: f.cfg.Label, Path: f.cfg.Path, Role: config.RoleFull}
+	st := Status{ID: f.cfg.ID, Label: f.cfg.Label, Path: f.cfg.Path, Role: config.RoleFull,
+		SentBytes: f.sent.Load(), RecvBytes: f.recv.Load()}
 	for _, e := range f.store.All() {
 		if !e.Deleted && e.Type == model.TypeFile {
 			st.LocalFiles++

@@ -18,6 +18,7 @@ import (
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/folder"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/node"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/relay"
 )
 
@@ -40,7 +41,11 @@ type dev struct {
 	dir   string // synced directory (full) or storage directory (relay)
 	relay bool
 	quota int64 // relay quota in MB (0 = default)
-	a     *app.App
+
+	// connectivity features (all off unless a test turns them on)
+	nat, relaySvc, dht, lan bool
+	addr                    map[string]string // peer name -> address to use instead of 127.0.0.1:port
+	a                       *app.App
 }
 
 func newDev(t *testing.T, root, name string, isRelay bool) *dev {
@@ -75,8 +80,17 @@ func (d *dev) start(t *testing.T, peers ...*dev) {
 		fc.Secret = "" // a relay never holds the folder secret
 		fc.QuotaMB = d.quota
 	}
+	cfg.NATTraversal, cfg.RelayService, cfg.DHT, cfg.LANDiscover = d.nat, d.relaySvc, d.dht, d.lan
 	for _, p := range peers {
-		cfg.Devices = append(cfg.Devices, config.Device{ID: p.id.ID, Name: p.name, Addresses: []string{fmt.Sprintf("127.0.0.1:%d", p.port)}})
+		address := fmt.Sprintf("127.0.0.1:%d", p.port)
+		if a, ok := d.addr[p.name]; ok {
+			address = a
+		}
+		var addrs []string
+		if address != "" {
+			addrs = []string{address}
+		}
+		cfg.Devices = append(cfg.Devices, config.Device{ID: p.id.ID, Name: p.name, Addresses: addrs})
 		fc.Devices = append(fc.Devices, config.FolderDevice{ID: p.id.ID, Relay: p.relay})
 	}
 	cfg.Folders = []config.Folder{fc}
@@ -366,5 +380,206 @@ func TestUnknownDeviceIsRefused(t *testing.T) {
 	}
 	if peers := a.a.Node.Peers(); len(peers) != 0 {
 		t.Fatalf("unknown device was accepted: %v", peers)
+	}
+}
+
+// The relay is blind: after storing real files, nothing on its disk contains a
+// file name or any fragment of the content.
+func TestRelayNeverSeesPlaintext(t *testing.T) {
+	root := t.TempDir()
+	a, b := newDev(t, root, "A", false), newDev(t, root, "B", false)
+	r := newDev(t, root, "R", true)
+	a.start(t, b, r)
+	r.start(t, a, b)
+
+	secretText := []byte("TOP-SECRET-CONTENT-" + strings.Repeat("x", 5000))
+	a.write(t, "Confidential/salary-review-2026.txt", secretText)
+	eventually(t, "relay stored the change", func() bool { return storeHasBlocks(r) })
+
+	var checked int
+	_ = filepath.WalkDir(r.dir, func(p string, e os.DirEntry, err error) error {
+		if err != nil || e.IsDir() {
+			return nil
+		}
+		raw, _ := os.ReadFile(p)
+		checked++
+		for _, leak := range []string{"TOP-SECRET", "salary-review", "Confidential", "xxxxxxxx"} {
+			if bytes.Contains(raw, []byte(leak)) || strings.Contains(p, leak) {
+				t.Errorf("relay leaks %q in %s", leak, p)
+			}
+		}
+		return nil
+	})
+	if checked < 2 {
+		t.Fatalf("expected relay files to inspect, got %d", checked)
+	}
+
+	// And the data still arrives intact on a device that gets it only via the relay.
+	a.stop()
+	b.start(t, a, r)
+	eventually(t, "B decrypts and receives", b.hasContent("Confidential/salary-review-2026.txt", secretText))
+}
+
+// A relay that tampers with a block must not be able to corrupt a device.
+func TestTamperedRelayBlockIsRejected(t *testing.T) {
+	root := t.TempDir()
+	a, b := newDev(t, root, "A", false), newDev(t, root, "B", false)
+	r := newDev(t, root, "R", true)
+	a.start(t, b, r)
+	r.start(t, a, b)
+	a.write(t, "doc.txt", []byte(strings.Repeat("original ", 2000)))
+	eventually(t, "relay stored the change", func() bool { return storeHasBlocks(r) })
+	a.stop()
+
+	// Corrupt every stored block.
+	_ = filepath.WalkDir(filepath.Join(r.dir, "blocks"), func(p string, e os.DirEntry, err error) error {
+		if err == nil && !e.IsDir() {
+			raw, _ := os.ReadFile(p)
+			raw[len(raw)/2] ^= 0xff
+			_ = os.WriteFile(p, raw, 0o600)
+		}
+		return nil
+	})
+	b.start(t, a, r)
+	time.Sleep(3 * time.Second)
+	if _, err := os.Stat(b.path("doc.txt")); err == nil {
+		t.Fatal("device accepted tampered data from the relay")
+	}
+}
+
+func (d *dev) status() (app.Status, folder.Status) {
+	st := d.a.Status().(app.Status)
+	var fs folder.Status
+	for _, f := range st.Folders {
+		if v, ok := f.(folder.Status); ok {
+			fs = v
+		}
+	}
+	return st, fs
+}
+
+func (d *dev) connectedTo(other *dev) func() bool {
+	return func() bool {
+		if d.a == nil {
+			return false
+		}
+		for _, p := range d.a.Node.Peers() {
+			if p.ID == other.id.ID {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// A big download interrupted by the sender going away resumes where it stopped
+// instead of starting over (important on unstable links).
+func TestInterruptedDownloadResumes(t *testing.T) {
+	root := t.TempDir()
+	a, b := newDev(t, root, "A", false), newDev(t, root, "B", false)
+	big := randBytes(12 << 20) // 96 blocks
+	a.write(t, "big.bin", big)
+
+	folder.SetServeDelay(40 * time.Millisecond)
+	t.Cleanup(func() { folder.SetServeDelay(0) })
+	a.start(t, b)
+	b.start(t, a)
+
+	partial := func() int64 {
+		var best int64
+		m, _ := filepath.Glob(filepath.Join(b.dir, ".p2psync", "tmp", "*.part"))
+		for _, p := range m {
+			if fi, err := os.Stat(p); err == nil && fi.Size() > best {
+				best = fi.Size()
+			}
+		}
+		return best
+	}
+	eventually(t, "download in progress", func() bool { return partial() > 4<<20 })
+	a.stop() // the link dies mid-transfer
+	if b.hasContent("big.bin", big)() {
+		t.Fatal("transfer finished before the interruption; test is not exercising resume")
+	}
+
+	folder.SetServeDelay(0)
+	a.start(t, b)
+	eventually(t, "download completes after reconnection", b.hasContent("big.bin", big))
+	_, fs := a.status()
+	if fs.SentBytes > int64(len(big))*8/10 {
+		t.Fatalf("after reconnecting A re-sent %d of %d bytes: the partial download was not resumed", fs.SentBytes, len(big))
+	}
+	t.Logf("A re-sent only %.1f MB of %.1f MB", float64(fs.SentBytes)/1e6, float64(len(big))/1e6)
+}
+
+func privateHook(public string) func(*node.Options) {
+	return func(o *node.Options) {
+		o.Reachability = "private"
+		if o.Config.DeviceName == public {
+			o.Reachability = "public"
+		}
+	}
+}
+
+// Two devices that cannot reach each other (no address known, as behind two
+// NATs) still connect, through a third device of the same owner acting as a
+// circuit relay. No external server is involved.
+func TestDevicesConnectThroughOwnDeviceAsCircuitRelay(t *testing.T) {
+	app.NodeHook = privateHook("H")
+	t.Cleanup(func() { app.NodeHook = nil })
+
+	root := t.TempDir()
+	h, a, b := newDev(t, root, "H", false), newDev(t, root, "A", false), newDev(t, root, "B", false)
+	h.relaySvc, h.nat = true, true
+	a.nat, b.nat = true, true
+	via := fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1/p2p/%s/p2p-circuit", h.port, h.id.ID)
+	a.addr = map[string]string{"B": via}
+	b.addr = map[string]string{"A": via}
+
+	h.start(t, a, b)
+	a.start(t, h, b)
+	b.start(t, h, a)
+
+	eventually(t, "A and B talk to each other through H", func() bool { return a.connectedTo(b)() && b.connectedTo(a)() })
+
+	data := randBytes(500 << 10)
+	a.write(t, "via-relay.bin", data)
+	eventually(t, "file reaches B", b.hasContent("via-relay.bin", data))
+}
+
+// Devices only need to know *one* reachable device of their own: the private
+// DHT lets them learn each other's current addresses from it.
+func TestDevicesFindEachOtherThroughPrivateDHT(t *testing.T) {
+	app.NodeHook = privateHook("H")
+	t.Cleanup(func() { app.NodeHook = nil })
+
+	root := t.TempDir()
+	h, a, b := newDev(t, root, "H", false), newDev(t, root, "A", false), newDev(t, root, "B", false)
+	for _, d := range []*dev{h, a, b} {
+		d.nat, d.relaySvc, d.dht = true, true, true
+	}
+	a.addr = map[string]string{"B": ""}
+	b.addr = map[string]string{"A": ""}
+
+	h.start(t, a, b)
+	a.start(t, h, b)
+	b.start(t, h, a)
+
+	eventually(t, "A and B find each other", func() bool { return a.connectedTo(b)() && b.connectedTo(a)() })
+}
+
+// A daemon must always be able to stop, even if a networking component hangs on
+// close (this happened with LAN discovery in a multicast-less environment).
+func TestStopIsBounded(t *testing.T) {
+	root := t.TempDir()
+	a, b := newDev(t, root, "A", false), newDev(t, root, "B", false)
+	a.nat, a.dht, a.lan, a.relaySvc = true, true, true, true
+	a.start(t, b)
+	time.Sleep(500 * time.Millisecond)
+	done := make(chan struct{})
+	go func() { a.stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("Stop did not return")
 	}
 }

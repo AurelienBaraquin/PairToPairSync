@@ -50,7 +50,7 @@ func (r *Relay) storeBytesLocked() int64 {
 func (r *Relay) gcBlocksLocked() {
 	keep := map[string]bool{}
 	for _, pd := range r.pending {
-		for _, h := range pd.Entry.Blocks {
+		for _, h := range pd.Entry.CBlocks {
 			keep[hex.EncodeToString(h)] = true
 		}
 	}

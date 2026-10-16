@@ -2,7 +2,7 @@ package folder
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -14,6 +14,7 @@ import (
 
 	"github.com/aurelienbaraquin/pairtopairsync/internal/model"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/node"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/protocol"
 )
 
 const pullWorkers = 4
@@ -181,7 +182,6 @@ func (f *Folder) applyFile(w *want, peer *node.Peer, abs string, cur model.FileI
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp) // no-op after a successful rename
 
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return err
@@ -219,23 +219,33 @@ type blockLoc struct {
 	size int
 }
 
+// partName names the partial download of one specific version of a file, so an
+// interrupted transfer can be resumed later, and a newer version never mixes
+// with it.
+func partName(e model.FileInfo) string {
+	sum := sha256.Sum256([]byte(e.Name + "|" + e.Version.String()))
+	return hex.EncodeToString(sum[:16]) + ".part"
+}
+
 // download builds the new content in a temporary file inside the folder's
 // metadata directory (same file system, so the final rename is atomic).
-// Blocks that already exist in the local version are copied, not downloaded.
+// Blocks that already exist in the local version are copied, not downloaded, and
+// blocks already received by an earlier, interrupted attempt are verified and
+// kept: on an unreliable link a big file converges instead of restarting.
 func (f *Folder) download(e model.FileInfo, peer *node.Peer, abs string, cur model.FileInfo, have bool, ds diskState) (string, error) {
-	var rnd [8]byte
-	_, _ = rand.Read(rnd[:])
-	tmp := filepath.Join(f.root, MetaDir, "tmp", hex.EncodeToString(rnd[:]))
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	tmp := filepath.Join(f.root, MetaDir, "tmp", partName(e))
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return "", err
+	}
+	var resumeSize int64
+	if fi, err := out.Stat(); err == nil {
+		resumeSize = fi.Size()
 	}
 	ok := false
 	defer func() {
 		out.Close()
-		if !ok {
-			os.Remove(tmp)
-		}
+		_ = ok // the partial file is deliberately kept on failure
 	}()
 
 	// Blocks we can reuse from the current local file.
@@ -266,6 +276,9 @@ func (f *Folder) download(e model.FileInfo, peer *node.Peer, abs string, cur mod
 			defer wg.Done()
 			for i := range jobs {
 				off, size := e.BlockRange(i)
+				if off+int64(size) <= resumeSize && partHasBlock(out, off, size, e.Blocks[i]) {
+					continue // received during an earlier attempt
+				}
 				data, err := f.fetchBlock(ctx, e, i, size, off, peer, old, reuse)
 				if err == nil {
 					_, err = out.WriteAt(data, off)
@@ -290,8 +303,8 @@ feed:
 	if firstErr != nil {
 		return "", firstErr
 	}
-	if err := ctx.Err(); err != nil && f.ctx.Err() != nil {
-		return "", err
+	if f.ctx.Err() != nil {
+		return "", f.ctx.Err()
 	}
 	if err := out.Truncate(e.Size); err != nil {
 		return "", err
@@ -311,6 +324,14 @@ feed:
 	return tmp, nil
 }
 
+func partHasBlock(file *os.File, off int64, size int, hash []byte) bool {
+	buf := make([]byte, size)
+	if n, _ := file.ReadAt(buf, off); n != size {
+		return false
+	}
+	return string(model.HashBytes(buf)) == string(hash)
+}
+
 func (f *Folder) fetchBlock(ctx context.Context, e model.FileInfo, i, size int, off int64, peer *node.Peer, old *os.File, reuse map[string]blockLoc) ([]byte, error) {
 	hash := e.Blocks[i]
 	if loc, ok := reuse[string(hash)]; ok && loc.size == size && old != nil {
@@ -321,11 +342,38 @@ func (f *Folder) fetchBlock(ctx context.Context, e model.FileInfo, i, size int, 
 			}
 		}
 	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ { // ride out brief network hiccups
+		if attempt > 0 {
+			select {
+			case <-time.After(time.Duration(attempt) * 700 * time.Millisecond):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		data, err := f.requestBlock(ctx, e, size, off, hash, peer)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("block %d of %s: %w", i, e.Name, lastErr)
+}
+
+func (f *Folder) requestBlock(ctx context.Context, e model.FileInfo, size int, off int64, hash []byte, peer *node.Peer) ([]byte, error) {
 	rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	data, err := peer.Request(rctx, f.cfg.ID, e.Name, off, size, hash, false)
-	if err != nil {
-		return nil, fmt.Errorf("block %d of %s: %w", i, e.Name, err)
+	if !f.isRelay(peer) {
+		data, err := peer.Request(rctx, protocol.Request{Folder: f.cfg.ID, Name: e.Name, Offset: off, Size: size, Hash: hash})
+		f.recv.Add(int64(len(data)))
+		return data, err
 	}
-	return data, nil
+	// Through a relay the block travels encrypted and is authenticated here.
+	body, err := peer.Request(rctx, protocol.Request{Folder: f.cfg.ID, Name: f.sealer.PathID(e.Name),
+		Offset: off, Size: size, Hash: f.sealer.BlockID(hash), Sealed: true})
+	if err != nil {
+		return nil, err
+	}
+	f.recv.Add(int64(len(body)))
+	return f.sealer.OpenBlock(body, hash)
 }

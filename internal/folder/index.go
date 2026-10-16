@@ -19,8 +19,25 @@ func (f *Folder) HandleIndex(p *node.Peer, idx protocol.Index) {
 	var changed []model.FileInfo
 	needed := false
 
+	entries := idx.Entries
+	if f.isRelay(p) {
+		// From a relay we accept sealed entries only, and only if they authenticate.
+		entries = nil
+		if f.sealer == nil {
+			return
+		}
+		for _, se := range idx.Sealed {
+			fi, err := f.unseal(se)
+			if err != nil {
+				f.log.Warn("ignoring entry from relay", "relay", p.Name(), "err", err)
+				continue
+			}
+			entries = append(entries, fi)
+		}
+	}
+
 	f.mu.Lock()
-	for _, e := range idx.Entries {
+	for _, e := range entries {
 		if !validName(e.Name) || ig.Ignored(e.Name, e.Type == model.TypeDir) || e.Version == nil {
 			continue
 		}

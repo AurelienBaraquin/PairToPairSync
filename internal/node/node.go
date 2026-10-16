@@ -32,6 +32,7 @@ import (
 	lprotocol "github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	ma "github.com/multiformats/go-multiaddr"
 
@@ -104,7 +105,7 @@ func New(o Options) *Node {
 		o.Logger = slog.Default()
 	}
 	if o.RedialMax == 0 {
-		o.RedialMax = time.Minute
+		o.RedialMax = 30 * time.Second
 	}
 	n := &Node{cfg: o.Config, id: o.Identity, log: o.Logger, opts: o, redial: o.RedialMax,
 		handlers: map[string]FolderHandler{}, known: map[peer.ID]config.Device{},
@@ -116,6 +117,10 @@ func New(o Options) *Node {
 	for _, d := range o.Config.Devices {
 		if pid, err := identity.Decode(d.ID); err == nil && d.ID != o.Identity.ID && n.sharesAny(d.ID) {
 			n.known[pid] = d
+			// Known before the host exists, so AutoRelay finds relay candidates at once.
+			for _, a := range d.Addresses {
+				n.disco[pid] = append(n.disco[pid], ParseAddr(a)...)
+			}
 		}
 	}
 	return n
@@ -203,7 +208,9 @@ func (n *Node) libp2pOptions() []libp2p.Option {
 			libp2p.NATPortMap(),         // UPnP / NAT-PMP / PCP on the user's own router
 			libp2p.EnableAutoNATv2(),    // learn from our own devices whether we are reachable
 			libp2p.EnableHolePunching(), // direct connection through NATs (DCUtR)
-			libp2p.EnableAutoRelayWithPeerSource(n.relayCandidates),
+			libp2p.EnableAutoRelayWithPeerSource(n.relayCandidates,
+				// With a handful of personal devices, do not wait for a crowd of candidates.
+				autorelay.WithBootDelay(0), autorelay.WithMinCandidates(1), autorelay.WithMinInterval(5*time.Second)),
 		)
 	}
 	if n.cfg.RelayService {
@@ -258,6 +265,9 @@ func (n *Node) relayCandidates(ctx context.Context, num int) <-chan peer.AddrInf
 	return ch
 }
 
+// Stop shuts the node down. Every step that depends on third-party code is
+// bounded in time: a library that fails to close must never keep the daemon
+// alive (or block a configuration reload).
 func (n *Node) Stop() {
 	if n.cancel == nil {
 		return
@@ -269,14 +279,27 @@ func (n *Node) Stop() {
 	}
 	n.mu.Unlock()
 	if n.mdns != nil {
-		_ = n.mdns.Close()
+		n.bounded("LAN discovery", func() { _ = n.mdns.Close() })
+	}
+	if n.dht != nil {
+		n.bounded("DHT", func() { _ = n.dht.Close() })
 	}
 	if n.host != nil {
-		_ = n.host.Close()
+		n.bounded("network host", func() { _ = n.host.Close() })
 	}
-	n.wg.Wait()
+	n.bounded("sessions", n.wg.Wait)
 	for _, h := range n.handlers {
 		h.Stop()
+	}
+}
+
+func (n *Node) bounded(what string, fn func()) {
+	done := make(chan struct{})
+	go func() { defer close(done); fn() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		n.log.Warn("did not stop in time, continuing", "component", what)
 	}
 }
 
@@ -365,9 +388,6 @@ func (n *Node) addDeviceAddrs(pid peer.ID, d config.Device) {
 		return
 	}
 	n.host.Peerstore().AddAddrs(pid, all, peerstore.PermanentAddrTTL)
-	n.mu.Lock()
-	n.disco[pid] = append(n.disco[pid], all...)
-	n.mu.Unlock()
 }
 
 type mdnsNotifee struct{ n *Node }

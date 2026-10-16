@@ -1,28 +1,40 @@
 # Architecture
 
-Un seul binaire Go (`cmd/p2psync`), sans CGO. Dépendance externe unique : `fsnotify`.
+Un seul binaire Go (`cmd/p2psync`), sans CGO. Réseau : [libp2p](https://libp2p.io). Autres dépendances :
+`fsnotify` (surveillance de fichiers), `x/crypto` (XChaCha20-Poly1305, HKDF).
 
 ```
-cmd/p2psync          CLI + démon (rechargement auto de la config)
+cmd/p2psync          CLI + démon (rechargement auto de la config, arrêt borné)
 internal/app         assemblage : config + identité + moteurs de dossiers + réseau + API
-internal/node        TLS, connexions, routage des messages, dédoublonnage des connexions
-internal/protocol    format de trame (en-tête JSON + corps binaire), messages
-internal/folder      moteur « copie complète » : scan, watcher, index, téléchargement, conflits
-internal/relay       moteur « relais » : changements en attente, acquittements, purge
+internal/node        hôte libp2p, gater, sessions, flux par requête, supervision de connexion
+internal/protocol    format de trame (en-tête JSON + corps binaire), messages, entrées scellées
+internal/folder      moteur « copie complète » : scan, watcher, index, téléchargement reprenable, conflits, scellement
+internal/relay       moteur « relais » : changements scellés en attente, acquittements, purge
+internal/seal        chiffrement du relais : HKDF, HMAC, XChaCha20-Poly1305
 internal/model       vecteurs de versions, FileInfo, blocs SHA-256
-internal/identity    certificat ed25519 auto-signé, ID d'appareil = SHA-256 du certificat
-internal/discovery   annonces UDP sur le réseau local
+internal/identity    clé Ed25519, ID d'appareil = peer ID libp2p
 internal/api         page d'état locale (127.0.0.1)
 mobile               API compatible gomobile
 ```
 
-## Sécurité
+## Réseau
 
-TLS 1.3 avec authentification mutuelle. Il n'y a pas d'autorité de certification : l'identité d'un appareil
-est le hachage de son certificat, comparé à la liste des appareils configurés (épinglage). Un appareil
-inconnu est déconnecté avant tout échange. Tous les chemins reçus sont validés (pas de `..`, pas de chemin
-absolu, pas de `.p2psync`), l'écriture refuse de traverser un lien symbolique, et chaque bloc reçu est
-vérifié par son SHA-256.
+- **Identité** : clé Ed25519 ; l'ID d'appareil est le peer ID libp2p dérivé de la clé publique. La
+  connexion sécurisée (QUIC/TLS 1.3 ou TCP+Noise) prouve la possession de la clé : il n'y a pas de CA.
+- **Gater** (`node/gater.go`) : `InterceptPeerDial`, `InterceptAddrDial`, `InterceptSecured` ne laissent
+  passer que les appareils configurés. Un inconnu est coupé pendant la poignée de main.
+- **Flux** : un flux long `session` par paire (Hello, Index, IndexAck, Ping) et un flux court par
+  `block` ou `probe`. Sur QUIC ce sont des flux indépendants, donc un gros bloc ne retarde pas les pings.
+- **Une seule session par paire** : si deux sessions s'ouvrent simultanément, celle ouverte par l'appareil
+  de plus petit ID survit des deux côtés. Si la session passe par un relais de connexion et qu'une connexion
+  directe apparaît (perçage réussi), la session est rouverte sur le chemin direct.
+- **Joignabilité** : mDNS ; adresses de la configuration ; DHT Kademlia *privée* (préfixe `/p2psync`, et
+  le gater empêche tout étranger de la rejoindre) ; NATPortMap ; AutoNAT v2 ; DCUtR ; AutoRelay + service de
+  relais de circuit v2 sans limites de débit/durée **mais restreint par ACL à vos appareils**.
+  Les candidats-relais d'AutoRelay sont vos propres appareils.
+- **Supervision** : `dialLoop` par appareil, délai 1 s → 30 s avec gigue, réveillé par mDNS ou une connexion
+  entrante ; pings toutes les 8 s, délai de lecture 30 s. `Stop()` borne dans le temps chaque composant tiers
+  (un `Close` qui ne revient pas ne peut pas garder le démon en vie).
 
 ## Modèle de données
 
@@ -47,13 +59,13 @@ blocs manquants ; les blocs déjà présents dans l'ancienne version locale sont
 ## Le relais
 
 Un relais n'a pas d'arborescence. Son état est `pending.json` (changements en attente) + `blocks/`
-(blocs adressés par hachage). Pour chaque changement : l'ensemble `Acked` des appareils qui possèdent la
-version.
+(blocs chiffrés adressés par identifiant). Pour chaque changement : l'ensemble `Acked` des appareils qui
+possèdent la version.
 
 | Événement | Effet sur le relais |
 |---|---|
 | Un appareil complet annonce une version | entrée créée (ou remplacée si plus récente) ; l'émetteur est acquitté |
-| Un appareil absent n'a pas acquitté | le relais **télécharge les blocs** depuis un appareil qui les a |
+| Un appareil absent n'a pas acquitté | le relais **télécharge les blocs chiffrés** depuis un appareil qui les a |
 | Tous les appareils sont connectés | il attend (`HoldTime`) : ils se synchronisent directement, rien n'est stocké |
 | Un appareil annonce la même version (il l'a reçue) | acquittement |
 | Connexion d'un appareil / toutes les 30 s | **sonde** « avez-vous la version V de F ? » → acquitte les livraisons faites sans lui |
@@ -61,11 +73,28 @@ version.
 | Quota atteint / rétention dépassée | pas de stockage / entrée jetée |
 
 Côté appareil complet, un nouveau relais ne reçoit que les changements **futurs** (compteur `relay_sent`
-confirmé par `IndexAck`, donc rien n'est perdu si la connexion tombe en route).
-Les relais ne se parlent pas entre eux et ne comptent jamais comme destinataires finaux.
+confirmé par `IndexAck`, donc rien n'est perdu si la connexion tombe en route). Les relais ne se parlent pas
+entre eux et ne comptent jamais comme destinataires finaux.
+
+### Protocole scellé (`internal/seal`, `folder/sealed.go`)
+
+Clés dérivées du secret du dossier par HKDF-SHA256 (étiquettes `name`, `meta`, `block`, `blockid`).
+
+| Donnée | Ce que voit le relais |
+|---|---|
+| chemin | `ID = HMAC(name)[:16]` (hex) — opaque, dépend du secret (pas d'attaque par dictionnaire) |
+| métadonnées | `XChaCha20-Poly1305(nonce aléatoire, AAD = ID‖version)` : nom, mode, hachages en clair des blocs |
+| bloc | `XChaCha20-Poly1305(nonce = HMAC(hash_en_clair), AAD = hash_en_clair)`, stocké sous `BlockID = HMAC(hash_en_clair)` |
+| en clair | vecteur de versions, date, indicateur de suppression, taille, taille de bloc, nombre de blocs |
+
+`BlockID` se calcule sans relire le fichier. Le destinataire rejoue tous les contrôles : il authentifie les
+métadonnées, vérifie que les champs en clair du relais (version, taille, suppression, date, liste de blocs)
+correspondent aux métadonnées authentifiées, déchiffre chaque bloc (l'AEAD échoue si le relais l'a modifié ou
+remplacé) puis revérifie le SHA-256 du clair. Un relais refuse les entrées en clair, et un appareil complet
+refuse de servir un bloc en clair à un relais.
 
 ## Pistes d'évolution
 
-Index différentiel entre appareils complets, purge des pierres tombales, détection de renommage,
-traversée de NAT / découverte globale, application Android native, intégration shell (icônes de statut),
-sélection de sous-dossiers, versionnage.
+Index différentiel entre appareils complets, purge des pierres tombales, détection de renommage, échange
+assisté et rotation du secret (QR code), application Android native, intégration shell (icônes de statut),
+sélection de sous-dossiers, versionnage, validation sur de vrais réseaux (NAT, mDNS, UPnP).

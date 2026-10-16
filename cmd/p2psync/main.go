@@ -312,7 +312,14 @@ func run(home string) error {
 			select {
 			case <-sig:
 				logger.Info("shutting down")
-				a.Stop()
+				stopped := make(chan struct{})
+				go func() { a.Stop(); close(stopped) }()
+				select {
+				case <-stopped:
+				case <-sig: // second Ctrl-C
+				case <-time.After(15 * time.Second):
+					logger.Warn("shutdown timed out, exiting anyway")
+				}
 				return nil
 			case <-reload:
 				restart = true
@@ -350,10 +357,14 @@ func status(home string) error {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	var st struct {
-		DeviceID   string                  `json:"device_id"`
-		DeviceName string                  `json:"device_name"`
-		Folders    []map[string]any        `json:"folders"`
-		Peers      []struct{ Name string } `json:"peers"`
+		DeviceID   string           `json:"device_id"`
+		DeviceName string           `json:"device_name"`
+		Addresses  []string         `json:"addresses"`
+		Folders    []map[string]any `json:"folders"`
+		Peers      []struct {
+			Name    string `json:"name"`
+			Relayed bool   `json:"relayed"`
+		} `json:"peers"`
 	}
 	if err := json.Unmarshal(body, &st); err != nil {
 		return err
@@ -370,7 +381,22 @@ func status(home string) error {
 			fmt.Println("          ERROR:", e)
 		}
 	}
-	fmt.Printf("  %d device(s) connected\n", len(st.Peers))
+	for _, p := range st.Peers {
+		path := "direct"
+		if p.Relayed {
+			path = "via one of your devices (relayed)"
+		}
+		fmt.Printf("  connected: %-16s %s\n", p.Name, path)
+	}
+	if len(st.Peers) == 0 {
+		fmt.Println("  no device connected")
+	}
+	if len(st.Addresses) > 0 {
+		fmt.Println("\nTo pair another device with this one, give it one of these addresses:")
+		for _, a := range st.Addresses {
+			fmt.Println("  ", a)
+		}
+	}
 	return nil
 }
 

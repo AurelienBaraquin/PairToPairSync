@@ -110,12 +110,11 @@ func (p *Peer) exchange(ctx context.Context, proto protocolID, t protocol.Type, 
 	return rh, rb, nil
 }
 
-// Request fetches one block and verifies its SHA-256. For a sealed request the
-// block is encrypted: its length is size+SealOverhead and hash is the hash of
-// the ciphertext.
-func (p *Peer) Request(ctx context.Context, folder, name string, off int64, size int, hash []byte, sealed bool) ([]byte, error) {
-	rh, body, err := p.exchange(ctx, protoBlock, protocol.TypeRequest, protocol.Request{
-		Folder: folder, Name: name, Offset: off, Size: size, Hash: hash})
+// Request fetches one block. A plain block is verified here against its
+// SHA-256. A sealed block (r.Sealed) is ciphertext whose authenticity is checked
+// by the caller when it decrypts; only its length is checked here.
+func (p *Peer) Request(ctx context.Context, r protocol.Request) ([]byte, error) {
+	rh, body, err := p.exchange(ctx, protoBlock, protocol.TypeRequest, r)
 	if err != nil {
 		return nil, err
 	}
@@ -126,11 +125,13 @@ func (p *Peer) Request(ctx context.Context, folder, name string, off int64, size
 	if resp.Err != "" {
 		return nil, fmt.Errorf("peer %s: %s", p.name, resp.Err)
 	}
-	want := size
-	if sealed {
-		want += protocol.SealOverhead
+	if r.Sealed {
+		if len(body) != r.Size+protocol.SealOverhead {
+			return nil, fmt.Errorf("peer %s: sealed block has the wrong size", p.name)
+		}
+		return body, nil
 	}
-	if len(body) != want || string(model.HashBytes(body)) != string(hash) {
+	if len(body) != r.Size || string(model.HashBytes(body)) != string(r.Hash) {
 		return nil, fmt.Errorf("peer %s: block failed verification", p.name)
 	}
 	return body, nil

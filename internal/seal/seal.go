@@ -8,10 +8,12 @@
 //   - metadata    -> XChaCha20-Poly1305 with a random nonce, bound to the
 //     identifier and the version vector (a relay cannot splice them);
 //   - data blocks -> XChaCha20-Poly1305 with a nonce derived from the block's own
-//     hash. Encryption is therefore deterministic: whichever device seals a block
-//     produces the same bytes, so the relay can verify and de-duplicate by the
-//     hash of the ciphertext. What the relay can learn: file sizes, timing, the
-//     version vectors, and that two blocks of the folder are identical.
+//     hash, and stored under a keyed identifier. Encryption is deterministic:
+//     whichever device seals a block produces the same bytes, so the relay can
+//     de-duplicate. Integrity is end to end: the receiving device authenticates
+//     the ciphertext and re-checks the plaintext hash. What the relay can learn:
+//     file sizes, timing, the version vectors, and that two blocks of the folder
+//     are identical.
 package seal
 
 import (
@@ -50,9 +52,9 @@ func ParseSecret(s string) ([]byte, error) {
 
 // Sealer holds the keys derived from a folder secret.
 type Sealer struct {
-	nameKey, metaKey, blockKey []byte
-	meta                       cipherAEAD
-	block                      cipherAEAD
+	nameKey, metaKey, blockKey, idKey []byte
+	meta                              cipherAEAD
+	block                             cipherAEAD
 }
 
 type cipherAEAD interface {
@@ -75,7 +77,7 @@ func New(secret string) (*Sealer, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Sealer{nameKey: derive(raw, "name"), metaKey: derive(raw, "meta"), blockKey: derive(raw, "block")}
+	s := &Sealer{nameKey: derive(raw, "name"), metaKey: derive(raw, "meta"), blockKey: derive(raw, "block"), idKey: derive(raw, "blockid")}
 	if s.meta, err = chacha20poly1305.NewX(s.metaKey); err != nil {
 		return nil, err
 	}
@@ -111,6 +113,15 @@ func (s *Sealer) OpenMeta(sealed []byte, pathID, version string) ([]byte, error)
 }
 
 func aad(pathID, version string) []byte { return []byte(pathID + "|" + version) }
+
+// BlockID is the identifier under which a relay stores an encrypted block. It
+// is computable from the plaintext hash alone (no need to re-read the file) and
+// reveals nothing about it without the secret.
+func (s *Sealer) BlockID(plainHash []byte) []byte {
+	m := hmac.New(sha256.New, s.idKey)
+	m.Write(plainHash)
+	return m.Sum(nil)
+}
 
 func (s *Sealer) blockNonce(plainHash []byte) []byte {
 	m := hmac.New(sha256.New, s.blockKey)
