@@ -30,6 +30,8 @@ func init() {
 	app.RedialMax = 500 * time.Millisecond
 }
 
+const testSecret = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+
 type dev struct {
 	name  string
 	home  string
@@ -62,10 +64,15 @@ func newDev(t *testing.T, root, name string, isRelay bool) *dev {
 // start launches d knowing the given peers.
 func (d *dev) start(t *testing.T, peers ...*dev) {
 	t.Helper()
-	cfg := &config.Config{DeviceName: d.name, ListenAddr: fmt.Sprintf("127.0.0.1:%d", d.port), APIAddr: "-"}
-	fc := config.Folder{ID: "docs", Path: d.dir, Role: config.RoleFull, ScanIntervalSec: 1}
+	cfg := &config.Config{DeviceName: d.name, ListenPort: d.port, APIAddr: "-",
+		ListenAddresses: []string{
+			fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1", d.port),
+			fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", d.port),
+		}}
+	fc := config.Folder{ID: "docs", Path: d.dir, Role: config.RoleFull, ScanIntervalSec: 1, Secret: testSecret}
 	if d.relay {
 		fc.Role = config.RoleRelay
+		fc.Secret = "" // a relay never holds the folder secret
 		fc.QuotaMB = d.quota
 	}
 	for _, p := range peers {

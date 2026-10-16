@@ -220,7 +220,7 @@ func (f *Folder) sendTo(p *node.Peer, entries []model.FileInfo) {
 		for _, e := range batch {
 			maxSeq = max(maxSeq, e.Seq)
 		}
-		if err := p.SendIndex(f.cfg.ID, batch, maxSeq); err != nil {
+		if err := p.SendIndex(protocol.Index{Folder: f.cfg.ID, Entries: batch, MaxSeq: maxSeq}); err != nil {
 			return
 		}
 	}

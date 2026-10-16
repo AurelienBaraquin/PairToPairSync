@@ -146,7 +146,7 @@ func (r *Relay) send(p *node.Peer, entries []model.FileInfo) {
 	const batch = 500
 	for len(entries) > 0 {
 		n := min(batch, len(entries))
-		if p.SendIndex(r.cfg.ID, entries[:n], 0) != nil {
+		if p.SendIndex(protocol.Index{Folder: r.cfg.ID, Entries: entries[:n]}) != nil {
 			return
 		}
 		entries = entries[n:]
@@ -419,7 +419,7 @@ func (r *Relay) fetch(name string, pd *Pending) {
 			for i := range jobs {
 				off, size := pd.Entry.BlockRange(i)
 				rctx, c := context.WithTimeout(ctx, 2*time.Minute)
-				data, err := src.Request(rctx, r.cfg.ID, name, off, size, pd.Entry.Blocks[i])
+				data, err := src.Request(rctx, r.cfg.ID, name, off, size, pd.Entry.Blocks[i], false)
 				c()
 				if err == nil {
 					err = r.writeBlock(pd.Entry.Blocks[i], data)

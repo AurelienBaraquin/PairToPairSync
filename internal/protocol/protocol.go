@@ -38,6 +38,9 @@ const (
 
 const MaxFrame = 64 << 20
 
+// SealOverhead is the size added to a block by authenticated encryption (Poly1305 tag).
+const SealOverhead = 16
+
 // Hello is the first message each side sends.
 type Hello struct {
 	Version int      `json:"version"`
@@ -45,13 +48,53 @@ type Hello struct {
 	Folders []string `json:"folders"` // IDs of the folders the sender shares with the receiver
 }
 
-// Index carries file metadata. MaxSeq is the highest local sequence number of
-// the entries it contains (0 if not applicable); the receiver echoes it in an
+// Index carries file metadata. Between full devices it carries plain Entries.
+// Everything exchanged with a relay is Sealed instead: the relay is not trusted
+// with names or content. MaxSeq is the highest local sequence number of the
+// entries it contains (0 if not applicable); the receiver echoes it in an
 // IndexAck once the entries are durably processed.
 type Index struct {
 	Folder  string           `json:"folder"`
-	Entries []model.FileInfo `json:"entries"`
+	Entries []model.FileInfo `json:"entries,omitempty"`
+	Sealed  []SealedEntry    `json:"sealed,omitempty"`
 	MaxSeq  int64            `json:"max_seq,omitempty"`
+}
+
+// SealedEntry is the only view of a change a relay ever has. In clear: an opaque
+// path identifier, the version vector (so the relay can order changes), the
+// timestamp, the deletion flag and the shape of the data. Names, modes and
+// plaintext block hashes are inside Meta, encrypted with the folder secret.
+type SealedEntry struct {
+	ID        string       `json:"id"`
+	Version   model.Vector `json:"version"`
+	ModTime   int64        `json:"mtime"`
+	Deleted   bool         `json:"deleted,omitempty"`
+	Size      int64        `json:"size"`
+	BlockSize int          `json:"block_size,omitempty"`
+	CBlocks   [][]byte     `json:"cblocks,omitempty"` // SHA-256 of each encrypted block
+	Meta      []byte       `json:"meta"`
+}
+
+// WinsOver mirrors model.FileInfo.WinsOver using only what a relay can see, so
+// that relay and devices agree on the canonical version of a concurrent edit.
+func (e SealedEntry) WinsOver(o SealedEntry) bool {
+	if e.Deleted != o.Deleted {
+		return !e.Deleted
+	}
+	if e.ModTime != o.ModTime {
+		return e.ModTime > o.ModTime
+	}
+	return e.Version.String() > o.Version.String()
+}
+
+// BlockRange returns the plaintext byte range covered by block i.
+func (e SealedEntry) BlockRange(i int) (off int64, size int) {
+	off = int64(i) * int64(e.BlockSize)
+	size = e.BlockSize
+	if rest := e.Size - off; rest < int64(size) {
+		size = int(rest)
+	}
+	return off, size
 }
 
 type IndexAck struct {
@@ -62,7 +105,6 @@ type IndexAck struct {
 // Request asks for one block of a file. Hash identifies the block by content,
 // which is what a relay (that has no directory tree) uses to find it.
 type Request struct {
-	ID     uint32 `json:"id"`
 	Folder string `json:"folder"`
 	Name   string `json:"name"`
 	Offset int64  `json:"offset"`
@@ -79,7 +121,6 @@ const (
 )
 
 type Response struct {
-	ID  uint32 `json:"id"`
 	Err string `json:"err,omitempty"`
 }
 
@@ -90,24 +131,29 @@ type ProbeItem struct {
 }
 
 type Probe struct {
-	ID     uint32      `json:"id"`
 	Folder string      `json:"folder"`
 	Items  []ProbeItem `json:"items"`
 }
 
 type ProbeReply struct {
-	ID   uint32 `json:"id"`
 	Have []bool `json:"have"`
 }
 
-// Conn frames messages on top of a net.Conn.
+// Stream is the subset of a network connection or libp2p stream that Conn needs.
+type Stream interface {
+	io.ReadWriteCloser
+	SetReadDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
+}
+
+// Conn frames messages on top of a Stream.
 type Conn struct {
-	nc  net.Conn
+	nc  Stream
 	r   *bufio.Reader
 	wmu sync.Mutex
 }
 
-func NewConn(nc net.Conn) *Conn { return &Conn{nc: nc, r: bufio.NewReaderSize(nc, 64<<10)} }
+func NewConn(nc Stream) *Conn { return &Conn{nc: nc, r: bufio.NewReaderSize(nc, 64<<10)} }
 
 func (c *Conn) Close() error { return c.nc.Close() }
 

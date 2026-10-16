@@ -1,144 +1,105 @@
-// Package identity manages the cryptographic identity of a device. A device is
-// identified by the SHA-256 of its self-signed certificate; peers authenticate
-// each other by pinning that value (mutual TLS 1.3, no certificate authority).
+// Package identity manages the cryptographic identity of a device.
+//
+// A device owns an Ed25519 key pair. Its device ID is the libp2p peer ID derived
+// from the public key, so the ID *is* the public key: when a connection is
+// secured (QUIC/TLS 1.3 or Noise) the remote end has proven possession of the
+// matching private key. There is no certificate authority and no server.
 package identity
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/base32"
-	"encoding/pem"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
+
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
-// ALPN protocol identifier.
-const alpn = "p2psync/1"
+const keyFile = "identity.key"
 
 type Identity struct {
-	Cert tls.Certificate
-	ID   string // canonical device ID (no dashes)
+	Key    crypto.PrivKey
+	PeerID peer.ID
+	ID     string // canonical device ID (== PeerID.String())
 }
 
-var b32 = base32.StdEncoding.WithPadding(base32.NoPadding)
-
-// IDFromCertDER computes the canonical device ID of a DER encoded certificate.
-func IDFromCertDER(der []byte) string {
-	sum := sha256.Sum256(der)
-	return b32.EncodeToString(sum[:])
-}
-
-// Normalize converts a user supplied ID (dashes, spaces, lowercase) to the
-// canonical form. It returns an error if the result is not a valid ID.
-func Normalize(id string) (string, error) {
-	id = strings.ToUpper(strings.NewReplacer("-", "", " ", "").Replace(strings.TrimSpace(id)))
-	raw, err := b32.DecodeString(id)
-	if err != nil || len(raw) != sha256.Size {
-		return "", fmt.Errorf("invalid device ID %q", id)
-	}
-	return id, nil
-}
-
-// Format renders an ID in groups of seven characters for display.
-func Format(id string) string {
-	var parts []string
-	for len(id) > 7 {
-		parts = append(parts, id[:7])
-		id = id[7:]
-	}
-	parts = append(parts, id)
-	return strings.Join(parts, "-")
-}
-
-// Short is the compact form used as a key in version vectors.
-func Short(id string) string {
-	if len(id) < 8 {
-		return id
-	}
-	return id[:8]
-}
-
-// LoadOrCreate reads the identity stored in dir, generating it on first use.
+// LoadOrCreate reads the private key stored in dir, generating it on first use.
 func LoadOrCreate(dir string) (*Identity, error) {
-	certPath, keyPath := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
-	if _, err := os.Stat(certPath); errors.Is(err, os.ErrNotExist) {
-		if err := generate(dir, certPath, keyPath); err != nil {
+	path := filepath.Join(dir, keyFile)
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		priv, _, gerr := crypto.GenerateEd25519Key(nil)
+		if gerr != nil {
+			return nil, gerr
+		}
+		if raw, err = crypto.MarshalPrivateKey(priv); err != nil {
 			return nil, err
 		}
+		if err = os.MkdirAll(dir, 0o700); err != nil {
+			return nil, err
+		}
+		if err = os.WriteFile(path, raw, 0o600); err != nil {
+			return nil, err
+		}
+	} else if err != nil {
+		return nil, err
 	}
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	priv, err := crypto.UnmarshalPrivateKey(raw)
 	if err != nil {
 		return nil, fmt.Errorf("load identity: %w", err)
 	}
-	return &Identity{Cert: cert, ID: IDFromCertDER(cert.Certificate[0])}, nil
-}
-
-func generate(dir, certPath, keyPath string) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	pid, err := peer.IDFromPrivateKey(priv)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	tpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(time.Now().UnixNano()),
-		Subject:               pkix.Name{CommonName: "p2psync"},
-		NotBefore:             time.Now().Add(-24 * time.Hour),
-		NotAfter:              time.Now().AddDate(30, 0, 0),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, pub, priv)
+	return &Identity{Key: priv, PeerID: pid, ID: pid.String()}, nil
+}
+
+// Normalize validates a device ID and returns its canonical form.
+func Normalize(id string) (string, error) {
+	pid, err := peer.Decode(strings.TrimSpace(id))
 	if err != nil {
-		return err
+		return "", fmt.Errorf("invalid device ID %q", id)
 	}
-	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	return pid.String(), nil
+}
+
+// Decode converts a canonical device ID to a peer ID.
+func Decode(id string) (peer.ID, error) { return peer.Decode(id) }
+
+// Format is the display form of an ID (identical to the canonical form).
+func Format(id string) string { return id }
+
+// Short is the compact, collision-resistant form used as a key in version vectors.
+func Short(id string) string {
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:6])
+}
+
+// ParseRef accepts what a user can paste to designate a device: a bare device
+// ID, or a full address such as /ip4/203.0.113.7/udp/22000/quic-v1/p2p/<ID>
+// (which also carries a way to reach it). addr is empty for a bare ID.
+func ParseRef(s string) (id string, addr string, err error) {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "/") {
+		id, err = Normalize(s)
+		return id, "", err
+	}
+	m, err := ma.NewMultiaddr(s)
 	if err != nil {
-		return err
+		return "", "", err
 	}
-	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
-		return err
+	info, err := peer.AddrInfoFromP2pAddr(m)
+	if err != nil {
+		return "", "", fmt.Errorf("address must end with /p2p/<device ID>: %w", err)
 	}
-	return os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644)
-}
-
-func (i *Identity) base() *tls.Config {
-	return &tls.Config{
-		Certificates: []tls.Certificate{i.Cert},
-		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{alpn},
-		// Trust is established by pinning the device ID after the handshake,
-		// not by a certificate chain.
-		InsecureSkipVerify: true,
+	if len(info.Addrs) > 0 {
+		addr = info.Addrs[0].String()
 	}
-}
-
-// ServerConfig is used for accepted connections; the client must present a certificate.
-func (i *Identity) ServerConfig() *tls.Config {
-	c := i.base()
-	c.ClientAuth = tls.RequireAnyClientCert
-	return c
-}
-
-// ClientConfig is used for outgoing connections.
-func (i *Identity) ClientConfig() *tls.Config { return i.base() }
-
-// PeerID returns the device ID of the remote end of an established TLS connection.
-func PeerID(c *tls.Conn) (string, error) {
-	certs := c.ConnectionState().PeerCertificates
-	if len(certs) == 0 {
-		return "", errors.New("peer presented no certificate")
-	}
-	return IDFromCertDER(certs[0].Raw), nil
+	return info.ID.String(), addr, nil
 }

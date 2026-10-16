@@ -8,11 +8,12 @@ import (
 
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/seal"
 )
 
 // Init creates the identity and a default configuration if they do not exist,
 // and returns the device ID.
-func Init(home, deviceName, listen, apiAddr string) (string, error) {
+func Init(home, deviceName string, port int, apiAddr string) (string, error) {
 	id, err := identity.LoadOrCreate(home)
 	if err != nil {
 		return "", err
@@ -23,8 +24,8 @@ func Init(home, deviceName, listen, apiAddr string) (string, error) {
 		if deviceName != "" {
 			cfg.DeviceName = deviceName
 		}
-		if listen != "" {
-			cfg.ListenAddr = listen
+		if port != 0 {
+			cfg.ListenPort = port
 		}
 		if apiAddr != "" {
 			cfg.APIAddr = apiAddr
@@ -48,10 +49,14 @@ func SaveConfig(home string, cfg *config.Config) error {
 }
 
 // AddDevice registers (or updates) a remote device.
-func AddDevice(cfg *config.Config, rawID, name string, addrs []string) error {
-	id, err := identity.Normalize(rawID)
+// ref is a bare device ID or a full address ending in /p2p/<ID>.
+func AddDevice(cfg *config.Config, ref, name string, addrs []string) error {
+	id, addr, err := identity.ParseRef(ref)
 	if err != nil {
 		return err
+	}
+	if addr != "" {
+		addrs = append(addrs, addr)
 	}
 	if d := cfg.Device(id); d != nil {
 		if name != "" {
@@ -89,22 +94,35 @@ func ShareFolder(cfg *config.Config, folderID, rawDevID string, relay bool) erro
 }
 
 // AddFolder declares a synchronised folder (role full) or a relay store (role relay).
-func AddFolder(cfg *config.Config, id, path, role string, quotaMB int64, retentionHours int) error {
+//
+// A full folder gets a secret (generated when none is supplied; pass the same
+// one on every full device of the folder). It is returned so it can be shown to
+// the user once. A relay never gets one.
+func AddFolder(cfg *config.Config, id, path, role string, quotaMB int64, retentionHours int, secret string) (string, error) {
 	if id == "" {
 		id = strings.ToLower(filepath.Base(path))
 	}
 	if cfg.Folder(id) != nil {
-		return fmt.Errorf("folder %q already exists", id)
+		return "", fmt.Errorf("folder %q already exists", id)
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
-		return err
+		return "", err
+	}
+	if role == config.RoleRelay {
+		secret = ""
+	} else if secret == "" {
+		if secret, err = seal.NewSecret(); err != nil {
+			return "", err
+		}
+	} else if _, err := seal.ParseSecret(secret); err != nil {
+		return "", err
 	}
 	cfg.Folders = append(cfg.Folders, config.Folder{
-		ID: id, Label: filepath.Base(abs), Path: abs, Role: role, QuotaMB: quotaMB, RetentionHours: retentionHours,
+		ID: id, Label: filepath.Base(abs), Path: abs, Role: role, QuotaMB: quotaMB, RetentionHours: retentionHours, Secret: secret,
 	})
-	return nil
+	return secret, nil
 }

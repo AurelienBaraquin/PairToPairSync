@@ -323,7 +323,7 @@ func (f *Folder) fetchBlock(ctx context.Context, e model.FileInfo, i, size int, 
 	}
 	rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	data, err := peer.Request(rctx, f.cfg.ID, e.Name, off, size, hash)
+	data, err := peer.Request(rctx, f.cfg.ID, e.Name, off, size, hash, false)
 	if err != nil {
 		return nil, fmt.Errorf("block %d of %s: %w", i, e.Name, err)
 	}

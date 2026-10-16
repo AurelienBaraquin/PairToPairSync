@@ -1,22 +1,51 @@
-// Package node owns the network side of a device: listening, dialling known
-// peers, authenticating them, and routing messages to the folder engines.
+// Package node owns the network side of a device. It is built on libp2p:
+//
+//   - transports: QUIC (TLS 1.3, survives IP changes) with TCP+Noise as fallback;
+//     every connection is mutually authenticated by the devices' Ed25519 keys;
+//   - a connection gater that refuses any device that is not in the configuration
+//     before a single byte of application data is exchanged;
+//   - reachability without any third-party server: mDNS on the LAN, UPnP/NAT-PMP,
+//     AutoNAT, hole punching, and circuit relaying through *your own* devices;
+//   - automatic reconnection with jittered back-off, and independent streams for
+//     control traffic and for each block transfer.
 package node
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
+	lprotocol "github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p/core/routing"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	ma "github.com/multiformats/go-multiaddr"
 
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/protocol"
+)
+
+type protocolID = lprotocol.ID
+
+const (
+	protoSession protocolID = "/p2psync/1.0/session"
+	protoBlock   protocolID = "/p2psync/1.0/block"
+	protoProbe   protocolID = "/p2psync/1.0/probe"
 )
 
 // FolderHandler is implemented by the folder engines (full copy and relay).
@@ -35,20 +64,16 @@ type FolderHandler interface {
 	Status() any
 }
 
-// AddressSource lets discovery contribute dial candidates.
-type AddressSource interface {
-	Addresses(deviceID string) []string
-}
-
 type Options struct {
 	Config   *config.Config
 	Identity *identity.Identity
 	Handlers []FolderHandler
 	Logger   *slog.Logger
-	// Addresses optionally supplies extra addresses (LAN discovery).
-	Addresses AddressSource
 	// RedialMax caps the reconnect back-off (default 60s).
 	RedialMax time.Duration
+	// Reachability forces "public" or "private" instead of auto-detecting
+	// (testing, or a server that knows better).
+	Reachability string
 }
 
 type Node struct {
@@ -56,16 +81,22 @@ type Node struct {
 	id       *identity.Identity
 	log      *slog.Logger
 	handlers map[string]FolderHandler
-	addrs    AddressSource
+	opts     Options
 	redial   time.Duration
+	known    map[peer.ID]config.Device
 
-	ln     net.Listener
+	host   host.Host
+	dht    *dht.IpfsDHT
+	mdns   mdns.Service
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu    sync.Mutex
-	peers map[string]*Peer
+	mu      sync.Mutex
+	peers   map[string]*Peer
+	opening map[peer.ID]bool
+	kick    map[peer.ID]chan struct{}
+	disco   map[peer.ID][]ma.Multiaddr // addresses learnt from configuration / mDNS (relay candidates)
 }
 
 func New(o Options) *Node {
@@ -75,40 +106,156 @@ func New(o Options) *Node {
 	if o.RedialMax == 0 {
 		o.RedialMax = time.Minute
 	}
-	n := &Node{cfg: o.Config, id: o.Identity, log: o.Logger, addrs: o.Addresses, redial: o.RedialMax,
-		handlers: map[string]FolderHandler{}, peers: map[string]*Peer{}}
+	n := &Node{cfg: o.Config, id: o.Identity, log: o.Logger, opts: o, redial: o.RedialMax,
+		handlers: map[string]FolderHandler{}, known: map[peer.ID]config.Device{},
+		peers: map[string]*Peer{}, opening: map[peer.ID]bool{}, kick: map[peer.ID]chan struct{}{},
+		disco: map[peer.ID][]ma.Multiaddr{}}
 	for _, h := range o.Handlers {
 		n.handlers[h.ID()] = h
+	}
+	for _, d := range o.Config.Devices {
+		if pid, err := identity.Decode(d.ID); err == nil && d.ID != o.Identity.ID && n.sharesAny(d.ID) {
+			n.known[pid] = d
+		}
 	}
 	return n
 }
 
-// Start begins listening and dialling. It returns once the listener is up.
+func (n *Node) sharesAny(id string) bool {
+	for i := range n.cfg.Folders {
+		if n.cfg.Folders[i].SharesWith(id) {
+			return true
+		}
+	}
+	return false
+}
+
+// Start brings the node online. It returns once the host is listening.
 func (n *Node) Start(parent context.Context) error {
 	n.ctx, n.cancel = context.WithCancel(parent)
-	ln, err := net.Listen("tcp", n.cfg.ListenAddr)
+	opts := n.libp2pOptions()
+	h, err := libp2p.New(opts...)
 	if err != nil {
 		n.cancel()
-		return fmt.Errorf("listen %s: %w", n.cfg.ListenAddr, err)
+		return fmt.Errorf("start network: %w", err)
 	}
-	n.ln = ln
-	for _, h := range n.handlers {
-		if err := h.Start(n.ctx); err != nil {
-			n.cancel()
-			ln.Close()
-			return fmt.Errorf("folder %s: %w", h.ID(), err)
+	n.host = h
+	h.SetStreamHandler(protoSession, func(s network.Stream) { n.wg.Add(1); defer n.wg.Done(); n.runSession(s, false) })
+	h.SetStreamHandler(protoBlock, n.serveBlock)
+	h.SetStreamHandler(protoProbe, n.serveProbe)
+	h.Network().Notify(&notifee{n})
+
+	// Static addresses from the configuration.
+	for pid, d := range n.known {
+		n.addDeviceAddrs(pid, d)
+	}
+	if n.dht != nil {
+		_ = n.dht.Bootstrap(n.ctx)
+	}
+	if n.cfg.LANDiscover {
+		n.mdns = mdns.NewMdnsService(h, "_p2psync._udp", &mdnsNotifee{n})
+		if err := n.mdns.Start(); err != nil {
+			n.log.Warn("LAN discovery unavailable", "err", err)
+			n.mdns = nil
 		}
 	}
-	n.wg.Add(1)
-	go n.acceptLoop()
-	for _, d := range n.cfg.Devices {
-		if d.ID == n.id.ID || !n.sharesAny(d.ID) {
-			continue
+	for _, hd := range n.handlers {
+		if err := hd.Start(n.ctx); err != nil {
+			n.Stop()
+			return fmt.Errorf("folder %s: %w", hd.ID(), err)
 		}
+	}
+	for pid := range n.known {
 		n.wg.Add(1)
-		go n.dialLoop(d)
+		go n.dialLoop(pid)
 	}
 	return nil
+}
+
+func (n *Node) listenAddrs() []string {
+	if len(n.cfg.ListenAddresses) > 0 {
+		return n.cfg.ListenAddresses
+	}
+	p := strconv.Itoa(n.cfg.ListenPort)
+	return []string{
+		"/ip4/0.0.0.0/udp/" + p + "/quic-v1", "/ip4/0.0.0.0/tcp/" + p,
+		"/ip6/::/udp/" + p + "/quic-v1", "/ip6/::/tcp/" + p,
+	}
+}
+
+func (n *Node) libp2pOptions() []libp2p.Option {
+	opts := []libp2p.Option{
+		libp2p.Identity(n.id.Key),
+		libp2p.ListenAddrStrings(n.listenAddrs()...),
+		libp2p.ConnectionGater(&gater{allowed: n.isKnown}),
+		libp2p.UserAgent("p2psync/0.2"),
+		libp2p.EnableRelay(),
+		libp2p.WithDialTimeout(12 * time.Second),
+	}
+	switch n.opts.Reachability {
+	case "public":
+		opts = append(opts, libp2p.ForceReachabilityPublic())
+	case "private":
+		opts = append(opts, libp2p.ForceReachabilityPrivate())
+	}
+	if n.cfg.NATTraversal {
+		opts = append(opts,
+			libp2p.NATPortMap(),         // UPnP / NAT-PMP / PCP on the user's own router
+			libp2p.EnableAutoNATv2(),    // learn from our own devices whether we are reachable
+			libp2p.EnableHolePunching(), // direct connection through NATs (DCUtR)
+			libp2p.EnableAutoRelayWithPeerSource(n.relayCandidates),
+		)
+	}
+	if n.cfg.RelayService {
+		// Our devices may relay each other without data caps; the ACL and the
+		// connection gater restrict this to the configured devices only.
+		opts = append(opts, libp2p.EnableRelayService(relayv2.WithInfiniteLimits(), relayv2.WithACL(&relayACL{n})))
+	}
+	if n.cfg.DHT {
+		opts = append(opts, libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
+			d, err := dht.New(h,
+				dht.ProtocolPrefix("/p2psync"), // a private DHT: only our devices can join it
+				dht.Mode(dht.ModeAutoServer), dht.DisableProviders(), dht.DisableValues())
+			n.dht = d
+			return d, err
+		}))
+	}
+	return opts
+}
+
+func (n *Node) isKnown(p peer.ID) bool { _, ok := n.known[p]; return ok }
+
+// relayACL lets only configured devices use this device as a circuit relay.
+type relayACL struct{ n *Node }
+
+func (a *relayACL) AllowReserve(p peer.ID, _ ma.Multiaddr) bool { return a.n.isKnown(p) }
+func (a *relayACL) AllowConnect(src peer.ID, _ ma.Multiaddr, dst peer.ID) bool {
+	return a.n.isKnown(src) && a.n.isKnown(dst)
+}
+
+// relayCandidates feeds AutoRelay with our own devices: those that are publicly
+// reachable will accept a reservation, the others simply refuse.
+func (n *Node) relayCandidates(ctx context.Context, num int) <-chan peer.AddrInfo {
+	ch := make(chan peer.AddrInfo, max(num, 1))
+	go func() {
+		defer close(ch)
+		n.mu.Lock()
+		var infos []peer.AddrInfo
+		for pid, addrs := range n.disco {
+			if len(addrs) > 0 {
+				infos = append(infos, peer.AddrInfo{ID: pid, Addrs: addrs})
+			}
+		}
+		n.mu.Unlock()
+		for _, ai := range infos {
+			select {
+			case ch <- ai:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
 }
 
 func (n *Node) Stop() {
@@ -116,25 +263,40 @@ func (n *Node) Stop() {
 		return
 	}
 	n.cancel()
-	n.ln.Close()
 	n.mu.Lock()
 	for _, p := range n.peers {
 		p.close()
 	}
 	n.mu.Unlock()
+	if n.mdns != nil {
+		_ = n.mdns.Close()
+	}
+	if n.host != nil {
+		_ = n.host.Close()
+	}
 	n.wg.Wait()
 	for _, h := range n.handlers {
 		h.Stop()
 	}
 }
 
-func (n *Node) ListenAddr() net.Addr { return n.ln.Addr() }
+// Addrs lists the multiaddrs (ending in /p2p/<ID>) at which this device can be
+// reached; one of them is what you give to another device to pair with it.
+func (n *Node) Addrs() []string {
+	var out []string
+	for _, a := range n.host.Addrs() {
+		out = append(out, a.String()+"/p2p/"+n.id.ID)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // PeerInfo describes a connected peer for the status API.
 type PeerInfo struct {
 	ID        string   `json:"id"`
 	Name      string   `json:"name"`
 	Outbound  bool     `json:"outbound"`
+	Relayed   bool     `json:"relayed"`
 	Folders   []string `json:"folders"`
 	Connected string   `json:"connected_since"`
 }
@@ -144,7 +306,7 @@ func (n *Node) Peers() []PeerInfo {
 	defer n.mu.Unlock()
 	var out []PeerInfo
 	for _, p := range n.peers {
-		pi := PeerInfo{ID: p.id, Name: p.name, Outbound: p.outbound, Connected: p.since.Format(time.RFC3339)}
+		pi := PeerInfo{ID: p.id, Name: p.name, Outbound: p.outbound, Relayed: p.viaRelay, Connected: p.since.Format(time.RFC3339)}
 		for f := range p.shared {
 			pi.Folders = append(pi.Folders, f)
 		}
@@ -162,111 +324,196 @@ func (n *Node) Connected(id string) bool {
 	return ok
 }
 
-func (n *Node) sharesAny(id string) bool {
-	for i := range n.cfg.Folders {
-		if n.cfg.Folders[i].SharesWith(id) {
-			return true
+// ---- addresses ---------------------------------------------------------------
+
+// ParseAddr turns "host:port" into the multiaddrs to try (QUIC first, then TCP),
+// or accepts a full multiaddr.
+func ParseAddr(s string) []ma.Multiaddr {
+	if len(s) > 0 && s[0] == '/' {
+		if m, err := ma.NewMultiaddr(s); err == nil {
+			return []ma.Multiaddr{m}
+		}
+		return nil
+	}
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return nil
+	}
+	proto := "dns"
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil {
+			proto = "ip4"
+		} else {
+			proto = "ip6"
 		}
 	}
-	return false
+	var out []ma.Multiaddr
+	for _, f := range []string{"/%s/%s/udp/%s/quic-v1", "/%s/%s/tcp/%s"} {
+		if m, err := ma.NewMultiaddr(fmt.Sprintf(f, proto, host, port)); err == nil {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
-func (n *Node) acceptLoop() {
-	defer n.wg.Done()
-	tlsCfg := n.id.ServerConfig()
-	for {
-		c, err := n.ln.Accept()
-		if err != nil {
-			if n.ctx.Err() != nil {
-				return
-			}
-			n.log.Warn("accept failed", "err", err)
-			time.Sleep(time.Second)
-			continue
+func (n *Node) addDeviceAddrs(pid peer.ID, d config.Device) {
+	var all []ma.Multiaddr
+	for _, a := range d.Addresses {
+		all = append(all, ParseAddr(a)...)
+	}
+	if len(all) == 0 {
+		return
+	}
+	n.host.Peerstore().AddAddrs(pid, all, peerstore.PermanentAddrTTL)
+	n.mu.Lock()
+	n.disco[pid] = append(n.disco[pid], all...)
+	n.mu.Unlock()
+}
+
+type mdnsNotifee struct{ n *Node }
+
+func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	if !m.n.isKnown(pi.ID) {
+		return
+	}
+	m.n.host.Peerstore().AddAddrs(pi.ID, pi.Addrs, peerstore.TempAddrTTL)
+	m.n.mu.Lock()
+	m.n.disco[pi.ID] = append(m.n.disco[pi.ID], pi.Addrs...)
+	m.n.mu.Unlock()
+	m.n.wake(pi.ID)
+}
+
+func (n *Node) wake(pid peer.ID) {
+	n.mu.Lock()
+	ch := n.kick[pid]
+	n.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
 		}
-		n.wg.Add(1)
-		go func() {
-			defer n.wg.Done()
-			n.session(tls.Server(c, tlsCfg), false, "")
-		}()
 	}
 }
 
-func (n *Node) dialLoop(d config.Device) {
+// ---- connection supervision ---------------------------------------------------
+
+// dialLoop keeps trying to reach one device, forever, with jittered exponential
+// back-off. It resets quickly when the network comes back (mDNS discovery, an
+// inbound connection or a network change wake it up).
+func (n *Node) dialLoop(pid peer.ID) {
 	defer n.wg.Done()
+	wake := make(chan struct{}, 1)
+	n.mu.Lock()
+	n.kick[pid] = wake
+	n.mu.Unlock()
+
 	backoff := time.Second
 	for n.ctx.Err() == nil {
-		if n.Connected(d.ID) {
-			if !n.sleep(3 * time.Second) {
+		if n.Connected(pid.String()) {
+			if !n.wait(2*time.Second, wake) {
 				return
 			}
+			backoff = time.Second
 			continue
 		}
-		cands := append([]string{}, d.Addresses...)
-		if n.addrs != nil {
-			cands = append(cands, n.addrs.Addresses(d.ID)...)
-		}
-		connected := false
-		for _, a := range cands {
-			dctx, cancel := context.WithTimeout(n.ctx, 8*time.Second)
-			c, err := (&net.Dialer{KeepAlive: 20 * time.Second}).DialContext(dctx, "tcp", a)
-			cancel()
-			if err != nil {
-				continue
+		cctx, cancel := context.WithTimeout(n.ctx, 20*time.Second)
+		err := n.host.Connect(cctx, peer.AddrInfo{ID: pid})
+		cancel()
+		if err == nil {
+			started := time.Now()
+			n.ensureSession(pid, 0)
+			if time.Since(started) > 10*time.Second {
+				backoff = time.Second
 			}
-			start := time.Now()
-			n.session(tls.Client(c, n.id.ClientConfig()), true, d.ID)
-			connected = time.Since(start) > 5*time.Second
-			break
+		} else {
+			n.log.Debug("cannot reach device yet", "device", pid.ShortString(), "err", err)
 		}
-		if connected {
-			backoff = time.Second
-		} else if backoff *= 2; backoff > n.redial {
-			backoff = n.redial
-		}
-		if !n.sleep(backoff) {
+		d := backoff + time.Duration(rand.Int63n(int64(backoff)/2+1)) // jitter
+		if !n.wait(d, wake) {
 			return
+		}
+		if backoff *= 2; backoff > n.redial {
+			backoff = n.redial
 		}
 	}
 }
 
-func (n *Node) sleep(d time.Duration) bool {
+func (n *Node) wait(d time.Duration, wake <-chan struct{}) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
 	select {
-	case <-time.After(d):
+	case <-t.C:
+		return true
+	case <-wake:
 		return true
 	case <-n.ctx.Done():
 		return false
 	}
 }
 
-// session runs one connection from handshake to close.
-func (n *Node) session(tc *tls.Conn, outbound bool, expect string) {
-	defer tc.Close()
-	hctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
-	err := tc.HandshakeContext(hctx)
+// ensureSession opens the session stream to pid if none is running. It blocks
+// for the lifetime of the session it creates.
+func (n *Node) ensureSession(pid peer.ID, delay time.Duration) {
+	if delay > 0 && !n.wait(delay, nil) {
+		return
+	}
+	n.mu.Lock()
+	if _, ok := n.peers[pid.String()]; ok || n.opening[pid] {
+		n.mu.Unlock()
+		return
+	}
+	n.opening[pid] = true
+	n.mu.Unlock()
+	defer func() {
+		n.mu.Lock()
+		delete(n.opening, pid)
+		n.mu.Unlock()
+	}()
+
+	ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+	s, err := n.openStream(ctx, pid, protoSession, true)
 	cancel()
 	if err != nil {
-		n.log.Debug("tls handshake failed", "err", err)
+		n.log.Debug("cannot open session", "device", pid.ShortString(), "err", err)
 		return
 	}
-	pid, err := identity.PeerID(tc)
-	if err != nil {
-		return
-	}
-	if outbound && pid != expect {
-		n.log.Warn("remote device has an unexpected identity; refusing", "expected", identity.Format(expect), "got", identity.Format(pid))
-		return
-	}
-	dev := n.cfg.Device(pid)
-	if dev == nil || pid == n.id.ID || !n.sharesAny(pid) {
-		n.log.Warn("connection from unknown device refused; add it to the configuration to accept it", "device", identity.Format(pid))
-		return
-	}
+	n.runSession(s, true)
+}
 
-	conn := protocol.NewConn(tc)
+// openStream opens a stream to pid. A direct connection is always preferred;
+// when only a relayed, limited connection exists and patient is set, it first
+// gives hole punching a few seconds to produce a direct one.
+func (n *Node) openStream(ctx context.Context, pid peer.ID, proto protocolID, patient bool) (network.Stream, error) {
+	s, err := n.host.NewStream(ctx, pid, proto)
+	if err == nil {
+		return s, nil
+	}
+	if patient {
+		for i := 0; i < 5 && ctx.Err() == nil; i++ {
+			if !n.wait(time.Second, nil) {
+				break
+			}
+			if s, err = n.host.NewStream(ctx, pid, proto); err == nil {
+				return s, nil
+			}
+		}
+	}
+	return n.host.NewStream(network.WithAllowLimitedConn(ctx, "p2psync"), pid, proto)
+}
+
+// ---- sessions ------------------------------------------------------------------
+
+func (n *Node) runSession(s network.Stream, outbound bool) {
+	defer s.Reset()
+	pid := s.Conn().RemotePeer()
+	dev, ok := n.known[pid]
+	if !ok {
+		return
+	}
+	conn := protocol.NewConn(s)
 	var mine []string
 	for i := range n.cfg.Folders {
-		if n.cfg.Folders[i].SharesWith(pid) {
+		if n.cfg.Folders[i].SharesWith(pid.String()) {
 			mine = append(mine, n.cfg.Folders[i].ID)
 		}
 	}
@@ -287,7 +534,7 @@ func (n *Node) session(tc *tls.Conn, outbound bool, expect string) {
 	if dev.Name != "" {
 		name = dev.Name
 	}
-	p := newPeer(pid, name, conn, outbound)
+	p := newPeer(n, pid, name, conn, outbound, isRelayedConn(s.Conn()))
 	theirs := map[string]bool{}
 	for _, f := range hello.Folders {
 		theirs[f] = true
@@ -304,13 +551,14 @@ func (n *Node) session(tc *tls.Conn, outbound bool, expect string) {
 	if !n.register(p) {
 		return
 	}
-	n.log.Info("connected", "peer", name, "device", identity.Format(pid)[:7], "outbound", outbound)
+	n.log.Info("connected", "peer", name, "device", pid.ShortString(), "outbound", outbound, "relayed", p.viaRelay)
 	defer func() {
 		n.unregister(p)
 		for f := range p.shared {
 			n.handlers[f].PeerDown(p)
 		}
 		n.log.Info("disconnected", "peer", name)
+		n.wake(pid)
 	}()
 
 	go func() {
@@ -322,14 +570,13 @@ func (n *Node) session(tc *tls.Conn, outbound bool, expect string) {
 	n.readLoop(p)
 }
 
-// register adds p to the peer table, resolving simultaneous dials: the
-// connection initiated by the device with the lower ID survives on both sides.
+// register adds p to the peer table, resolving simultaneous sessions: the one
+// opened by the device with the lower ID survives on both sides.
 func (n *Node) register(p *Peer) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if old, ok := n.peers[p.id]; ok {
-		oldWins := dialerID(old, n.id.ID) < dialerID(p, n.id.ID)
-		if oldWins {
+		if dialerID(old, n.id.ID) < dialerID(p, n.id.ID) {
 			return false
 		}
 		old.close()
@@ -354,8 +601,9 @@ func (n *Node) unregister(p *Peer) {
 	n.mu.Unlock()
 }
 
+// pinger detects dead links quickly (a vanished Wi-Fi does not close sockets).
 func (n *Node) pinger(p *Peer) {
-	t := time.NewTicker(15 * time.Second)
+	t := time.NewTicker(8 * time.Second)
 	defer t.Stop()
 	for {
 		select {
@@ -371,13 +619,12 @@ func (n *Node) pinger(p *Peer) {
 }
 
 func (n *Node) readLoop(p *Peer) {
-	sem := make(chan struct{}, 16)
 	for {
-		_ = p.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		t, hb, body, err := p.conn.Recv()
+		_ = p.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		t, hb, _, err := p.conn.Recv()
 		if err != nil {
 			if n.ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
-				n.log.Debug("read failed", "peer", p.name, "err", err)
+				n.log.Debug("session ended", "peer", p.name, "err", err)
 			}
 			return
 		}
@@ -400,53 +647,8 @@ func (n *Node) readLoop(p *Peer) {
 			if h := n.handler(p, ack.Folder); h != nil {
 				h.HandleIndexAck(p, ack)
 			}
-		case protocol.TypeResponse:
-			var r protocol.Response
-			if json.Unmarshal(hb, &r) != nil {
-				return
-			}
-			p.deliver(r.ID, reply{hdr: hb, body: body})
-		case protocol.TypeProbeReply:
-			var r protocol.ProbeReply
-			if json.Unmarshal(hb, &r) != nil {
-				return
-			}
-			p.deliver(r.ID, reply{hdr: hb})
-		case protocol.TypeRequest:
-			var r protocol.Request
-			if json.Unmarshal(hb, &r) != nil {
-				return
-			}
-			h := n.handler(p, r.Folder)
-			sem <- struct{}{}
-			go func() {
-				defer func() { <-sem }()
-				var data []byte
-				code := protocol.ErrNotFound
-				if h != nil {
-					data, code = h.HandleRequest(p, r)
-				}
-				if p.conn.Send(protocol.TypeResponse, protocol.Response{ID: r.ID, Err: code}, data) != nil {
-					p.close()
-				}
-			}()
-		case protocol.TypeProbe:
-			var pr protocol.Probe
-			if json.Unmarshal(hb, &pr) != nil {
-				return
-			}
-			h := n.handler(p, pr.Folder)
-			go func() {
-				have := make([]bool, len(pr.Items))
-				if h != nil {
-					have = h.HandleProbe(p, pr.Items)
-				}
-				if p.conn.Send(protocol.TypeProbeReply, protocol.ProbeReply{ID: pr.ID, Have: have}, nil) != nil {
-					p.close()
-				}
-			}()
 		default:
-			n.log.Debug("unknown message type", "type", t)
+			n.log.Debug("unexpected message on session stream", "type", t)
 		}
 	}
 }
@@ -457,3 +659,95 @@ func (n *Node) handler(p *Peer, folder string) FolderHandler {
 	}
 	return n.handlers[folder]
 }
+
+func (n *Node) sessionPeer(s network.Stream) *Peer {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.peers[s.Conn().RemotePeer().String()]
+}
+
+// serveBlock answers one block request on its own stream.
+func (n *Node) serveBlock(s network.Stream) {
+	defer s.Close()
+	p := n.sessionPeer(s)
+	if p == nil {
+		_ = s.Reset()
+		return
+	}
+	n.wg.Add(1)
+	defer n.wg.Done()
+	_ = s.SetDeadline(time.Now().Add(3 * time.Minute))
+	c := protocol.NewConn(s)
+	t, hb, _, err := c.Recv()
+	var r protocol.Request
+	if err != nil || t != protocol.TypeRequest || json.Unmarshal(hb, &r) != nil {
+		_ = s.Reset()
+		return
+	}
+	var data []byte
+	code := protocol.ErrNotFound
+	if h := n.handler(p, r.Folder); h != nil {
+		data, code = h.HandleRequest(p, r)
+	}
+	_ = c.Send(protocol.TypeResponse, protocol.Response{Err: code}, data)
+}
+
+func (n *Node) serveProbe(s network.Stream) {
+	defer s.Close()
+	p := n.sessionPeer(s)
+	if p == nil {
+		_ = s.Reset()
+		return
+	}
+	n.wg.Add(1)
+	defer n.wg.Done()
+	_ = s.SetDeadline(time.Now().Add(time.Minute))
+	c := protocol.NewConn(s)
+	t, hb, _, err := c.Recv()
+	var pr protocol.Probe
+	if err != nil || t != protocol.TypeProbe || json.Unmarshal(hb, &pr) != nil {
+		_ = s.Reset()
+		return
+	}
+	have := make([]bool, len(pr.Items))
+	if h := n.handler(p, pr.Folder); h != nil {
+		have = h.HandleProbe(p, pr.Items)
+	}
+	_ = c.Send(protocol.TypeProbeReply, protocol.ProbeReply{Have: have}, nil)
+}
+
+// notifee reacts to connections appearing and disappearing.
+type notifee struct{ n *Node }
+
+func (nf *notifee) Connected(_ network.Network, c network.Conn) {
+	n := nf.n
+	pid := c.RemotePeer()
+	if !n.isKnown(pid) || n.ctx.Err() != nil {
+		return
+	}
+	// A direct connection appeared while the session runs through a relay (hole
+	// punching succeeded): move the session to the better path.
+	if !isRelayedConn(c) {
+		n.mu.Lock()
+		p := n.peers[pid.String()]
+		n.mu.Unlock()
+		if p != nil && p.viaRelay {
+			n.log.Info("direct connection established, leaving the relay", "peer", p.name)
+			p.close()
+		}
+	}
+	// The device with the lower ID opens the session right away; the other one
+	// only does so if nothing happens, which avoids needless duplicate sessions.
+	delay := 3 * time.Second
+	if n.id.ID < pid.String() {
+		delay = 0
+	}
+	n.wg.Add(1)
+	go func() { defer n.wg.Done(); n.ensureSession(pid, delay) }()
+}
+
+func (nf *notifee) Disconnected(_ network.Network, c network.Conn) {
+	nf.n.wake(c.RemotePeer())
+}
+func (nf *notifee) Listen(network.Network, ma.Multiaddr)      {}
+func (nf *notifee) ListenClose(network.Network, ma.Multiaddr) {}

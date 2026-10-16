@@ -6,14 +6,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/aurelienbaraquin/pairtopairsync/internal/api"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
-	"github.com/aurelienbaraquin/pairtopairsync/internal/discovery"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/folder"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/node"
@@ -24,6 +22,9 @@ const ConfigFile = "config.json"
 
 // RedialMax caps the reconnection back-off (tests shorten it).
 var RedialMax time.Duration
+
+// NodeHook lets tests adjust the network options (e.g. force reachability).
+var NodeHook func(*node.Options)
 
 // DefaultHome returns the per-user directory holding config, identity and indexes.
 func DefaultHome() (string, error) {
@@ -44,7 +45,6 @@ type App struct {
 	Node     *node.Node
 
 	handlers []node.FolderHandler
-	disc     *discovery.Discovery
 	api      *api.Server
 	log      *slog.Logger
 }
@@ -73,17 +73,8 @@ func Start(ctx context.Context, home string, cfg *config.Config, id *identity.Id
 	}
 
 	opts := node.Options{Config: cfg, Identity: id, Handlers: a.handlers, Logger: log, RedialMax: RedialMax}
-	if cfg.LANDiscover {
-		if _, port, err := net.SplitHostPort(cfg.ListenAddr); err == nil {
-			var p int
-			fmt.Sscanf(port, "%d", &p)
-			if d, err := discovery.Start(id.ID, p, log); err == nil {
-				a.disc = d
-				opts.Addresses = d
-			} else {
-				log.Warn("LAN discovery unavailable", "err", err)
-			}
-		}
+	if NodeHook != nil {
+		NodeHook(&opts)
 	}
 	a.Node = node.New(opts)
 	if err := a.Node.Start(ctx); err != nil {
@@ -108,21 +99,19 @@ func (a *App) Stop() {
 	if a.Node != nil {
 		a.Node.Stop()
 	}
-	if a.disc != nil {
-		a.disc.Stop()
-	}
 }
 
 // Status is the document served by the local API.
 type Status struct {
 	DeviceID   string          `json:"device_id"`
 	DeviceName string          `json:"device_name"`
+	Addresses  []string        `json:"addresses"`
 	Folders    []any           `json:"folders"`
 	Peers      []node.PeerInfo `json:"peers"`
 }
 
 func (a *App) Status() any {
-	st := Status{DeviceID: identity.Format(a.Identity.ID), DeviceName: a.Cfg.DeviceName, Peers: a.Node.Peers()}
+	st := Status{DeviceID: identity.Format(a.Identity.ID), DeviceName: a.Cfg.DeviceName, Addresses: a.Node.Addrs(), Peers: a.Node.Peers()}
 	for _, h := range a.handlers {
 		st.Folders = append(st.Folders, h.Status())
 	}

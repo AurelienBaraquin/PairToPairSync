@@ -25,7 +25,7 @@ var (
 
 // Init creates the identity if needed and returns the (formatted) device ID.
 func Init(home, deviceName string) (string, error) {
-	id, err := app.Init(home, deviceName, "", "-")
+	id, err := app.Init(home, deviceName, 0, "-")
 	if err != nil {
 		return "", err
 	}
@@ -47,7 +47,8 @@ func AddDevice(home, deviceID, name, addr string) error {
 // undelivered changes in storagePath (use the app's private directory).
 func AddRelayFolder(home, folderID, storagePath string, quotaMB int64) error {
 	return edit(home, func(c *config.Config) error {
-		return app.AddFolder(c, folderID, storagePath, config.RoleRelay, quotaMB, 0)
+		_, err := app.AddFolder(c, folderID, storagePath, config.RoleRelay, quotaMB, 0, "")
+		return err
 	})
 }
 

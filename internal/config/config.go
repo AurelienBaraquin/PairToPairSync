@@ -38,6 +38,11 @@ type Folder struct {
 	Role    string         `json:"role,omitempty"`
 	Devices []FolderDevice `json:"devices"`
 
+	// Secret (base64, 32 bytes) is shared by the full devices of the folder only.
+	// It encrypts everything that is handed to a relay, so a relay never sees file
+	// names or content. It must never be configured on a relay.
+	Secret string `json:"secret,omitempty"`
+
 	// Full devices.
 	ScanIntervalSec int `json:"scan_interval_sec,omitempty"` // safety full rescan, default 60
 
@@ -47,17 +52,27 @@ type Folder struct {
 }
 
 type Config struct {
-	DeviceName  string   `json:"device_name"`
-	ListenAddr  string   `json:"listen_addr"`        // default ":22000"
-	APIAddr     string   `json:"api_addr,omitempty"` // local status endpoint, default "127.0.0.1:8384", "-" disables
-	LANDiscover bool     `json:"lan_discovery"`      // announce / find devices on the local network
-	Devices     []Device `json:"devices"`
-	Folders     []Folder `json:"folders"`
+	DeviceName string `json:"device_name"`
+	ListenPort int    `json:"listen_port"`        // UDP (QUIC) and TCP port, default 22000
+	APIAddr    string `json:"api_addr,omitempty"` // local status page, default "127.0.0.1:8384", "-" disables
+	// ListenAddresses overrides ListenPort with explicit multiaddrs (advanced).
+	ListenAddresses []string `json:"listen_addresses,omitempty"`
+
+	// Connectivity. Everything is peer to peer: no third-party server is ever
+	// contacted. Only your own devices help each other to connect.
+	LANDiscover  bool `json:"lan_discovery"` // find devices on the local network (mDNS)
+	NATTraversal bool `json:"nat_traversal"` // UPnP/NAT-PMP port mapping, NAT detection and hole punching
+	DHT          bool `json:"dht"`           // private address book shared by your own devices
+	RelayService bool `json:"relay_service"` // let your other devices connect *through* this one when they cannot reach each other
+
+	Devices []Device `json:"devices"`
+	Folders []Folder `json:"folders"`
 }
 
 func Default() *Config {
 	host, _ := os.Hostname()
-	return &Config{DeviceName: host, ListenAddr: ":22000", APIAddr: "127.0.0.1:8384", LANDiscover: true}
+	return &Config{DeviceName: host, ListenPort: 22000, APIAddr: "127.0.0.1:8384",
+		LANDiscover: true, NATTraversal: true, DHT: true, RelayService: true}
 }
 
 // Load reads the configuration; a missing file yields the defaults.
@@ -119,6 +134,9 @@ func (c *Config) Validate() error {
 		if f.Role != RoleFull && f.Role != RoleRelay {
 			return fmt.Errorf("folder %q: unknown role %q", f.ID, f.Role)
 		}
+		if err := f.checkSecret(); err != nil {
+			return err
+		}
 		for j := range f.Devices {
 			id, err := identity.Normalize(f.Devices[j].ID)
 			if err != nil {
@@ -129,6 +147,26 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("folder %q references unknown device %s", f.ID, id)
 			}
 		}
+	}
+	return nil
+}
+
+func (f *Folder) hasRelayPeer() bool {
+	for _, d := range f.Devices {
+		if d.Relay {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *Folder) checkSecret() error {
+	switch {
+	case f.Role == RoleRelay && f.Secret != "":
+		return fmt.Errorf("folder %q: a relay must not hold the folder secret (it would defeat end-to-end encryption)", f.ID)
+	case f.Role == RoleFull && f.hasRelayPeer() && f.Secret == "":
+		return fmt.Errorf("folder %q uses a relay but has no secret; run `p2psync folder add ... ` to generate one, "+
+			"or copy the `secret` of the same folder from another full device", f.ID)
 	}
 	return nil
 }

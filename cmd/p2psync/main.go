@@ -29,10 +29,10 @@ Usage:
   p2psync [--home DIR] <command>
 
 Setup:
-  init [--name NAME] [--listen ADDR] [--api ADDR]
+  init [--name NAME] [--port N] [--api ADDR]
                                         create this device's identity and config
   id                                    print this device's ID (give it to your other devices)
-  device add <ID> [--name N] [--addr HOST:PORT]...
+  device add <ID> [--name N] [--addr HOST:PORT]...   (ID may also be a full /ip4/…/p2p/ID address)
   device list | device remove <ID>
   folder add <PATH> [--id ID] [--device ID[:relay]]...
                                         synchronise PATH (a normal directory) with those devices
@@ -62,12 +62,13 @@ func main() {
 	switch cmd {
 	case "init":
 		fs := flag.NewFlagSet("init", flag.ExitOnError)
-		var name, listen, apiAddr string
+		var name, apiAddr string
+		var port int
 		fs.StringVar(&name, "name", "", "device name")
-		fs.StringVar(&listen, "listen", "", "address to listen on (default :22000)")
+		fs.IntVar(&port, "port", 0, "UDP+TCP port to listen on (default 22000)")
 		fs.StringVar(&apiAddr, "api", "", "local status page address (default 127.0.0.1:8384, - to disable)")
 		parse(fs, args)
-		id, err := app.Init(home, name, listen, apiAddr)
+		id, err := app.Init(home, name, port, apiAddr)
 		check(err)
 		fmt.Printf("Device ID: %s\nConfig:    %s\n", identity.Format(id), filepath.Join(home, app.ConfigFile))
 	case "id":
@@ -211,12 +212,13 @@ func cmdFolder(home string, args []string) {
 	case "add", "add-relay":
 		isRelay := args[0] == "add-relay"
 		fs := flag.NewFlagSet(args[0], flag.ExitOnError)
-		var id string
+		var id, secret string
 		var devs list
 		var quota int64
 		var retention int
 		fs.StringVar(&id, "id", "", "folder ID shared by all devices (default: directory name)")
 		fs.Var(&devs, "device", "device ID to share with; suffix :relay if that device is a temporary relay (repeatable)")
+		fs.StringVar(&secret, "secret", "", "full folder: secret shared by all your full devices (generated if omitted)")
 		fs.Int64Var(&quota, "quota-mb", 0, "relay: maximum temporary storage in MB (default 2048)")
 		fs.IntVar(&retention, "retention-hours", 0, "relay: drop undelivered changes after this many hours (default 720)")
 		pos := parse(fs, args[1:])
@@ -231,7 +233,8 @@ func cmdFolder(home string, args []string) {
 			}
 		}
 		cfg := loadForEdit(home)
-		check(app.AddFolder(cfg, id, pos[0], role, quota, retention))
+		sec, err := app.AddFolder(cfg, id, pos[0], role, quota, retention, secret)
+		check(err)
 		fid := id
 		if fid == "" {
 			fid = strings.ToLower(filepath.Base(pos[0]))
@@ -242,6 +245,9 @@ func cmdFolder(home string, args []string) {
 		}
 		check(app.SaveConfig(home, cfg))
 		fmt.Printf("folder %q added (%s)\n", fid, role)
+		if sec != "" && secret == "" {
+			fmt.Printf("\nFolder secret (give it ONLY to your other full devices, with --secret; never to a relay):\n  %s\n", sec)
+		}
 	case "share":
 		fs := flag.NewFlagSet("folder share", flag.ExitOnError)
 		rel := fs.Bool("relay", false, "the device is a temporary relay")
@@ -298,7 +304,7 @@ func run(home string) error {
 		if err != nil {
 			return err
 		}
-		logger.Info("running", "device", identity.Format(id.ID), "listen", cfg.ListenAddr)
+		logger.Info("running", "device", identity.Format(id.ID), "port", cfg.ListenPort)
 
 		poll := time.NewTicker(3 * time.Second)
 		restart := false
