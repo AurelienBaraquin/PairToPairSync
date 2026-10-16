@@ -45,9 +45,8 @@ const (
 	maxBody     = 16 << 10
 	maxFolders  = 64
 	maxSubjects = 512
-	// A clock that is wrong by more than this is not an honest clock: refusing such a
-	// grant keeps a mistaken date from silencing every later change of that device.
-	maxFuture = 7 * 24 * time.Hour
+	// A clock that is wrong by more than this is not an honest clock.
+	maxFuture = 24 * time.Hour
 	domain    = "p2psync/grant/v1\n"
 )
 
@@ -101,6 +100,9 @@ func (g *Grant) validate() error {
 	}
 	if g.Seq <= 0 {
 		return errors.New("grant: no sequence number")
+	}
+	if g.Issuer == g.Subject {
+		return errors.New("grant: a device cannot vouch for itself")
 	}
 	g.Name = config.Clean(g.Name)
 	if len(g.Folders) > maxFolders {
@@ -198,28 +200,34 @@ func Verify(s Signed) (Grant, error) {
 
 // ---- the set of grants a device holds ------------------------------------------------
 
-// A device may also describe itself (Subject == Issuer): which folders it takes
-// part in and in which role, so that another device can tell whether it is a full
-// member or a blind relay of a folder it does not have yet. That statement is kept
-// apart from what an admin says about the device (it must not replace it) and
-// never confers anything by itself.
-func key(g Grant) string {
-	if g.Issuer == g.Subject {
-		return "self/" + g.Subject
-	}
-	return g.Subject
-}
+// Grants are kept per (issuer, subject): each admin's statement about a device stands on
+// its own. What a device is granted is the union of what the trusted admins say, so
+// one admin narrowing or withdrawing its own grant cannot erase another's, and a
+// promoted admin cannot cut off the admin that promoted it.
+func key(issuer, subject string) string { return issuer + "|" + subject }
 
 type entry struct {
 	Signed
 	g Grant
+	// What this device remembers about the grant it replaced. An admin that narrows a
+	// device to other folders must still be heard by the devices that knew it for the
+	// old ones (see Entry.Mentions).
+	prev      []string
+	prevAdmin bool
 }
 
-// Set holds the newest grant known for each device.
+// stored is the on-disk form of an entry.
+type stored struct {
+	Signed
+	Prev      []string `json:"prev,omitempty"`
+	PrevAdmin bool     `json:"prev_admin,omitempty"`
+}
+
+// Set holds the newest grant of each admin for each device.
 type Set struct {
 	mu   sync.Mutex
 	path string
-	m    map[string]entry // by key()
+	m    map[string]entry // by key(issuer, subject)
 }
 
 // Load reads the set stored at path. A damaged file is set aside and the set
@@ -231,40 +239,60 @@ func Load(path string) *Set {
 	if err != nil {
 		return s
 	}
-	var list []Signed
+	var list []stored
 	if err := json.Unmarshal(b, &list); err != nil {
 		_ = fsutil.Rename(path, fmt.Sprintf("%s.corrupt-%d", path, time.Now().Unix()))
 		return s
 	}
-	for _, sg := range list {
-		if g, err := Verify(sg); err == nil {
-			s.keep(sg, g)
+	for _, st := range list {
+		if g, err := Verify(st.Signed); err == nil && s.keep(st.Signed, g) {
+			e := s.m[key(g.Issuer, g.Subject)]
+			e.prev, e.prevAdmin = capFolders(st.Prev), st.PrevAdmin
+			s.m[key(g.Issuer, g.Subject)] = e
 		}
 	}
 	return s
 }
 
+func capFolders(in []string) []string {
+	if len(in) > maxFolders {
+		in = in[len(in)-maxFolders:]
+	}
+	return in
+}
+
 func (s *Set) keep(sg Signed, g Grant) bool {
-	k := key(g)
-	if cur, ok := s.m[k]; ok && !g.newer(cur.g) {
+	k := key(g.Issuer, g.Subject)
+	cur, had := s.m[k]
+	if had && !g.newer(cur.g) {
 		return false
 	}
-	if _, ok := s.m[k]; !ok && len(s.m) >= maxSubjects {
+	if !had && len(s.m) >= maxSubjects {
 		s.evict()
 		if len(s.m) >= maxSubjects {
 			return false
 		}
 	}
-	s.m[k] = entry{sg, g}
+	e := entry{Signed: sg, g: g}
+	if had {
+		e.prev, e.prevAdmin = cur.prev, cur.prevAdmin || cur.g.Admin
+		for _, f := range cur.g.Folders {
+			if !slices.Contains(e.prev, f.ID) {
+				e.prev = append(e.prev, f.ID)
+			}
+		}
+		e.prev = capFolders(e.prev)
+	}
+	s.m[k] = e
 	return true
 }
 
 // evict drops the oldest revocation to make room.
 func (s *Set) evict() {
 	var oldest string
-	for sub, e := range s.m {
+	for k, e := range s.m {
 		if e.g.Revoked && (oldest == "" || e.g.Seq < s.m[oldest].g.Seq) {
-			oldest = sub
+			oldest = k
 		}
 	}
 	if oldest != "" {
@@ -291,8 +319,7 @@ func (s *Set) trustedLocked(pinned map[string]bool) map[string]bool {
 	for changed := true; changed; {
 		changed = false
 		for _, e := range s.m {
-			sub := e.g.Subject
-			if !t[sub] && e.g.Issuer != sub && e.g.Admin && !e.g.Revoked && t[e.g.Issuer] {
+			if sub := e.g.Subject; !t[sub] && e.g.Admin && !e.g.Revoked && t[e.g.Issuer] {
 				t[sub], changed = true, true
 			}
 		}
@@ -322,20 +349,22 @@ func (s *Set) Offer(sg Signed, pinned map[string]bool, now time.Time) (Grant, bo
 }
 
 // Issue signs and stores a grant made by this device (an admin).
-func (s *Set) Issue(key_ crypto.PrivKey, g Grant, now time.Time) (Signed, Grant, error) {
-	if pid, err := peer.IDFromPrivateKey(key_); err == nil {
-		g.Issuer = pid.String()
+func (s *Set) Issue(priv crypto.PrivKey, g Grant, now time.Time) (Signed, Grant, error) {
+	pid, err := peer.IDFromPrivateKey(priv)
+	if err != nil {
+		return Signed{}, Grant{}, err
 	}
+	g.Issuer = pid.String()
 	if g.Seq == 0 {
 		// Strictly newer than the grant it replaces, even if the clock went back.
 		g.Seq = now.UnixNano()
 		s.mu.Lock()
-		if cur, ok := s.m[key(g)]; ok && cur.g.Seq >= g.Seq {
+		if cur, ok := s.m[key(g.Issuer, g.Subject)]; ok && cur.g.Seq >= g.Seq {
 			g.Seq = cur.g.Seq + 1
 		}
 		s.mu.Unlock()
 	}
-	sg, err := Sign(key_, g, now)
+	sg, err := Sign(priv, g, now)
 	if err != nil {
 		return Signed{}, Grant{}, err
 	}
@@ -352,46 +381,75 @@ func (s *Set) Issue(key_ crypto.PrivKey, g Grant, now time.Time) (Signed, Grant,
 	return sg, parsed, nil
 }
 
-// Get returns the newest grant an admin made for a device.
-func (s *Set) Get(subject string) (Grant, bool) {
+// By returns the newest grant that one admin made for a device.
+func (s *Set) By(issuer, subject string) (Grant, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.m[subject]
+	e, ok := s.m[key(issuer, subject)]
 	return e.g, ok
 }
 
-// GetSelf returns the newest description a device gave of itself.
-func (s *Set) GetSelf(subject string) (Grant, bool) {
+// Latest returns the most recent grant of any admin about a device.
+func (s *Set) Latest(subject string) (Grant, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.m["self/"+subject]
-	return e.g, ok
+	var best Grant
+	found := false
+	for _, e := range s.m {
+		if e.g.Subject == subject && (!found || e.g.newer(best)) {
+			best, found = e.g, true
+		}
+	}
+	return best, found
 }
 
 // Entry is a stored grant together with its parsed form.
 type Entry struct {
-	Signed Signed
-	Grant  Grant
+	Signed    Signed
+	Grant     Grant
+	Prev      []string // folders the replaced grant listed
+	PrevAdmin bool     // an earlier grant made the subject an admin
 }
 
-// All returns every stored grant, oldest subject first (stable order).
+// Mentions reports whether the grant concerns any of the folders: those it lists now
+// and those it listed before it was narrowed.
+func (e Entry) Mentions(folders map[string]bool) bool {
+	for _, f := range e.Grant.Folders {
+		if folders[f.ID] {
+			return true
+		}
+	}
+	for _, f := range e.Prev {
+		if folders[f] {
+			return true
+		}
+	}
+	return false
+}
+
+// All returns every stored grant in a stable order.
 func (s *Set) All() []Entry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]Entry, 0, len(s.m))
 	for _, e := range s.m {
-		out = append(out, Entry{e.Signed, e.g})
+		out = append(out, Entry{e.Signed, e.g, slices.Clone(e.prev), e.prevAdmin})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Grant.Subject < out[j].Grant.Subject })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Grant.Subject != out[j].Grant.Subject {
+			return out[i].Grant.Subject < out[j].Grant.Subject
+		}
+		return out[i].Grant.Issuer < out[j].Grant.Issuer
+	})
 	return out
 }
 
 // Save writes the set atomically.
 func (s *Set) Save() error {
 	s.mu.Lock()
-	list := make([]Signed, 0, len(s.m))
+	list := make([]stored, 0, len(s.m))
 	for _, e := range s.m {
-		list = append(list, e.Signed)
+		list = append(list, stored{e.Signed, e.prev, e.prevAdmin})
 	}
 	s.mu.Unlock()
 	sort.Slice(list, func(i, j int) bool { return bytes.Compare(list[i].Body, list[j].Body) < 0 })

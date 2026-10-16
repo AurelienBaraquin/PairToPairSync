@@ -150,6 +150,7 @@ func cmdPairNetwork(home string, inv pairing.Invite, dir string, yes bool) {
 	m := app.LoadMembership(home, id, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	check(app.PreflightNetwork(cfg, inv))
 
+	fmt.Printf("This device's ID is %s: the admin sees the same ID when it is asked to accept. Compare them.\n", identity.Format(id.ID))
 	fmt.Printf("Connecting to %s…\n", orID(inv.Name, inv.ID))
 	wait := 45 * time.Second
 	if inv.Approve {

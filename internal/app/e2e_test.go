@@ -32,6 +32,7 @@ func init() {
 	relay.ProbeInterval = time.Second
 	relay.TickInterval = 100 * time.Millisecond
 	app.RedialMax = 500 * time.Millisecond
+	node.AllowLoopbackHints = true // every test device lives on 127.0.0.1
 }
 
 const testSecret = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"

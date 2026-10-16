@@ -843,7 +843,7 @@ func (n *Node) readLoop(p *Peer) {
 			}
 		case protocol.TypeGrants:
 			var g protocol.Grants
-			if json.Unmarshal(hb, &g) != nil || len(g.List) > protocol.MaxGrants || len(g.Hints) > protocol.MaxHintedIDs {
+			if len(hb) > 1<<20 || json.Unmarshal(hb, &g) != nil || len(g.List) > protocol.MaxGrants || len(g.Hints) > protocol.MaxHintedIDs {
 				return
 			}
 			if n.opts.Network != nil {
@@ -1210,13 +1210,8 @@ func (n *Node) AddHints(device string, addrs []string) {
 		return
 	}
 	var ms []ma.Multiaddr
-	for _, a := range addrs {
-		if len(a) <= 200 {
-			ms = append(ms, ParseAddr(a)...)
-		}
-		if len(ms) >= 2*protocol.MaxHintAddrs {
-			break
-		}
+	for _, a := range CleanHints(addrs) {
+		ms = append(ms, ParseAddr(a)...)
 	}
 	if len(ms) == 0 {
 		return

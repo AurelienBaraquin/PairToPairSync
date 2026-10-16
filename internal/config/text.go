@@ -14,8 +14,26 @@ var folderIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // ValidFolderID accepts short identifiers that are safe as part of a file name:
 // no separators, no "..", no spaces.
+//
+// The ID becomes a directory name on every device, Windows included: no trailing dot or
+// space (Windows drops it, so two IDs would share a directory) and none of the names
+// Windows reserves for devices.
 func ValidFolderID(id string) bool {
-	return folderIDRe.MatchString(id) && !strings.Contains(id, "..")
+	if !folderIDRe.MatchString(id) || strings.Contains(id, "..") || strings.HasSuffix(id, ".") {
+		return false
+	}
+	base := strings.ToLower(id)
+	if i := strings.IndexByte(base, '.'); i >= 0 {
+		base = base[:i]
+	}
+	switch base {
+	case "con", "prn", "aux", "nul":
+		return false
+	}
+	if len(base) == 4 && (strings.HasPrefix(base, "com") || strings.HasPrefix(base, "lpt")) && base[3] >= '0' && base[3] <= '9' {
+		return false
+	}
+	return true
 }
 
 // SlugID turns an arbitrary directory name into a valid folder ID.

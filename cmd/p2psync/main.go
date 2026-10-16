@@ -217,6 +217,10 @@ func cmdDevice(home string, args []string) {
 		if cfg.Device(id) == nil {
 			fatal(fmt.Errorf("no such device: %s", identity.Format(id)))
 		}
+		// A device an admin introduced stays removed until the admin says something newer.
+		if lid, err := identity.LoadOrCreate(home); err == nil {
+			app.LoadMembership(home, lid, slog.New(slog.NewTextHandler(io.Discard, nil))).Dismiss(cfg, id)
+		}
 		var keep []config.Device
 		for _, d := range cfg.Devices {
 			if d.ID != id {

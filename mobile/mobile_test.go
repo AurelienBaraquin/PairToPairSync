@@ -16,8 +16,11 @@ import (
 	"github.com/aurelienbaraquin/pairtopairsync/internal/app"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/node"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/pairing"
 )
+
+func init() { node.AllowLoopbackHints = true }
 
 const secret = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
 

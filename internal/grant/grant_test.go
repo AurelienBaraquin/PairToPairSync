@@ -121,7 +121,7 @@ func TestOnlyTrustedIssuersAndNewestWins(t *testing.T) {
 	if _, ch, err := s.Offer(rev, trust, now); err != nil || !ch {
 		t.Fatalf("revocation: %v %v", err, ch)
 	}
-	if g, _ := s.Get(n.id); !g.Revoked {
+	if g, _ := s.Latest(n.id); !g.Revoked {
 		t.Fatal("revocation not applied")
 	}
 	// ... and the revoked grant cannot be replayed.
@@ -190,7 +190,7 @@ func TestIssueAlwaysBeatsThePreviousGrant(t *testing.T) {
 	if err != nil || g2.Seq <= g1.Seq {
 		t.Fatalf("seq %d after %d (%v)", g2.Seq, g1.Seq, err)
 	}
-	if cur, _ := s.Get(n.id); !cur.Revoked {
+	if cur, _ := s.Latest(n.id); !cur.Revoked {
 		t.Fatal("the newer grant was not kept")
 	}
 }
@@ -206,7 +206,7 @@ func TestPersistenceAndDamagedFile(t *testing.T) {
 	if err := s.Save(); err != nil {
 		t.Fatal(err)
 	}
-	if g, ok := Load(path).Get(n.id); !ok || len(g.Folders) != 1 || !g.Folders[0].Relay {
+	if g, ok := Load(path).Latest(n.id); !ok || len(g.Folders) != 1 || !g.Folders[0].Relay {
 		t.Fatalf("not reloaded: %+v", g)
 	}
 	// A damaged file is set aside, not fatal.
@@ -235,5 +235,73 @@ func TestSetIsBounded(t *testing.T) {
 	}
 	if refused == 0 {
 		t.Fatal("going over the limit was not reported")
+	}
+}
+
+// Each admin's statement stands on its own: one admin narrowing its grant does not
+// erase another admin's, and a promoted admin cannot cut off whoever promoted it.
+func TestGrantsAreKeptPerIssuer(t *testing.T) {
+	root, b, c, n := newDev(t), newDev(t), newDev(t), newDev(t)
+	s := Load(filepath.Join(t.TempDir(), "g.json"))
+	trust := pin(root)
+	for _, sg := range []Signed{
+		issue(t, root, b, true, 1, Share{ID: "docs"}),
+		issue(t, b, c, true, 2, Share{ID: "docs"}),
+		issue(t, root, n, false, 3, Share{ID: "docs"}, Share{ID: "photos"}),
+		issue(t, b, n, false, 10, Share{ID: "docs"}), // newer, but narrower: B's own statement only
+	} {
+		if _, _, err := s.Offer(sg, trust, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var seen int
+	for _, e := range s.All() {
+		if e.Grant.Subject == n.id {
+			seen++
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("both admins' grants for the device should be kept, got %d", seen)
+	}
+	if g, ok := s.By(root.id, n.id); !ok || len(g.Folders) != 2 {
+		t.Fatalf("root's grant was overwritten: %+v", g)
+	}
+	// C (promoted by B) says B is not an admin: that is C's opinion only.
+	if _, _, err := s.Offer(issue(t, c, b, false, 20), trust, now); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Trusted(trust); !got[b.id] || !got[c.id] {
+		t.Fatalf("a promoted admin cut off its promoter: %v", got)
+	}
+}
+
+func TestADeviceCannotVouchForItself(t *testing.T) {
+	a := newDev(t)
+	if _, err := Sign(a.key, Grant{Subject: a.id, Folders: []Share{{ID: "x"}}}, now); err == nil {
+		t.Fatal("a self-grant was signed")
+	}
+}
+
+func TestNarrowedGrantStillMentionsItsOldFolders(t *testing.T) {
+	a, n := newDev(t), newDev(t)
+	s := Load(filepath.Join(t.TempDir(), "g.json"))
+	if _, _, err := s.Issue(a.key, Grant{Subject: n.id, Folders: []Share{{ID: "F"}, {ID: "G"}}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Issue(a.key, Grant{Subject: n.id, Folders: []Share{{ID: "G"}}}, now); err != nil {
+		t.Fatal(err)
+	}
+	e := s.All()[0]
+	if !e.Mentions(map[string]bool{"F": true}) {
+		t.Fatal("the devices that knew the subject through F would never hear it was removed")
+	}
+	if e.Mentions(map[string]bool{"H": true}) {
+		t.Fatal("unrelated folder mentioned")
+	}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if again := Load(s.path).All()[0]; !again.Mentions(map[string]bool{"F": true}) {
+		t.Fatal("the memory of old folders was not persisted")
 	}
 }

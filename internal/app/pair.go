@@ -17,6 +17,7 @@ import (
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/grant"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/node"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/pairing"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/protocol"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/seal"
@@ -433,33 +434,45 @@ func (p *pairer) acceptNetwork(remote peer.ID, remoteIP string, req protocol.Pai
 		}
 	}
 
-	// A copy of the configuration with the guest in it tells which grants concern it.
-	plan := *cfg
-	plan.Devices = slices.Clone(cfg.Devices)
-	plan.Folders = make([]config.Folder, len(cfg.Folders))
-	for i, f := range cfg.Folders {
-		plan.Folders[i] = f
-		plan.Folders[i].Devices = slices.Clone(f.Devices)
+	// The configuration may have changed while a person was deciding.
+	if cfg, err = LoadConfig(p.home); err != nil {
+		return refuse("internal error")
 	}
-	if err := AddDevice(&plan, guest, guestName, nil); err != nil {
+	var shares []grant.Share
+	for _, id := range pend.Folders {
+		f := cfg.Folder(id)
+		if f == nil || (f.Role == config.RoleRelay && !pend.InviteeRelay) {
+			return refuse("a folder of the invitation changed while waiting")
+		}
+		shares = append(shares, grant.Share{ID: id, Relay: pend.InviteeRelay})
+	}
+	// A copy of the configuration with the guest in it tells which grants concern it.
+	plan, err := cloneConfig(cfg)
+	if err != nil {
+		return refuse("internal error")
+	}
+	if err := AddDevice(plan, guest, guestName, nil); err != nil {
 		return refuse("internal error")
 	}
 	plan.Device(guest).Admin = pend.GuestAdmin
 	secrets := map[string]string{}
 	for _, id := range pend.Folders {
-		if err := ShareFolder(&plan, id, guest, pend.InviteeRelay); err != nil {
+		if err := ShareFolder(plan, id, guest, pend.InviteeRelay); err != nil {
 			return refuse("internal error")
 		}
 		if f := cfg.Folder(id); !pend.InviteeRelay && f.Secret != "" {
 			secrets[id] = f.Secret // only a full guest ever receives a folder secret
 		}
 	}
-	if _, err := p.net.IssueFromConfig(&plan); err != nil {
-		p.log.Error("cannot issue the grant", "err", err)
+	// The guest's grant is signed now, but only stored (and gossiped) once the guest has
+	// really been recorded, in commit: a request that fails half-way leaves nothing behind.
+	guestGrant, err := grant.Sign(p.net.id.Key, grant.Grant{Subject: guest, Name: guestName, Admin: pend.GuestAdmin, Folders: shares}, time.Now())
+	if err != nil {
+		p.log.Error("cannot sign the grant", "err", err)
 		return refuse("internal error")
 	}
 	resp := protocol.PairResponse{OK: true, Name: cfg.DeviceName, Folder: pend.Folders[0], Network: true,
-		Grants: p.net.ForPeer(&plan, guest), Secrets: secrets, Hints: p.hintsFor(&plan, guest)}
+		Grants: append(p.net.ForPeer(plan, guest), guestGrant), Secrets: secrets, Hints: p.hintsFor(plan, guest)}
 
 	var addr string
 	if remoteIP != "" && req.Port > 0 && req.Port < 65536 {
@@ -475,7 +488,9 @@ func (p *pairer) acceptNetwork(remote peer.ID, remoteIP string, req protocol.Pai
 				addrs = []string{addr}
 			}
 			if err = AddDevice(cfg, guest, guestName, addrs); err == nil {
-				cfg.Device(guest).Admin = pend.GuestAdmin
+				if pend.GuestAdmin { // never demote a device that is already trusted as an admin
+					cfg.Device(guest).Admin = true
+				}
 				for _, id := range pend.Folders {
 					if err = ShareFolder(cfg, id, guest, pend.InviteeRelay); err != nil {
 						break
@@ -484,6 +499,9 @@ func (p *pairer) acceptNetwork(remote peer.ID, remoteIP string, req protocol.Pai
 			}
 			if err == nil {
 				err = SaveConfig(p.home, cfg) // the daemon notices and reloads
+			}
+			if err == nil {
+				_, err = p.net.IssueFromConfig(cfg) // stores the grant: from now on it is gossiped
 			}
 		}
 		if err != nil {
@@ -509,7 +527,7 @@ func (p *pairer) hintsFor(cfg *config.Config, guest string) map[string][]string 
 		if p.addrsOf != nil {
 			addrs = append(addrs, p.addrsOf(g.Subject)...)
 		}
-		if addrs = uniqueFirst(addrs, protocol.MaxHintAddrs); len(addrs) > 0 {
+		if addrs = node.CleanHints(addrs); len(addrs) > 0 {
 			hints[g.Subject] = addrs
 		}
 	}
@@ -622,7 +640,11 @@ func JoinNetwork(m *Membership, cfg *config.Config, inv pairing.Invite, resp pro
 	if err := AddDevice(cfg, inv.ID, name, inv.Addrs); err != nil {
 		return err
 	}
-	cfg.Device(inv.ID).Admin = true // the owner scanned this code: this device is trusted as an admin
+	d := cfg.Device(inv.ID)
+	d.Admin = true // the owner scanned this code: this device is trusted as an admin
+	if !inv.InviteeRelay {
+		d.Full = true // and, since it offered a full copy, it holds one: it may introduce full folders
+	}
 
 	pins := pinned(cfg, m.id.ID)
 	for pass := 0; pass < 4; pass++ {
@@ -636,7 +658,7 @@ func JoinNetwork(m *Membership, cfg *config.Config, inv pairing.Invite, resp pro
 			break
 		}
 	}
-	mine, ok := m.set.Get(m.id.ID)
+	mine, ok := m.set.Latest(m.id.ID)
 	if !ok || mine.Revoked || len(mine.Folders) == 0 {
 		return errors.New("the admin did not send a valid grant for this device")
 	}
@@ -649,13 +671,7 @@ func JoinNetwork(m *Membership, cfg *config.Config, inv pairing.Invite, resp pro
 		if (f.Role == config.RoleRelay) != sh.Relay {
 			return fmt.Errorf("folder %q already exists here with another role than the admin granted", sh.ID)
 		}
-		adminRelay := false
-		if self, ok := m.set.GetSelf(inv.ID); ok {
-			if s, has := self.Has(sh.ID); has {
-				adminRelay = s.Relay
-			}
-		}
-		if err := ShareFolder(cfg, sh.ID, inv.ID, adminRelay); err != nil {
+		if err := ShareFolder(cfg, sh.ID, inv.ID, false); err != nil {
 			return err
 		}
 	}
@@ -674,7 +690,7 @@ func JoinNetwork(m *Membership, cfg *config.Config, inv pairing.Invite, resp pro
 	// Where to find the devices that were just introduced.
 	for id, addrs := range resp.Hints {
 		if d := cfg.Device(id); d != nil && d.Managed && len(d.Addresses) == 0 {
-			d.Addresses = uniqueFirst(addrs, protocol.MaxHintAddrs)
+			d.Addresses = node.CleanHints(addrs)
 		}
 	}
 	return m.set.Save()

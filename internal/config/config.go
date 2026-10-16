@@ -30,6 +30,10 @@ type Device struct {
 	// not by hand, so a later grant may remove it again.
 	Admin   bool `json:"admin,omitempty"`
 	Managed bool `json:"managed,omitempty"`
+	// Full: the owner established that this device holds full copies (it joined as the
+	// admin of a full-copy invitation). Only such a device can introduce a new full
+	// folder, because the folder secret will be fetched from it.
+	Full bool `json:"full,omitempty"`
 }
 
 // FolderDevice declares that a remote device takes part in a folder.
