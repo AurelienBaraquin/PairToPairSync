@@ -77,6 +77,11 @@ func New(cfg config.Folder, selfID string, log *slog.Logger) *Relay {
 func (r *Relay) ID() string { return r.cfg.ID }
 
 func (r *Relay) Start(ctx context.Context) error {
+	if r.cfg.Secret != "" {
+		// Defence in depth (config validation already rejects this): a relay that
+		// holds the secret could read what it is only meant to carry.
+		return errors.New("a relay must not be given the folder secret")
+	}
 	if err := os.MkdirAll(filepath.Join(r.dir, "blocks"), 0o700); err != nil {
 		return err
 	}

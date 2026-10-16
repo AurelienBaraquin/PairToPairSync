@@ -5,7 +5,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,4 +62,28 @@ func TestStartIgnoresNothingOnEmptyStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.Stop()
+}
+
+// The relay carries ciphertext it has no way to read. This pins that down at
+// the build level: the package must never depend on the encryption package, so
+// adding a decryption path to the relay requires changing this test on purpose.
+func TestRelayCannotDecrypt(t *testing.T) {
+	out, err := exec.Command("go", "list", "-deps", "-f", "{{.ImportPath}}", ".").Output()
+	if err != nil {
+		t.Skip("go tool unavailable:", err)
+	}
+	for _, dep := range strings.Fields(string(out)) {
+		if strings.HasSuffix(dep, "/internal/seal") || strings.HasSuffix(dep, "/internal/folder") {
+			t.Fatalf("relay depends on %s: it must not be able to open sealed data", dep)
+		}
+	}
+}
+
+func TestRelayRefusesToHoldTheSecret(t *testing.T) {
+	r := New(config.Folder{ID: "f", Path: t.TempDir(), Role: config.RoleRelay, Secret: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"},
+		"SELF", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := r.Start(t.Context()); err == nil {
+		r.Stop()
+		t.Fatal("relay started with the folder secret")
+	}
 }
