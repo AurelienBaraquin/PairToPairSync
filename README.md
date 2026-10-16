@@ -19,6 +19,7 @@ jamais une copie du dossier, n'est pas un stockage permanent, et **ne peut rien 
 | Plateforme | Rôle | Livré |
 |---|---|---|
 | **Windows x64** | appareil complet (copie du dossier) | `p2psync.exe` (ligne de commande) et `p2psyncd.exe` (démon sans fenêtre) : `make windows` |
+| **Ubuntu x64 (aussi dans WSL)** | appareil complet | `make linux`, voir [docs/WSL.md](docs/WSL.md) |
 | **Android (arm64)** | relais temporaire | application dans [`android/`](android/README.md) |
 
 Le code est écrit en Go portable et ses tests tournent sous Linux (c'est là qu'ils sont exécutés ici),
@@ -77,6 +78,16 @@ Le démon recharge `config.json` tout seul. Si `config.json` devient illisible, 
 garde la configuration qui tournait et le dit dans le journal. Les commandes manuelles (`device add`,
 `folder add --secret-file`, `folder add-relay`…) restent disponibles : voir `p2psync` sans argument.
 
+## Appareils administrateurs
+
+Plutôt que d'appairer chaque appareil avec tous les autres, on peut désigner des **admins** : un nouvel appareil
+scanne le QR d'un seul admin, l'admin accepte la demande, et le nouvel appareil est automatiquement relié aux
+autres appareils des dossiers que l'admin a choisi de partager (qui l'apprennent de l'admin, puis se connectent
+directement). `p2psync admin enable`, `p2psync invite --network`, `p2psync pair … --dir …`, `p2psync requests` /
+`accept`. Un admin ne peut agir que sur les dossiers dont il est membre, un relais (téléphone) ne peut jamais faire
+entrer une copie complète, et ce que vous avez configuré à la main n'est jamais modifié. Détails, limites et
+modèle de confiance : [docs/ADMIN.md](docs/ADMIN.md).
+
 ## Sécurité
 
 | Couche | Protection |
@@ -88,6 +99,7 @@ garde la configuration qui tournait et le dit dans le journal. Les commandes man
 | Relais | **Chiffré de bout en bout, à connaissance nulle** (ci-dessous). |
 | Appairage | Invitation à usage unique (128 bits, 10 min). Les inconnus ne sont acceptés **que pendant une invitation**, 6 au plus (2 par adresse IP), 15 s au plus, un seul échange à la fois, et ne peuvent faire qu'une chose : présenter le jeton (requête limitée à 4 Ko). L'annuaire DHT leur est fermé. |
 | Contenu venu d'un autre appareil | Identifiants de dossier, noms et libellés sont validés/filtrés (pas de `/`, `..`, ni balisage) ; un invité vérifie la réponse de l'invitant avant d'appliquer quoi que ce soit. |
+| Réseau d'admins | Autorisations signées (Ed25519, séparation de domaine), ordonnées par numéro de séquence, vérifiées par chaque appareil ; seuls les admins que **vous** avez choisis (ou qu'ils ont promus) comptent ; un admin ne touche qu'aux dossiers dont il est membre ; chaque demande de connexion est confirmée par un humain côté admin ; les secrets de dossier ne sont remis qu'à une copie complète listée, jamais à un relais. |
 | Page locale | `127.0.0.1` seulement ; jeton d'accès obligatoire ; refuse tout `Host` non local (anti DNS-rebinding) ; création d'invitation = POST JSON de même origine ; aucun script en ligne, texte inséré via `textContent`, politique CSP stricte. |
 | Fichiers de config | `config.json`, clé, index : permissions `0600` ; sous Windows, le dossier de données (`%LOCALAPPDATA%\p2psync`) n'est accessible qu'à votre compte (liste d'accès non héritée). Écritures atomiques et synchronisées sur disque. |
 

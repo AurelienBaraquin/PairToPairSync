@@ -24,6 +24,7 @@ data class UiState(
     val deviceId: String = "",
     val wifiOnly: Boolean = true,
     val busy: String? = null,
+    val busyCancelable: Boolean = false, // waiting for an admin to accept
     val notice: Notice? = null,
     val toConfirm: InviteInfo? = null,
     val showPaste: Boolean = false,
@@ -93,9 +94,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun cancelPair() = _ui.update { it.copy(toConfirm = null) }
 
+    /** Gives up waiting for an admin to accept. */
+    fun cancelWait() = io { runCatching { Mobile.cancelPair() } }
+
     fun confirmPair() {
         val info = _ui.value.toConfirm ?: return
-        _ui.update { it.copy(toConfirm = null, busy = str(R.string.pairing_busy)) }
+        val waiting = info.network && info.approve
+        _ui.update {
+            it.copy(
+                toConfirm = null, busyCancelable = waiting,
+                busy = if (waiting) str(R.string.pairing_waiting, info.shownName) else str(R.string.pairing_busy),
+            )
+        }
         io {
             val ctx = getApplication<Application>()
             val result = runCatching {
@@ -108,9 +118,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 // start a foreground service. The pairing is saved either way; the relay
                 // starts the next time the app is opened (see MainActivity.onStart).
                 runCatching { RelayService.start(ctx) }
-                _ui.update { s -> s.copy(busy = null, notice = Notice(str(R.string.paired_ok, info.shownName))) }
+                _ui.update { s -> s.copy(busy = null, busyCancelable = false, notice = Notice(str(R.string.paired_ok, info.shownName))) }
             }.onFailure { e ->
-                _ui.update { s -> s.copy(busy = null, notice = Notice(str(R.string.pair_failed, e.message ?: "?"), error = true)) }
+                _ui.update { s -> s.copy(busy = null, busyCancelable = false, notice = Notice(str(R.string.pair_failed, e.message ?: "?"), error = true)) }
             }
             refresh()
         }

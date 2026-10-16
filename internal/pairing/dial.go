@@ -60,6 +60,16 @@ func Dial(ctx context.Context, key crypto.PrivKey, inv Invite, req protocol.Pair
 		return protocol.PairResponse{}, fmt.Errorf("the other device refused to pair (invitation expired or already used?): %w", err)
 	}
 	defer s.Close()
+	// Giving up (the user pressed cancel) must also end the wait for an answer.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = s.Reset()
+		case <-stop:
+		}
+	}()
 	wait := 20 * time.Second
 	if inv.Approve {
 		wait = MaxApprovalWait + 20*time.Second // a person has to say yes

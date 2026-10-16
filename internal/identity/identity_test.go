@@ -3,6 +3,7 @@ package identity
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 )
@@ -38,7 +39,8 @@ func TestConcurrentFirstUseYieldsOneKey(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, keyFile+".tmp")); !os.IsNotExist(err) {
 		t.Fatal("temporary key file left behind")
 	}
-	if fi, _ := os.Stat(filepath.Join(dir, keyFile)); fi == nil || fi.Mode().Perm() != 0o600 {
+	// Windows has no Unix mode bits (the data directory carries an access list instead).
+	if fi, _ := os.Stat(filepath.Join(dir, keyFile)); fi == nil || (runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600) {
 		t.Fatal("key file must be mode 0600")
 	}
 }

@@ -12,14 +12,19 @@ import (
 // that edits are noticed within a fraction of a second. If it cannot (limits,
 // unsupported file system) the periodic rescan still keeps the folder in sync.
 func (f *Folder) startWatcher() *fsnotify.Watcher {
-	w, err := fsnotify.NewWatcher()
+	// Buffered: on Windows the notification goroutine blocks on a full channel while
+	// Add waits for it, which deadlocks a program that adds watches from the very
+	// goroutine that should be draining events.
+	w, err := fsnotify.NewBufferedWatcher(4096)
 	if err != nil {
 		f.log.Warn("file watcher unavailable, relying on periodic scans", "err", err)
 		return nil
 	}
-	f.watchTree(w, f.root)
-	f.wg.Add(1)
-	go func() {
+	// New directories are watched by a goroutine of their own, never by the one
+	// reading events.
+	adds := make(chan string, 256)
+	f.wg.Add(2)
+	go func() { // event reader: never calls Add
 		defer f.wg.Done()
 		for {
 			select {
@@ -27,7 +32,7 @@ func (f *Folder) startWatcher() *fsnotify.Watcher {
 				if !ok {
 					return
 				}
-				f.onEvent(w, ev)
+				f.onEvent(adds, ev)
 			case err, ok := <-w.Errors:
 				if !ok {
 					return
@@ -39,6 +44,18 @@ func (f *Folder) startWatcher() *fsnotify.Watcher {
 			}
 		}
 	}()
+	go func() { // watch registrar
+		defer f.wg.Done()
+		for {
+			select {
+			case dir := <-adds:
+				f.watchTree(w, dir)
+			case <-f.ctx.Done():
+				return
+			}
+		}
+	}()
+	f.watchTree(w, f.root)
 	return w
 }
 
@@ -60,7 +77,7 @@ func (f *Folder) watchTree(w *fsnotify.Watcher, start string) {
 	})
 }
 
-func (f *Folder) onEvent(w *fsnotify.Watcher, ev fsnotify.Event) {
+func (f *Folder) onEvent(adds chan<- string, ev fsnotify.Event) {
 	rel, err := filepath.Rel(f.root, ev.Name)
 	if err != nil {
 		return
@@ -78,7 +95,11 @@ func (f *Folder) onEvent(w *fsnotify.Watcher, ev fsnotify.Event) {
 	}
 	if ev.Has(fsnotify.Create) {
 		if fi, err := os.Lstat(ev.Name); err == nil && fi.IsDir() {
-			f.watchTree(w, ev.Name)
+			select {
+			case adds <- ev.Name:
+			default:
+				f.queueScan("") // too many at once: the rescan finds them, the next event registers them
+			}
 		}
 	}
 	f.queueScan(rel)

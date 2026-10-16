@@ -12,8 +12,8 @@ android {
         applicationId = "io.p2psync.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.3.0"
+        versionCode = 2
+        versionName = "0.4.0"
         // The engine ships native code for 64-bit ARM phones only (see scripts/build-aar.sh).
         ndk { abiFilters += listOf("arm64-v8a") }
     }

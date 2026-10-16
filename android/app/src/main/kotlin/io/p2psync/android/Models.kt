@@ -32,7 +32,7 @@ data class EngineStatus(
     val storedTotal get() = folders.sumOf { it.storedBytes }
 }
 
-data class DeviceCfg(val id: String, val name: String)
+data class DeviceCfg(val id: String, val name: String, val admin: Boolean = false, val managed: Boolean = false)
 
 data class FolderCfg(
     val id: String,
@@ -41,6 +41,7 @@ data class FolderCfg(
     val quotaMb: Long,
     val retentionHours: Int,
     val devices: List<DeviceCfg>,
+    val managed: Boolean = false, // granted by a network admin
 ) {
     val title get() = label.ifBlank { id }
 }
@@ -88,7 +89,9 @@ fun parseStatus(json: String): EngineStatus {
 
 fun parseConfig(json: String): AppConfig {
     val root = JSONObject(json)
-    fun devices(a: JSONArray?) = a.objects { DeviceCfg(it.optString("id"), it.optString("name")) }
+    fun devices(a: JSONArray?) = a.objects {
+        DeviceCfg(it.optString("id"), it.optString("name"), it.optBoolean("admin"), it.optBoolean("managed"))
+    }
     return AppConfig(
         deviceName = root.optString("device_name"),
         listenPort = root.optInt("listen_port"),
@@ -102,6 +105,7 @@ fun parseConfig(json: String): AppConfig {
                 quotaMb = f.optLong("quota_mb"),
                 retentionHours = f.optInt("retention_hours"),
                 devices = devices(f.optJSONArray("devices")),
+                managed = f.optBoolean("managed"),
             )
         },
     )
@@ -116,10 +120,15 @@ data class InviteInfo(
     val label: String,
     val forRelay: Boolean,
     val expiresAtSec: Long,
+    /** Joining the inviter's whole network: it becomes a trusted admin and chooses [folders]. */
+    val network: Boolean = false,
+    val folders: List<String> = emptyList(),
+    /** The inviter's owner has to accept the request: the phone waits for an answer. */
+    val approve: Boolean = false,
 ) {
     fun expired(nowMs: Long = System.currentTimeMillis()) = nowMs / 1000 > expiresAtSec
     val shownName get() = inviterName.ifBlank { shortId }
-    val shownFolder get() = label.ifBlank { folder }
+    val shownFolder get() = if (network) folders.joinToString(", ") else label.ifBlank { folder }
     /** The start and end of the inviter's ID (all IDs begin alike): names are free text, the ID is what actually identifies a device. */
     val shortId get() = if (inviterId.length <= 14) inviterId else inviterId.take(6) + "…" + inviterId.takeLast(6)
 }
@@ -144,7 +153,12 @@ fun parseInvite(text: String): InviteInfo? {
     if (payload.contains('=')) return null
     return try {
         val obj = JSONObject(String(Base64.getUrlDecoder().decode(payload), Charsets.UTF_8))
-        if (obj.optInt("v") != 1 || obj.optString("id").isBlank() || obj.optString("t").isBlank()) null
+        val v = obj.optInt("v")
+        val network = v == 2 && obj.optBoolean("nw")
+        val folders = obj.optJSONArray("fs").strings().take(64).map { cleanText(it) }.filter { it.isNotEmpty() }
+        if ((v != 1 && v != 2) || obj.optString("id").isBlank() || obj.optString("t").isBlank() ||
+            (v == 2 && !network) || (network && folders.isEmpty()) || (v == 1 && obj.has("nw"))
+        ) null
         else InviteInfo(
             code = INVITE_PREFIX + payload,
             inviterId = obj.getString("id"),
@@ -153,6 +167,9 @@ fun parseInvite(text: String): InviteInfo? {
             label = cleanText(obj.optString("l")),
             forRelay = obj.optBoolean("er"),
             expiresAtSec = obj.optLong("x"),
+            network = network,
+            folders = if (network) folders else emptyList(),
+            approve = network && obj.optBoolean("ap"),
         )
     } catch (e: Exception) {
         null

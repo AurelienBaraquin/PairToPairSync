@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -39,7 +40,7 @@ func guard(err *error) {
 func quiet() { _ = recover() }
 
 // Version of the embedded engine.
-func Version() string { return "0.3.0" }
+func Version() string { return "0.4.0" }
 
 // ---- identity ------------------------------------------------------------------------
 
@@ -79,6 +80,9 @@ func Pair(home, code, storageDir string, quotaMB int64) (res string, err error) 
 	if inv.Expired(time.Now()) {
 		return "", errors.New("this invitation has expired; ask for a new one")
 	}
+	if inv.Net {
+		return pairNetwork(home, inv, storageDir)
+	}
 	if !inv.InviteeRelay {
 		return "", errors.New("this invitation is for a full copy, which a phone cannot hold; " +
 			"create it with `p2psync invite --as-relay` (or tick \"relay\" on the page)")
@@ -101,7 +105,7 @@ func Pair(home, code, storageDir string, quotaMB int64) (res string, err error) 
 	if err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := pairContext(45 * time.Second)
 	defer cancel()
 	resp, err := pairing.Dial(ctx, id.Key, inv, app.GuestRequest(cfg))
 	if err != nil {
@@ -123,6 +127,86 @@ func Pair(home, code, storageDir string, quotaMB int64) (res string, err error) 
 		return "", joinErr
 	}
 	b, _ := json.Marshal(map[string]string{"folder": inv.Folder, "label": inv.Label, "peer": resp.Name, "peer_id": inv.ID})
+	return string(b), nil
+}
+
+// pairCtx lets the app give up on a pairing that is waiting for an admin.
+var (
+	pairMu     sync.Mutex
+	pairCancel context.CancelFunc
+)
+
+func pairContext(d time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	pairMu.Lock()
+	pairCancel = cancel
+	pairMu.Unlock()
+	return ctx, cancel
+}
+
+// CancelPair abandons the pairing in progress (for instance while it waits for the
+// admin to accept). The invitation is spent either way.
+func CancelPair() {
+	defer quiet()
+	pairMu.Lock()
+	c := pairCancel
+	pairMu.Unlock()
+	if c != nil {
+		c()
+	}
+}
+
+// pairNetwork joins a network through an admin: this phone becomes a relay for the
+// folders the admin chose, and learns the other devices from the admin's grants. The
+// admin may have to accept the request, which can take minutes.
+func pairNetwork(home string, inv pairing.Invite, storageDir string) (string, error) {
+	if !inv.InviteeRelay {
+		return "", errors.New("this invitation would make the phone a full copy, which it cannot hold; " +
+			"ask for an invitation \"as relay\"")
+	}
+	if _, err := Init(home, ""); err != nil {
+		return "", err
+	}
+	cfg, err := app.LoadConfig(home)
+	if err != nil {
+		return "", err
+	}
+	if err := app.PreflightNetwork(cfg, inv); err != nil {
+		return "", err
+	}
+	id, err := identity.LoadOrCreate(home)
+	if err != nil {
+		return "", err
+	}
+	wait := 45 * time.Second
+	if inv.Approve {
+		wait += pairing.MaxApprovalWait
+	}
+	ctx, cancel := pairContext(wait)
+	defer cancel()
+	resp, err := pairing.Dial(ctx, id.Key, inv, app.GuestRequest(cfg))
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", errors.New("pairing cancelled or timed out")
+		}
+		return "", err
+	}
+	m := app.LoadMembership(home, id, slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	var joinErr error
+	app.WithConfigLock(func() {
+		if cfg, joinErr = app.LoadConfig(home); joinErr != nil {
+			return
+		}
+		if joinErr = app.JoinNetwork(m, cfg, inv, resp, app.JoinOptions{Dir: storageDir}); joinErr != nil {
+			return
+		}
+		joinErr = app.SaveConfig(home, cfg)
+	})
+	if joinErr != nil {
+		return "", joinErr
+	}
+	b, _ := json.Marshal(map[string]any{"folder": inv.Folder, "folders": inv.Folders, "label": inv.Label,
+		"peer": resp.Name, "peer_id": inv.ID, "network": true})
 	return string(b), nil
 }
 
@@ -155,8 +239,10 @@ func NewInvite(home, folderID string) (res string, err error) {
 // ---- configuration views and edits -------------------------------------------------------
 
 type deviceView struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Admin   bool   `json:"admin,omitempty"`   // trusted as a network admin
+	Managed bool   `json:"managed,omitempty"` // introduced by an admin rather than paired directly
 }
 
 type folderView struct {
@@ -166,6 +252,7 @@ type folderView struct {
 	QuotaMB        int64        `json:"quota_mb"`
 	RetentionHours int          `json:"retention_hours"`
 	Devices        []deviceView `json:"devices"`
+	Managed        bool         `json:"managed,omitempty"` // granted by an admin
 }
 
 // ConfigJSON describes devices and folders for the UI. It never contains secrets.
@@ -183,22 +270,31 @@ func ConfigJSON(home string) (res string, err error) {
 		Folders    []folderView `json:"folders"`
 	}{DeviceName: cfg.DeviceName, ListenPort: cfg.ListenPort, LAN: cfg.LANDiscover, Devices: []deviceView{}, Folders: []folderView{}}
 	for _, d := range cfg.Devices {
-		out.Devices = append(out.Devices, deviceView{d.ID, d.Name})
+		out.Devices = append(out.Devices, deviceView{d.ID, d.Name, d.Admin, d.Managed})
 	}
 	for _, f := range cfg.Folders {
 		fv := folderView{ID: f.ID, Label: f.Label, Role: f.Role, QuotaMB: f.Quota() >> 20,
-			RetentionHours: int(f.Retention().Hours()), Devices: []deviceView{}}
+			RetentionHours: int(f.Retention().Hours()), Devices: []deviceView{}, Managed: f.Managed}
 		for _, fd := range f.Devices {
 			name := fd.ID
 			if d := cfg.Device(fd.ID); d != nil && d.Name != "" {
 				name = d.Name
 			}
-			fv.Devices = append(fv.Devices, deviceView{fd.ID, name})
+			fv.Devices = append(fv.Devices, deviceView{ID: fd.ID, Name: name})
 		}
 		out.Folders = append(out.Folders, fv)
 	}
 	b, err := json.Marshal(out)
 	return string(b), err
+}
+
+// membership opens the grants of this device (nil if the identity cannot be read).
+func membership(home string) *app.Membership {
+	id, err := identity.LoadOrCreate(home)
+	if err != nil {
+		return nil
+	}
+	return app.LoadMembership(home, id, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func edit(home string, fn func(*config.Config) error) (err error) {
@@ -223,7 +319,11 @@ func RemoveDevice(home, deviceID string) error {
 	if err != nil {
 		return err
 	}
+	m := membership(home)
 	return edit(home, func(c *config.Config) error {
+		if d := c.Device(id); d != nil && d.Managed && m != nil {
+			m.Dismiss(c, id) // an admin's grant does not bring it back, only a newer one
+		}
 		var devs []config.Device
 		for _, d := range c.Devices {
 			if d.ID != id {
@@ -248,11 +348,15 @@ func RemoveDevice(home, deviceID string) error {
 func RemoveFolder(home, folderID string) (err error) {
 	defer guard(&err)
 	var path string
+	m := membership(home)
 	err = edit(home, func(c *config.Config) error {
 		var keep []config.Folder
 		for _, f := range c.Folders {
 			if f.ID == folderID {
 				path = f.Path
+				if f.Managed && m != nil {
+					m.DismissFolder(c, folderID)
+				}
 				continue
 			}
 			keep = append(keep, f)

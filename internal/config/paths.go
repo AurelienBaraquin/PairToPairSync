@@ -11,8 +11,21 @@ import (
 // path exists, and lower-cased where the file system ignores case.
 func canon(p string) string {
 	p = filepath.Clean(p)
-	if r, err := filepath.EvalSymlinks(p); err == nil {
-		p = r
+	// Resolve what exists (symbolic links, and on Windows 8.3 short names such as
+	// RUNNER~1) and keep the rest as written: the private directory may not exist yet
+	// while the folder around it does, and both must be compared in the same spelling.
+	rest := ""
+	for cur := p; ; {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			p = filepath.Join(r, rest)
+			break
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
 	}
 	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 		p = strings.ToLower(p)

@@ -175,7 +175,12 @@ fun AppRoot(vm: MainViewModel, onToggleRelay: (Boolean) -> Unit) {
             title = { Text(stringResource(R.string.confirm_title, info.shownName)) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(stringResource(R.string.confirm_body, info.shownFolder))
+                    if (info.network) {
+                        Text(stringResource(R.string.confirm_network_body, info.shownName, info.shownFolder))
+                        if (info.approve) Text(stringResource(R.string.confirm_approve_note, info.shownName))
+                    } else {
+                        Text(stringResource(R.string.confirm_body, info.shownFolder))
+                    }
                     // A name is free text chosen by whoever made the code; the ID is what identifies a device.
                     Text(stringResource(R.string.confirm_id, info.inviterId), fontFamily = FontFamily.Monospace, fontSize = 12.sp)
                     if (ui.config?.folders?.any { it.id == info.folder } == true) { // looked up now, not when the code arrived
@@ -194,6 +199,9 @@ fun AppRoot(vm: MainViewModel, onToggleRelay: (Boolean) -> Unit) {
         AlertDialog(
             onDismissRequest = {},
             confirmButton = {},
+            dismissButton = if (ui.busyCancelable) {
+                { TextButton(onClick = vm::cancelWait) { Text(stringResource(R.string.cancel)) } }
+            } else null,
             title = { Text(msg) },
             text = { Box(Modifier.fillMaxWidth(), Alignment.Center) { CircularProgressIndicator() } },
         )

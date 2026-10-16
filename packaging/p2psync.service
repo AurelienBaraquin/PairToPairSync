@@ -1,0 +1,23 @@
+# systemd *user* unit (Ubuntu, including WSL2 with systemd enabled).
+#
+#   mkdir -p ~/.config/systemd/user && cp p2psync.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now p2psync
+#   journalctl --user -u p2psync -f        # the log
+#
+# Adjust ExecStart if p2psync is not in ~/.local/bin. In WSL, enable systemd first
+# (see docs/WSL.md); without it, start the daemon from your shell: p2psync run &
+[Unit]
+Description=PairToPairSync folder synchronisation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/p2psync run
+Restart=on-failure
+RestartSec=5
+# The daemon only needs its own data directory and the synchronised folders.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

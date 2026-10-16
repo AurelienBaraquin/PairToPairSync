@@ -125,4 +125,40 @@ class ModelsTest {
         val padded = fixture("invite.txt") + "="
         assertNull(parseInvite(padded))
     }
+
+    // ---- network invitations (a real one made by the Go engine) ---------------------------
+
+    @Test
+    fun readsANetworkInvitationMadeByTheEngine() {
+        val inv = parseInvite(fixture("invite_network.txt"))!!
+        assertTrue(inv.network && inv.approve && inv.forRelay)
+        assertEquals(listOf("docs", "photos"), inv.folders)
+        assertEquals("docs, photos", inv.shownFolder)
+        assertEquals("Office PC", inv.inviterName)
+    }
+
+    @Test
+    fun aNetworkInvitationWithoutFoldersOrWithAV1HeaderIsNotShown() {
+        val code = fixture("invite_network.txt")
+        fun tweak(f: (JSONObject) -> Unit): String {
+            val obj = JSONObject(String(Base64.getUrlDecoder().decode(code.removePrefix(INVITE_PREFIX))))
+            f(obj)
+            return INVITE_PREFIX + Base64.getUrlEncoder().withoutPadding().encodeToString(obj.toString().toByteArray())
+        }
+        assertNull(parseInvite(tweak { it.remove("fs") }))
+        assertNull(parseInvite(tweak { it.put("v", 1) })) // a v1 code cannot be a network invitation
+        assertNull(parseInvite(tweak { it.put("v", 3) }))
+        val hostile = parseInvite(tweak { it.put("fs", org.json.JSONArray(listOf("a\u202Eb", "x".repeat(300)))) })!!
+        assertTrue(hostile.folders.all { it.length <= 48 && !it.contains('\u202E') })
+    }
+
+    @Test
+    fun parsesAdminAndManagedFlagsOfTheConfiguration() {
+        val cfg = parseConfig("""{"device_name":"p","listen_port":1,"lan_discovery":true,
+            "devices":[{"id":"x","name":"PC","admin":true},{"id":"y","name":"Laptop","managed":true}],
+            "folders":[{"id":"docs","role":"relay","managed":true,"devices":[]}]}""")
+        assertTrue(cfg.devices[0].admin && !cfg.devices[0].managed)
+        assertTrue(cfg.devices[1].managed)
+        assertTrue(cfg.folders[0].managed)
+    }
 }

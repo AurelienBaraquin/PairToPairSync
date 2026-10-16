@@ -378,3 +378,104 @@ func TestChangeRightAfterStartIsNotMissed(t *testing.T) {
 		Stop()
 	}
 }
+
+// A phone scans an admin's network invitation: the admin has to accept, the phone
+// becomes a relay for the chosen folders and never gets the secret.
+func TestPhoneJoinsTheNetworkThroughAnAdmin(t *testing.T) {
+	pc := newComputer(t)
+	cfg, _ := app.LoadConfig(pc.home)
+	cfg.Admin = true
+	must(t, app.SaveConfig(pc.home, cfg))
+	pc.a.Stop()
+	pc.start(t)
+
+	cfg, _ = app.LoadConfig(pc.home)
+	inv, err := app.CreateNetworkInvite(pc.home, cfg, pc.id.ID, pc.a.Node.Addrs(), app.NetworkInviteOptions{AsRelay: true, Approve: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, storage := newPhone(t)
+
+	type out struct {
+		s   string
+		err error
+	}
+	done := make(chan out, 1)
+	go func() { s, err := Pair(home, inv.Encode(), storage, 256); done <- out{s, err} }()
+	eventually(t, "request reaches the admin", func() bool { return len(pc.a.Requests()) == 1 })
+	if !pc.a.Decide(pc.a.Requests()[0].ID, true) {
+		t.Fatal("request vanished")
+	}
+	r := <-done
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	var sum map[string]any
+	_ = json.Unmarshal([]byte(r.s), &sum)
+	if sum["network"] != true {
+		t.Fatalf("summary: %s", r.s)
+	}
+	cj, _ := ConfigJSON(home)
+	if strings.Contains(cj, secret) {
+		t.Fatal("the folder secret reached the phone's view")
+	}
+	phoneCfg, err := app.LoadConfig(home)
+	must(t, err)
+	f := phoneCfg.Folder("docs")
+	if f == nil || f.Role != config.RoleRelay || f.Secret != "" || !f.Managed || filepath.Dir(f.Path) != storage {
+		t.Fatalf("relay folder not created as expected: %+v", f)
+	}
+	if d := phoneCfg.Device(pc.id.ID); d == nil || !d.Admin {
+		t.Fatalf("the admin is not trusted: %+v", d)
+	}
+}
+
+// The phone can't hold a full copy: a network invitation for one is refused before
+// it is spent.
+func TestPhoneRefusesAFullCopyNetworkInvitation(t *testing.T) {
+	pc := newComputer(t)
+	cfg, _ := app.LoadConfig(pc.home)
+	cfg.Admin = true
+	must(t, app.SaveConfig(pc.home, cfg))
+	pc.a.Stop()
+	pc.start(t)
+	cfg, _ = app.LoadConfig(pc.home)
+	inv, err := app.CreateNetworkInvite(pc.home, cfg, pc.id.ID, pc.a.Node.Addrs(), app.NetworkInviteOptions{})
+	must(t, err)
+	home, storage := newPhone(t)
+	if _, err := Pair(home, inv.Encode(), storage, 256); err == nil {
+		t.Fatal("a phone accepted an invitation for a full copy")
+	}
+	if !pairing.NewStore(pc.home).Active(time.Now()) {
+		t.Fatal("the invitation was spent although the phone refused it")
+	}
+}
+
+// Cancelling while the admin has not answered ends the wait.
+func TestCancelPairEndsTheWait(t *testing.T) {
+	pc := newComputer(t)
+	cfg, _ := app.LoadConfig(pc.home)
+	cfg.Admin = true
+	must(t, app.SaveConfig(pc.home, cfg))
+	pc.a.Stop()
+	pc.start(t)
+	cfg, _ = app.LoadConfig(pc.home)
+	inv, err := app.CreateNetworkInvite(pc.home, cfg, pc.id.ID, pc.a.Node.Addrs(), app.NetworkInviteOptions{AsRelay: true, Approve: true})
+	must(t, err)
+	home, storage := newPhone(t)
+	done := make(chan error, 1)
+	go func() { _, err := Pair(home, inv.Encode(), storage, 256); done <- err }()
+	eventually(t, "request waiting", func() bool { return len(pc.a.Requests()) == 1 })
+	CancelPair()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled pairing reported success")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancel did not end the wait")
+	}
+	if cfg, _ := app.LoadConfig(home); len(cfg.Folders) != 0 {
+		t.Fatal("a cancelled pairing left a folder behind")
+	}
+}

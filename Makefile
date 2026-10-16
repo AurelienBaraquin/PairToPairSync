@@ -1,6 +1,6 @@
-# Supported targets: Windows x64 and Android (arm64). The code also builds and
-# runs on Linux/macOS, which is how the tests run, but nothing else is shipped.
-.PHONY: build test windows android check
+# Supported targets: Windows x64, Ubuntu x64 (including WSL) and Android (arm64).
+# The code also builds elsewhere, but nothing else is shipped or tested.
+.PHONY: build test windows linux android check
 GOFLAGS_REL = -trimpath -ldflags "-s -w -buildid="
 
 build:
@@ -20,6 +20,10 @@ check:
 windows:
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build $(GOFLAGS_REL) -o dist/p2psync.exe ./cmd/p2psync
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -buildid= -H=windowsgui" -o dist/p2psyncd.exe ./cmd/p2psync
+
+# Ubuntu (also inside WSL): one static binary, see docs/WSL.md.
+linux:
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build $(GOFLAGS_REL) -o dist/p2psync-linux-amd64 ./cmd/p2psync
 
 # Needs ANDROID_HOME (SDK + NDK) and JDK 17+; produces android/app/build/outputs/apk/.
 android:

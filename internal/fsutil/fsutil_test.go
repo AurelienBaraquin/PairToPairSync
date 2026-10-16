@@ -74,3 +74,12 @@ func TestRemoveOfMissingFileIsNotAnError(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestOnWindowsMountIsFalseForOrdinaryDirectories(t *testing.T) {
+	if OnWindowsMount(t.TempDir()) {
+		t.Fatal("a temp directory was taken for a Windows drive")
+	}
+	if OnWindowsMount("/definitely/not/there") {
+		t.Fatal("a missing path was taken for a Windows drive")
+	}
+}

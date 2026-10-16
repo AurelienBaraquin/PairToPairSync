@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aurelienbaraquin/pairtopairsync/internal/fsutil"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/model"
 )
 
@@ -22,7 +23,14 @@ func (f *Folder) scanLoop() {
 	f.scan("")
 	close(f.scanned)
 
-	tick := time.NewTicker(f.cfg.ScanInterval())
+	interval := f.cfg.ScanInterval()
+	if fsutil.OnWindowsMount(f.root) && interval > 10*time.Second {
+		// WSL does not deliver change notifications for files written by Windows programs.
+		f.log.Warn("this folder is on a Windows drive seen from WSL: changes made by Windows programs are only noticed by the periodic scan (10 s); "+
+			"keep the folder inside the Linux file system (~/...) for instant sync", "path", f.root)
+		interval = 10 * time.Second
+	}
+	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	pending := map[string]bool{}
 	var debounce <-chan time.Time
