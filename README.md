@@ -22,8 +22,8 @@ jamais une copie du dossier, n'est pas un stockage permanent, et **ne peut rien 
 | **Ubuntu x64 (aussi dans WSL)** | appareil complet | `make linux`, voir [docs/WSL.md](docs/WSL.md) |
 | **Android (arm64)** | relais temporaire | application dans [`android/`](android/README.md) |
 
-Le code est écrit en Go portable et ses tests tournent sous Linux (c'est là qu'ils sont exécutés ici),
-mais seuls Windows x64 et Android arm64 sont des cibles livrées et maintenues.
+Le code est écrit en Go portable ; ses tests tournent sous Linux et, en CI, sous Windows. Seuls Windows x64,
+Ubuntu x64 (WSL compris) et Android arm64 sont des cibles livrées et maintenues.
 
 ## Un dossier comme les autres
 
@@ -35,7 +35,113 @@ masqué. Les noms de fichiers que Windows refuse (`CON`, `aux.txt`, `:`, `?`, po
 signalés et non synchronisés plutôt que mal écrits ; deux noms qui ne diffèrent que par la casse sont
 traités comme conflit sur un disque Windows.
 
-## Démarrage rapide (avec QR code)
+## Guide d'utilisation (pour commencer)
+
+Exemple : vous voulez le même dossier `Projets` sur votre PC Windows et sur votre portable, et un téléphone qui
+sert de boîte aux lettres quand l'un des deux est éteint. Les commandes se tapent dans PowerShell (Windows) ou un
+terminal (Ubuntu / WSL) ; remplacez `p2psync` par `.\p2psync.exe` si le programme n'est pas dans votre `PATH`.
+
+### 0. Obtenir le programme
+
+Il n'y a pas d'installateur : un seul fichier. Compilez-le (Go 1.26 requis) avec `make windows` (donne
+`dist\p2psync.exe` et `dist\p2psyncd.exe`) ou `make linux` (donne `dist/p2psync-linux-amd64`), puis copiez-le où vous
+voulez. Pour le téléphone : `make android` produit l'APK (voir [android/README.md](android/README.md) pour
+l'installer). La première fois que Windows demande d'autoriser le programme dans le pare-feu, acceptez pour les
+**réseaux privés** : sans cela, les autres appareils ne peuvent pas se connecter à ce PC.
+
+### 1. Sur le premier PC : créer le dossier
+
+```powershell
+p2psync init --name PC-maison                       # crée l'identité de l'appareil (une seule fois)
+p2psync folder add "C:\Users\moi\Documents\Projets" --id projets
+p2psync run                                         # lance la synchronisation (laissez cette fenêtre ouverte)
+```
+
+`Projets` reste **un dossier ordinaire** : déposez-y, modifiez, supprimez des fichiers comme d'habitude, avec
+n'importe quel programme. Pour qu'il se lance tout seul à l'ouverture de session, sans fenêtre :
+`powershell -ExecutionPolicy Bypass -File packaging\windows-autostart.ps1 -Exe C:\Outils\p2psyncd.exe` (le
+journal est alors dans `%LOCALAPPDATA%\p2psync\p2psync.log`). Sous Ubuntu : `packaging/p2psync.service`
+([docs/WSL.md](docs/WSL.md)).
+
+### 2. Ajouter le portable (une copie complète)
+
+Sur le PC (le démon doit tourner) :
+
+```powershell
+p2psync invite
+```
+
+Un **QR code** et un texte `p2psync://pair/…` s'affichent, valables **10 minutes**, utilisables **une seule fois**.
+Sur le portable, installez le programme, puis :
+
+```powershell
+p2psync pair "p2psync://pair/…" --path "D:\Projets"      # collez le texte entre guillemets
+p2psync run
+```
+
+Le dossier `D:\Projets` se remplit avec le contenu du PC, puis les deux restent identiques en quelques secondes dès
+qu'un fichier change d'un côté ou de l'autre. Il n'y a rien d'autre à configurer : ni compte, ni serveur, ni
+adresse IP à recopier.
+
+### 3. Ajouter le téléphone (relais temporaire)
+
+1. Installez l'application sur le téléphone.
+2. Sur le PC : `p2psync invite --as-relay`.
+3. Sur le téléphone : **Scanner un QR code**, vérifiez le nom et le dossier proposés, **confirmez**, puis activez
+   **Relais actif** (une notification permanente apparaît : c'est normal, c'est ce qui garde la connexion).
+4. Pour que le portable passe aussi par le téléphone : dans l'application, **Afficher un QR code pour un
+   ordinateur**, puis sur le portable `p2psync pair "p2psync://pair/…"`.
+
+Le téléphone **ne garde jamais de copie** de vos fichiers : il retient seulement, chiffrées, les modifications que
+certains de vos appareils n'ont pas encore reçues, et les efface dès que tous les ont. Il n'a aucun moyen de les
+lire. Par défaut il ne travaille qu'en Wi‑Fi (réglable).
+
+### 4. Au quotidien
+
+| Je veux… | Commande |
+|---|---|
+| voir l'état (à jour ? appareils connectés ?) | `p2psync status` |
+| ouvrir la page d'état (et générer des QR codes) | `p2psync ui` (affiche un lien à ouvrir dans le navigateur) |
+| voir mes appareils / mes dossiers | `p2psync device list` / `p2psync folder list` |
+| ne pas synchroniser certains fichiers | créer `.p2pignore` à la racine du dossier : une ligne par motif (`*.tmp`, `build/`, `/brouillons/*`) |
+| retirer un appareil | `p2psync device remove <ID>` (l'ID s'obtient avec `p2psync device list`) |
+| connaître mon propre ID | `p2psync id` |
+| arrêter | `Ctrl+C` dans la fenêtre ; avec le démarrage automatique : `Stop-ScheduledTask -TaskName PairToPairSync` |
+| tout voir en détail | `p2psync run --log fichier.log` |
+
+À savoir :
+- **Suppressions** : supprimer un fichier le supprime partout (il n'y a pas de corbeille : gardez une sauvegarde de
+  ce qui compte).
+- **Conflits** : si le même fichier est modifié sur deux appareils hors connexion, une version est gardée
+  et l'autre est conservée à côté sous le nom `rapport.sync-conflict-20261016-101500-ABC123.docx`. Ouvrez les deux,
+  gardez la bonne, supprimez l'autre.
+- **Appareil éteint** : il se met à jour tout seul au rallumage. Si aucun des autres appareils ni le téléphone
+  n'était joignable à ce moment-là, il rattrape dès qu'il en retrouve un.
+- **Changer de réseau** (Wi‑Fi, 4G, VPN) ne demande rien : les connexions reviennent d'elles-mêmes.
+- Où sont les données du programme ? Windows : `%LOCALAPPDATA%\p2psync` ; Ubuntu : `~/.config/p2psync`. Elles
+  contiennent la **clé de l'appareil** : ne la copiez pas sur un autre appareil (chaque appareil a la sienne) et ne
+  la mettez pas dans un dossier synchronisé.
+- Mettre à jour : remplacez le fichier du programme et relancez-le.
+
+### 5. Beaucoup d'appareils : un administrateur
+
+Pour ne pas appairer chaque nouvel appareil avec tous les autres, désignez un appareil **administrateur** :
+`p2psync admin enable`, puis `p2psync invite --network`. Le nouvel appareil (`p2psync pair "…" --dir "D:\P2PSync"`)
+se présente à l'admin, qui accepte la demande (`p2psync requests`, puis `p2psync accept <demande>`) ; il est alors
+relié automatiquement aux autres appareils des dossiers choisis. Détails : [docs/ADMIN.md](docs/ADMIN.md).
+
+### Si ça ne marche pas
+
+| Symptôme | Cause probable et remède |
+|---|---|
+| `daemon not reachable`, ou `the p2psync daemon must be running` | le démon ne tourne pas : lancez `p2psync run` (ou démarrez la tâche planifiée) |
+| `invalid, expired or already used invitation` | le code a plus de 10 minutes ou a déjà servi : refaites `p2psync invite` |
+| les deux appareils ne se voient pas | pare-feu (autoriser le programme sur les réseaux privés), ou appareils sur des réseaux différents : il suffit qu'**un** de vos appareils soit joignable (même réseau local, port 22100 ouvert, IPv6…) pour que les autres se retrouvent ; sinon un VPN personnel (WireGuard, Tailscale) règle le problème |
+| `p2psync status` montre une erreur sur un dossier | lisez le message : disque non monté, dossier déplacé, droits insuffisants. Si le dossier de service `.p2psync` a disparu alors que le dossier était déjà synchronisé, le programme **refuse volontairement** de continuer (pour ne pas annoncer une suppression de tous vos fichiers) : remettez le disque, ou recréez le dossier `.p2psync` pour confirmer |
+| un fichier n'arrive pas | nom refusé par Windows (`CON`, `aux.txt`, caractères `: ? *`, point ou espace final), ou fichier ignoré par `.p2pignore` : le journal (`--log`) le dit |
+| le téléphone ne synchronise plus | l'économie d'énergie du constructeur l'a arrêté : exemptez l'application des optimisations de batterie ; vérifiez « Relais actif » et le Wi‑Fi |
+
+## Résumé des commandes (avec QR code)
 
 ```sh
 make windows                             # dist\p2psync.exe et dist\p2psyncd.exe (ou: go build ./cmd/p2psync)
