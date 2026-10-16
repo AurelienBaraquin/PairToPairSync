@@ -34,7 +34,7 @@ func TestDecodeRejectsGarbage(t *testing.T) {
 	if _, err := Decode(both.Encode()); err == nil {
 		t.Error("relay inviting a relay accepted")
 	}
-	wrongVersion := Invite{V: 2, ID: id, Token: "t", Folder: "f"}
+	wrongVersion := Invite{V: 3, ID: id, Token: "t", Folder: "f"}
 	if _, err := Decode(wrongVersion.Encode()); err == nil {
 		t.Error("unknown version accepted")
 	}
@@ -132,4 +132,31 @@ func TestDecodeSanitisesHostileInvitations(t *testing.T) {
 	if _, err := Decode(Invite{V: 1, ID: id, Token: strings.Repeat("a", 200), Folder: "d"}.Encode()); err == nil {
 		t.Error("oversized token accepted")
 	}
+}
+
+func TestNetworkInvitationRules(t *testing.T) {
+	ok := Invite{V: 2, ID: id, Token: "t", Net: true, Folders: []string{"docs", "photos"}, Approve: true}
+	got, err := Decode(ok.Encode())
+	if err != nil || got.Folder != "docs" || !got.Approve || len(got.Folders) != 2 {
+		t.Fatalf("valid network invitation refused or changed: %+v %v", got, err)
+	}
+	for name, bad := range map[string]Invite{
+		"v1 pretending to be a network": {V: 1, ID: id, Token: "t", Folder: "f", Net: true, Folders: []string{"f"}},
+		"no folders":                    {V: 2, ID: id, Token: "t", Net: true},
+		"traversal in the list":         {V: 2, ID: id, Token: "t", Net: true, Folders: []string{"docs", "../x"}},
+		"too many folders":              {V: 2, ID: id, Token: "t", Net: true, Folders: manyFolders(65)},
+		"relay inviter":                 {V: 2, ID: id, Token: "t", Net: true, Folders: []string{"docs"}, InviterRelay: true},
+	} {
+		if _, err := Decode(bad.Encode()); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+func manyFolders(n int) []string {
+	var out []string
+	for i := 0; i < n; i++ {
+		out = append(out, "f"+string(rune('a'+i%26))+string(rune('a'+i/26)))
+	}
+	return out
 }

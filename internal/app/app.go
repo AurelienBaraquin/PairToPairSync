@@ -307,7 +307,7 @@ func (a *App) storeSecret(folderID, secret string) (stored bool) {
 
 // netHandler gossips signed grants over the sessions.
 type netHandler struct {
-	a    *App
+	a     *App
 	mu    sync.Mutex
 	times map[string][]time.Time
 }
