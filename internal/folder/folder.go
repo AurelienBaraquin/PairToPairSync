@@ -208,6 +208,12 @@ func (f *Folder) PeerUp(p *node.Peer) {
 		return
 	}
 	f.mu.Lock()
+	select {
+	case <-p.Done(): // the session ended (or was replaced) before PeerUp ran: do not register it
+		f.mu.Unlock()
+		return
+	default:
+	}
 	f.peers[p.ID()] = p
 	f.mu.Unlock()
 

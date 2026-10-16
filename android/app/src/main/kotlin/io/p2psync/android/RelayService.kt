@@ -35,8 +35,9 @@ class RelayService : Service() {
     private lateinit var connectivity: ConnectivityManager
     private var multicastLock: WifiManager.MulticastLock? = null
     private var callback: ConnectivityManager.NetworkCallback? = null
-    private var lastNetwork: Network? = null
+    private var lastNetworkKey: Pair<Network?, Boolean>? = null
     private var begun = false
+    @Volatile private var stopping = false // a stop is in progress; cleared by any new start
 
     // The engine's status call can wait for its start-up lock: never ask for it on
     // the main thread. The worker thread builds the notification, the main thread
@@ -70,6 +71,13 @@ class RelayService : Service() {
             shutDown()
             return START_NOT_STICKY
         }
+        // The system restarts a killed sticky service with a null intent: honour a Stop the
+        // user pressed in the meantime instead of silently turning the relay back on.
+        if (intent == null && !settings.relayEnabled) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        stopping = false // a start during a stop wins; the pending stop then does nothing
         if (!goForeground()) return START_NOT_STICKY
         settings.relayEnabled = true
         if (!begun) {
@@ -100,6 +108,7 @@ class RelayService : Service() {
 
     /** Brings the engine in line with what is wanted and what the network allows. */
     private fun reconcile(networkChanged: Boolean) {
+        if (stopping) return
         val allowed = !settings.wifiOnly || onUnmeteredNetwork()
         try {
             if (allowed) {
@@ -111,14 +120,22 @@ class RelayService : Service() {
                     Mobile.restart()
                 }
                 RelayState.set(Phase.Running)
+                main.removeCallbacks(retry)
             } else {
-                if (Mobile.isRunning()) Mobile.stop()
+                Mobile.stop() // unconditional: also ends an engine that is retrying a failed restart
                 RelayState.set(Phase.PausedNoWifi)
+                main.removeCallbacks(retry)
             }
         } catch (e: Exception) {
             RelayState.set(Phase.Error(e.message ?: e.javaClass.simpleName))
+            main.removeCallbacks(retry)
+            main.postDelayed(retry, 30_000) // do not wait for the next network change
         }
         notify(buildNotification()) // already on the worker thread
+    }
+
+    private val retry = Runnable {
+        if (!stopping) runCatching { worker.execute { reconcile(networkChanged = false) } }
     }
 
     private fun onUnmeteredNetwork(): Boolean {
@@ -127,24 +144,30 @@ class RelayService : Service() {
     }
 
     private fun watchNetwork() {
+        lastNetworkKey = null
         val cb = object : ConnectivityManager.NetworkCallback() {
-            private val debounce = Runnable { worker.execute { reconcile(networkChanged = true) } }
+            private val debounce = Runnable { runCatching { worker.execute { reconcile(networkChanged = true) } } }
 
-            private fun changed(network: Network?) {
-                if (network == lastNetwork && network != null) return
-                lastNetwork = network
+            /** Acts only when the network, or whether it is metered, really changed. */
+            private fun evaluate(network: Network?) {
+                val metered = network?.let {
+                    connectivity.getNetworkCapabilities(it)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) != true
+                } ?: false
+                val key = network to metered
+                val first = lastNetworkKey == null
+                if (key == lastNetworkKey) return
+                lastNetworkKey = key
+                // The first event only describes the network the engine was just started on.
+                if (first) return
                 // Networks flap while switching; act once things settle.
                 main.removeCallbacks(debounce)
                 main.postDelayed(debounce, 1500)
             }
 
-            override fun onAvailable(network: Network) = changed(network)
-            override fun onLost(network: Network) = changed(null)
-            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                // Wi‑Fi <-> mobile data flips the "metered" flag without a new Network.
-                main.removeCallbacks(debounce)
-                main.postDelayed(debounce, 1500)
-            }
+            override fun onAvailable(network: Network) = evaluate(network)
+            override fun onLost(network: Network) = evaluate(null)
+            // Wi‑Fi <-> mobile data can flip the "metered" flag without a new Network.
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) = evaluate(network)
         }
         callback = cb
         connectivity.registerDefaultNetworkCallback(cb)
@@ -159,12 +182,21 @@ class RelayService : Service() {
     }
 
     private fun shutDown() {
+        stopping = true
+        begun = false
+        main.removeCallbacksAndMessages(null)
+        callback?.let { runCatching { connectivity.unregisterNetworkCallback(it) } }
+        callback = null
+        runCatching { multicastLock?.release() }
         RelayState.set(Phase.Stopped)
         worker.execute {
             runCatching { Mobile.stop() }
             main.post {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                // If the user switched the relay back on while it was stopping, keep running.
+                if (stopping) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
             }
         }
     }
@@ -186,8 +218,9 @@ class RelayService : Service() {
     }
 
     private fun buildNotification(quick: Boolean = false): Notification {
-        val paused = RelayState.phase.value == Phase.PausedNoWifi
-        val st = if (paused || quick) EngineStatus(false) else Engine.status()
+        val phase = RelayState.phase.value
+        val paused = phase == Phase.PausedNoWifi
+        val st = if (paused || quick || phase is Phase.Error) EngineStatus(false) else Engine.status()
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
@@ -201,6 +234,7 @@ class RelayService : Service() {
             .setContentTitle(getString(if (paused) R.string.notif_paused else R.string.notif_running))
             .setContentText(
                 when {
+                    phase is Phase.Error -> getString(R.string.relay_error, phase.message)
                     paused -> getString(R.string.relay_paused)
                     quick -> getString(R.string.relay_starting)
                     else -> getString(R.string.notif_text, st.pendingTotal, st.peers.size)

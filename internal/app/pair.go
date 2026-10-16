@@ -21,8 +21,16 @@ import (
 
 // ---- inviter side -------------------------------------------------------------------
 
-// cfgMu serialises read-modify-write cycles of config.json made by the daemon.
+// cfgMu serialises read-modify-write cycles of config.json made inside this process.
 var cfgMu sync.Mutex
+
+// WithConfigLock runs fn while holding the lock that protects config.json from
+// concurrent read-modify-write cycles (pairing commits, UI edits, joins).
+func WithConfigLock(fn func()) {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	fn()
+}
 
 const (
 	maxBadTokens = 3                // failures before a device is shut out

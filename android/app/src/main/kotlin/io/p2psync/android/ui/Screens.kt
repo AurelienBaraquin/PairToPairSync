@@ -12,6 +12,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.PersistableBundle
 import android.provider.Settings as AndroidSettings
+import android.util.Size
 import android.os.PowerManager
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -21,6 +22,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Image
@@ -158,7 +161,7 @@ fun AppRoot(vm: MainViewModel, onToggleRelay: (Boolean) -> Unit) {
         Box(Modifier.padding(pad).fillMaxSize()) {
             when (ui.screen) {
                 Screen.Home -> HomeScreen(ui, phase, vm, onToggleRelay)
-                Screen.Scan -> ScanScreen(onCode = vm::submitCode)
+                Screen.Scan -> ScanScreen(onCode = vm::submitCode, onError = vm::cameraError)
                 Screen.Invite -> InviteScreen(ui, vm)
                 Screen.Settings -> SettingsScreen(ui, vm)
                 Screen.Logs -> LogsScreen(ui, vm)
@@ -170,7 +173,19 @@ fun AppRoot(vm: MainViewModel, onToggleRelay: (Boolean) -> Unit) {
         AlertDialog(
             onDismissRequest = vm::cancelPair,
             title = { Text(stringResource(R.string.confirm_title, info.shownName)) },
-            text = { Text(stringResource(R.string.confirm_body, info.shownFolder)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(stringResource(R.string.confirm_body, info.shownFolder))
+                    // A name is free text chosen by whoever made the code; the ID is what identifies a device.
+                    Text(stringResource(R.string.confirm_id, info.shortId), fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                    if (ui.confirmExists) {
+                        Text(
+                            stringResource(R.string.confirm_exists, info.shownFolder),
+                            color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
+            },
             confirmButton = { Button(onClick = vm::confirmPair) { Text(stringResource(R.string.confirm_yes)) } },
             dismissButton = { TextButton(onClick = vm::cancelPair) { Text(stringResource(R.string.cancel)) } },
         )
@@ -311,7 +326,7 @@ private fun PasteDialog(onDismiss: () -> Unit, onSubmit: (String) -> Unit) {
 // ---- scanner -------------------------------------------------------------------------------
 
 @Composable
-private fun ScanScreen(onCode: (String) -> Unit) {
+private fun ScanScreen(onCode: (String) -> Unit, onError: () -> Unit) {
     val ctx = LocalContext.current
     var granted by remember { mutableStateOf(ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
     val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it }
@@ -326,7 +341,15 @@ private fun ScanScreen(onCode: (String) -> Unit) {
     }
     val owner = LocalLifecycleOwner.current
     val executor = remember { Executors.newSingleThreadExecutor() }
-    DisposableEffect(Unit) { onDispose { executor.shutdown() } }
+    val provider = remember { arrayOfNulls<ProcessCameraProvider>(1) }
+    // Stop the camera *before* the analysis thread goes away, or a late frame would be
+    // posted to a dead executor.
+    DisposableEffect(Unit) {
+        onDispose {
+            runCatching { provider[0]?.unbindAll() }
+            executor.shutdown()
+        }
+    }
 
     Box(Modifier.fillMaxSize()) {
         AndroidView(
@@ -335,22 +358,28 @@ private fun ScanScreen(onCode: (String) -> Unit) {
                 val view = PreviewView(c)
                 val future = ProcessCameraProvider.getInstance(c)
                 future.addListener({
-                    val provider = future.get()
-                    val preview = Preview.Builder().build().also { it.setSurfaceProvider(view.surfaceProvider) }
-                    val analysis = ImageAnalysis.Builder()
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .build()
-                        .also { a ->
-                            a.setAnalyzer(executor, QrAnalyzer { text ->
-                                view.post { onCode(text) }
-                            })
-                        }
-                    provider.unbindAll()
-                    provider.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+                    try {
+                        val p = future.get()
+                        provider[0] = p
+                        val preview = Preview.Builder().build().also { it.setSurfaceProvider(view.surfaceProvider) }
+                        // A dense QR code needs more than the 640x480 default.
+                        val resolution = ResolutionSelector.Builder()
+                            .setResolutionStrategy(ResolutionStrategy(Size(1280, 720), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+                            .build()
+                        val analysis = ImageAnalysis.Builder()
+                            .setResolutionSelector(resolution)
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .build()
+                            .also { a -> a.setAnalyzer(executor, QrAnalyzer { text -> view.post { onCode(text) } }) }
+                        p.unbindAll()
+                        p.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+                    } catch (e: Exception) {
+                        // No back camera, camera in use, policy-disabled...: say so, never crash.
+                        onError()
+                    }
                 }, ContextCompat.getMainExecutor(c))
                 view
             },
-            onRelease = { runCatching { ProcessCameraProvider.getInstance(ctx).get().unbindAll() } },
         )
         Text(
             stringResource(R.string.scan_hint),
@@ -398,9 +427,8 @@ private fun InviteScreen(ui: UiState, vm: MainViewModel) {
             val bmp = remember(inv.code) { qrBitmap(inv.code) }
             Image(bmp.asImageBitmap(), contentDescription = null, modifier = Modifier.size(300.dp))
             Text(stringResource(R.string.invite_expires, DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(inv.expiresAtMs))))
-            SelectionContainer {
-                Text(inv.code, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
-            }
+            // Not selectable: the system copy toolbar would not mark it sensitive.
+            Text(inv.code, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
             OutlinedButton(onClick = { copySensitive(ctx, inv.code) }) { Text(stringResource(R.string.copy)) }
         }
     }

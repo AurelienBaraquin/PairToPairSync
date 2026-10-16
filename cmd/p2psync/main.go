@@ -309,11 +309,13 @@ func run(home string) error {
 	notifyReload(reload)
 
 	for {
+		// Note the version of config.json *before* loading it: a change made in between
+		// must trigger the next restart, not be mistaken for the version we already run.
+		stamp := modTime(cfgPath)
 		cfg, err := app.LoadConfig(home)
 		if err != nil {
 			return err
 		}
-		stamp := modTime(cfgPath)
 		a, err := app.Start(context.Background(), home, cfg, id, logger)
 		if err != nil {
 			return err

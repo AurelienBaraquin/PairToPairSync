@@ -40,6 +40,9 @@
     <string name="confirm_title">Pair with %1$s?</string>
     <string name="confirm_body">This phone will become a temporary relay for the folder “%1$s”. It will not be able to read your files: everything it keeps is encrypted for your computers only.</string>
     <string name="confirm_yes">Pair</string>
+    <string name="confirm_id">Device ID: %1$s</string>
+    <string name="confirm_exists">A folder “%1$s” is already paired on this phone: this device will be added to it. Continue only if you recognise it.</string>
+    <string name="camera_error">The camera is not available. You can paste the code instead.</string>
     <string name="confirm_expired">This invitation has expired. Create a new one.</string>
     <string name="confirm_not_relay">This invitation is for a full copy, which a phone cannot hold. Create it with “p2psync invite --as-relay”.</string>
     <string name="invalid_code">That is not a PairToPairSync invitation.</string>

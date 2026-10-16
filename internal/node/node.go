@@ -494,7 +494,10 @@ func (n *Node) dialLoop(pid peer.ID) {
 		cancel()
 		if err == nil {
 			started := time.Now()
-			n.ensureSession(pid, 0)
+			// Only one side should open the session: the device with the lower ID does so at
+			// once, the other lets it. Two sessions opened simultaneously would have one of
+			// them torn down mid-transfer by the tie-break.
+			n.ensureSession(pid, sessionDelay(n.id.ID, pid.String()))
 			if time.Since(started) > 10*time.Second {
 				backoff = time.Second
 			}
@@ -522,6 +525,15 @@ func (n *Node) wait(d time.Duration, wake <-chan struct{}) bool {
 	case <-n.ctx.Done():
 		return false
 	}
+}
+
+// sessionDelay is how long a device waits before opening the session itself: the
+// lower ID goes first; the other only steps in if nothing happened.
+func sessionDelay(self, other string) time.Duration {
+	if self < other {
+		return 0
+	}
+	return 3 * time.Second
 }
 
 // ensureSession opens the session stream to pid if none is running. It blocks
@@ -625,8 +637,14 @@ func (n *Node) runSession(s network.Stream, outbound bool) {
 		return
 	}
 	n.log.Info("connected", "peer", name, "device", pid.ShortString(), "outbound", outbound, "relayed", p.viaRelay)
+	// PeerUp runs on its own goroutine (it sends the index, which must not block the
+	// reader), so it must be finished before PeerDown: otherwise a late PeerUp could
+	// re-register a session that has already ended, and a handler would keep talking
+	// to a dead connection forever.
+	upDone := make(chan struct{})
 	defer func() {
 		n.unregister(p)
+		<-upDone
 		for f := range p.shared {
 			n.handlers[f].PeerDown(p)
 		}
@@ -635,7 +653,13 @@ func (n *Node) runSession(s network.Stream, outbound bool) {
 	}()
 
 	go func() {
+		defer close(upDone)
 		for f := range p.shared {
+			select {
+			case <-p.done: // replaced or closed before we got here
+				return
+			default:
+			}
 			n.handlers[f].PeerUp(p)
 		}
 	}()
@@ -815,10 +839,7 @@ func (nf *notifee) Connected(_ network.Network, c network.Conn) {
 	}
 	// The device with the lower ID opens the session right away; the other one
 	// only does so if nothing happens, which avoids needless duplicate sessions.
-	delay := 3 * time.Second
-	if n.id.ID < pid.String() {
-		delay = 0
-	}
+	delay := sessionDelay(n.id.ID, pid.String())
 	n.wg.Add(1)
 	go func() { defer n.wg.Done(); n.ensureSession(pid, delay) }()
 }

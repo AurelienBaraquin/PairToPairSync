@@ -32,6 +32,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        // The user wants the relay running but nothing runs (a start was refused while the
+        // app was in the background, or the service was killed): start it now, while allowed.
+        if (Settings(this).relayEnabled && RelayState.phase.value is Phase.Stopped) {
+            runCatching { RelayService.start(this) }
+        }
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)

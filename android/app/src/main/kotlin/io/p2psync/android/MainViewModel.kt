@@ -26,6 +26,7 @@ data class UiState(
     val busy: String? = null,
     val notice: Notice? = null,
     val toConfirm: InviteInfo? = null,
+    val confirmExists: Boolean = false, // the folder is already paired on this phone
     val showPaste: Boolean = false,
     val invite: InviteView? = null,
     val logs: String = "",
@@ -67,6 +68,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** A code arrived (camera, pasted text or a p2psync:// link). Nothing is done until the user confirms. */
     fun submitCode(text: String) {
+        // A link or QR that arrives while a dialog is open or a pairing runs must not
+        // replace what the user is looking at (a web page could fire links repeatedly).
+        val cur = _ui.value
+        if (cur.toConfirm != null || cur.busy != null) return
         val info = parseInvite(text)
         val problem = when {
             info == null -> R.string.invalid_code
@@ -75,9 +80,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             else -> null
         }
         _ui.update {
-            if (problem == null) it.copy(toConfirm = info, screen = Screen.Home, showPaste = false)
-            else it.copy(notice = Notice(str(problem), error = true), screen = Screen.Home, showPaste = false)
+            if (problem == null) {
+                val exists = it.config?.folders?.any { f -> f.id == info!!.folder } == true
+                it.copy(toConfirm = info, confirmExists = exists, screen = Screen.Home, showPaste = false)
+            } else {
+                it.copy(notice = Notice(str(problem), error = true), screen = Screen.Home, showPaste = false)
+            }
         }
+    }
+
+    fun cameraError() {
+        _ui.update { it.copy(screen = Screen.Home, notice = Notice(str(R.string.camera_error), error = true)) }
     }
 
     fun cancelPair() = _ui.update { it.copy(toConfirm = null) }
@@ -93,7 +106,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
             result.onSuccess {
                 settings.relayEnabled = true
-                RelayService.start(ctx)
+                // The user may have left the app during the pairing: Android then refuses to
+                // start a foreground service. The pairing is saved either way; the relay
+                // starts the next time the app is opened (see MainActivity.onStart).
+                runCatching { RelayService.start(ctx) }
                 _ui.update { s -> s.copy(busy = null, notice = Notice(str(R.string.paired_ok, info.shownName))) }
             }.onFailure { e ->
                 _ui.update { s -> s.copy(busy = null, notice = Notice(str(R.string.pair_failed, e.message ?: "?"), error = true)) }

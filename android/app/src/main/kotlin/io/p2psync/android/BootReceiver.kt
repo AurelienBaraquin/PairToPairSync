@@ -11,6 +11,7 @@ class BootReceiver : BroadcastReceiver() {
         // system broadcast's action and only if the user asked for the relay to run.
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
         if (!Settings(context).relayEnabled) return
+        if (!Engine.hasFolders(context)) return // nothing paired any more: no permanent notification
         runCatching { RelayService.start(context) }
     }
 }

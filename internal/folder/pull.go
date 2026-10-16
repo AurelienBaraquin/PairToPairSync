@@ -91,7 +91,7 @@ func (f *Folder) pickSource(w *want) *node.Peer {
 	var relay *node.Peer
 	for id := range w.sources {
 		p := f.peers[id]
-		if p == nil {
+		if p == nil || !peerAlive(p) {
 			continue
 		}
 		if !f.cfg.IsRelay(id) {
@@ -376,4 +376,14 @@ func (f *Folder) requestBlock(ctx context.Context, e model.FileInfo, size int, o
 	}
 	f.recv.Add(int64(len(body)))
 	return f.sealer.OpenBlock(body, hash)
+}
+
+// peerAlive reports whether a session is still open; a table entry can briefly outlive its connection.
+func peerAlive(p *node.Peer) bool {
+	select {
+	case <-p.Done():
+		return false
+	default:
+		return true
+	}
 }

@@ -118,9 +118,18 @@ data class InviteInfo(
     val expiresAtSec: Long,
 ) {
     fun expired(nowMs: Long = System.currentTimeMillis()) = nowMs / 1000 > expiresAtSec
-    val shownName get() = inviterName.ifBlank { inviterId.take(12) + "…" }
+    val shownName get() = inviterName.ifBlank { shortId }
     val shownFolder get() = label.ifBlank { folder }
+    /** The start of the inviter's ID: names are free text, the ID is what actually identifies a device. */
+    val shortId get() = inviterId.take(12) + "…"
 }
+
+// Text in a QR code is chosen by whoever made it. Before it is shown in a
+// confirmation dialog, drop control and bidirectional-override characters (which
+// can reorder or hide text) and cap the length.
+private val INVISIBLE = Regex("[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]")
+
+internal fun cleanText(s: String) = s.replace(INVISIBLE, "").trim().take(48)
 
 const val INVITE_PREFIX = "p2psync://pair/"
 
@@ -129,22 +138,25 @@ const val INVITE_PREFIX = "p2psync://pair/"
  * validation when pairing; this only decides what to show in the confirmation.
  * Returns null if the text is not an invitation.
  */
-fun parseInvite(text: String): InviteInfo? = try {
-    val code = text.trim()
-    val payload = code.removePrefix(INVITE_PREFIX)
-    val obj = JSONObject(String(Base64.getUrlDecoder().decode(payload), Charsets.UTF_8))
-    if (obj.optInt("v") != 1 || obj.optString("id").isBlank() || obj.optString("t").isBlank()) null
-    else InviteInfo(
-        code = INVITE_PREFIX + payload,
-        inviterId = obj.getString("id"),
-        inviterName = obj.optString("n"),
-        folder = obj.optString("f"),
-        label = obj.optString("l"),
-        forRelay = obj.optBoolean("er"),
-        expiresAtSec = obj.optLong("x"),
-    )
-} catch (e: Exception) {
-    null
+fun parseInvite(text: String): InviteInfo? {
+    val payload = text.trim().removePrefix(INVITE_PREFIX)
+    // The engine only accepts unpadded base64url: refuse here what it would refuse later.
+    if (payload.contains('=')) return null
+    return try {
+        val obj = JSONObject(String(Base64.getUrlDecoder().decode(payload), Charsets.UTF_8))
+        if (obj.optInt("v") != 1 || obj.optString("id").isBlank() || obj.optString("t").isBlank()) null
+        else InviteInfo(
+            code = INVITE_PREFIX + payload,
+            inviterId = obj.getString("id"),
+            inviterName = cleanText(obj.optString("n")),
+            folder = cleanText(obj.optString("f")),
+            label = cleanText(obj.optString("l")),
+            forRelay = obj.optBoolean("er"),
+            expiresAtSec = obj.optLong("x"),
+        )
+    } catch (e: Exception) {
+        null
+    }
 }
 
 fun formatBytes(b: Long): String = when {

@@ -40,6 +40,9 @@
     <string name="confirm_title">Appairer avec %1$s ?</string>
     <string name="confirm_body">Ce téléphone deviendra un relais temporaire pour le dossier « %1$s ». Il ne pourra pas lire vos fichiers : tout ce qu\'il garde est chiffré pour vos ordinateurs uniquement.</string>
     <string name="confirm_yes">Appairer</string>
+    <string name="confirm_id">Identifiant : %1$s</string>
+    <string name="confirm_exists">Un dossier « %1$s » est déjà appairé sur ce téléphone : cet appareil y sera ajouté. Continuez seulement si vous le reconnaissez.</string>
+    <string name="camera_error">L\'appareil photo n\'est pas disponible. Vous pouvez coller le code à la place.</string>
     <string name="confirm_expired">Cette invitation a expiré. Créez-en une nouvelle.</string>
     <string name="confirm_not_relay">Cette invitation est pour une copie complète, qu\'un téléphone ne peut pas contenir. Créez-la avec « p2psync invite --as-relay ».</string>
     <string name="invalid_code">Ce n\'est pas une invitation PairToPairSync.</string>

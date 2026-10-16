@@ -89,12 +89,20 @@ func Pair(home, code, storageDir string, quotaMB int64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Nothing was changed on disk until the other device accepted us.
-	if err := app.Join(cfg, inv, resp, opts); err != nil {
-		return "", err
-	}
-	if err := app.SaveConfig(home, cfg); err != nil {
-		return "", err
+	// Nothing was changed on disk until the other device accepted us. Re-read the
+	// configuration under the lock: it may have changed during the (slow) network exchange.
+	var joinErr error
+	app.WithConfigLock(func() {
+		if cfg, joinErr = app.LoadConfig(home); joinErr != nil {
+			return
+		}
+		if joinErr = app.Join(cfg, inv, resp, opts); joinErr != nil {
+			return
+		}
+		joinErr = app.SaveConfig(home, cfg)
+	})
+	if joinErr != nil {
+		return "", joinErr
 	}
 	b, _ := json.Marshal(map[string]string{"folder": inv.Folder, "label": inv.Label, "peer": resp.Name, "peer_id": inv.ID})
 	return string(b), nil
@@ -173,15 +181,18 @@ func ConfigJSON(home string) (string, error) {
 	return string(b), err
 }
 
-func edit(home string, fn func(*config.Config) error) error {
-	cfg, err := app.LoadConfig(home)
-	if err != nil {
-		return err
-	}
-	if err := fn(cfg); err != nil {
-		return err
-	}
-	return app.SaveConfig(home, cfg)
+func edit(home string, fn func(*config.Config) error) (err error) {
+	app.WithConfigLock(func() {
+		var cfg *config.Config
+		if cfg, err = app.LoadConfig(home); err != nil {
+			return
+		}
+		if err = fn(cfg); err != nil {
+			return
+		}
+		err = app.SaveConfig(home, cfg)
+	})
+	return err
 }
 
 // RemoveDevice forgets a device everywhere. Pending changes it had not yet
@@ -232,6 +243,14 @@ func RemoveFolder(home, folderID string) error {
 	})
 	if err != nil {
 		return err
+	}
+	// The running engine still has the folder open and could write to it again:
+	// restart it on the new configuration *before* deleting what it stored.
+	mu.Lock()
+	r := current
+	mu.Unlock()
+	if r != nil {
+		r.restart()
 	}
 	if path != "" && filepath.Base(path) == folderID { // only ever delete our own storage directory
 		_ = os.RemoveAll(path)
@@ -295,10 +314,12 @@ type runner struct {
 	home string
 	log  *slog.Logger
 
+	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
 	kick   chan struct{}
 
+	rmu sync.Mutex // serialises restarts (supervisor tick, Restart, RemoveFolder)
 	amu sync.Mutex
 	a   *app.App
 }
@@ -340,59 +361,80 @@ func Start(home string) error {
 	}
 	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx, cancel := context.WithCancel(context.Background())
+	// Take the reference version of the configuration *before* the engine loads it: a
+	// change made right after Start returns must still be noticed by the supervisor.
+	seen := cfgStamp(home)
 	a, err := startApp(ctx, home, log)
 	if err != nil {
 		cancel()
 		return err
 	}
-	r := &runner{home: home, log: log, cancel: cancel, done: make(chan struct{}), kick: make(chan struct{}, 1)}
+	r := &runner{home: home, log: log, ctx: ctx, cancel: cancel, done: make(chan struct{}), kick: make(chan struct{}, 1)}
 	r.set(a)
 	current = r
-	go r.supervise(ctx)
+	go r.supervise(ctx, seen)
 	return nil
 }
 
-func cfgStamp(home string) time.Time {
-	fi, err := os.Stat(filepath.Join(home, app.ConfigFile))
-	if err != nil {
-		return time.Time{}
-	}
-	return fi.ModTime()
+// stamp identifies a version of config.json (modification time and size).
+type stamp struct {
+	mod  time.Time
+	size int64
 }
 
-func (r *runner) supervise(ctx context.Context) {
+func cfgStamp(home string) stamp {
+	fi, err := os.Stat(filepath.Join(home, app.ConfigFile))
+	if err != nil {
+		return stamp{}
+	}
+	return stamp{fi.ModTime(), fi.Size()}
+}
+
+// restart stops the engine and starts it again on the current configuration.
+// It returns when the new engine is up (or has failed; the supervisor retries).
+func (r *runner) restart() {
+	r.rmu.Lock()
+	defer r.rmu.Unlock()
+	if r.ctx.Err() != nil {
+		return
+	}
+	r.log.Info("restarting engine")
+	if a := r.app(); a != nil {
+		a.Stop()
+		r.set(nil)
+	}
+	a, err := startApp(r.ctx, r.home, r.log)
+	if err != nil {
+		r.log.Error("restart failed, will retry", "err", err)
+		return
+	}
+	r.set(a)
+}
+
+func (r *runner) supervise(ctx context.Context, stamp stamp) {
 	defer close(r.done)
-	stamp := cfgStamp(r.home)
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
 	for {
 		restart := false
 		select {
 		case <-ctx.Done():
+			r.rmu.Lock()
 			if a := r.app(); a != nil {
 				a.Stop()
+				r.set(nil)
 			}
+			r.rmu.Unlock()
 			return
 		case <-r.kick:
 			restart = true
 		case <-tick.C:
 			restart = cfgStamp(r.home) != stamp || r.app() == nil // also retry a failed restart
 		}
-		if !restart {
-			continue
+		if restart {
+			stamp = cfgStamp(r.home)
+			r.restart()
 		}
-		r.log.Info("restarting engine")
-		if a := r.app(); a != nil {
-			a.Stop()
-			r.set(nil)
-		}
-		stamp = cfgStamp(r.home)
-		a, err := startApp(ctx, r.home, r.log)
-		if err != nil {
-			r.log.Error("restart failed, will retry", "err", err)
-			continue
-		}
-		r.set(a)
 	}
 }
 
@@ -427,11 +469,13 @@ func Restart() {
 	}
 }
 
-// IsRunning reports whether the engine is started.
+// IsRunning reports whether the relay has been started (and not stopped). While
+// the supervisor is retrying a failed restart it still counts as running: it is
+// Stop, not Start, that ends it.
 func IsRunning() bool {
 	mu.Lock()
 	defer mu.Unlock()
-	return current != nil && current.app() != nil
+	return current != nil
 }
 
 // StatusJSON returns what the UI shows: relay state, peers, addresses.

@@ -2,6 +2,7 @@ package relay
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -85,5 +86,103 @@ func TestRelayRefusesToHoldTheSecret(t *testing.T) {
 	if err := r.Start(t.Context()); err == nil {
 		r.Stop()
 		t.Fatal("relay started with the folder secret")
+	}
+}
+
+func sealedEntry(id string, version model.Vector) protocol.SealedEntry {
+	return protocol.SealedEntry{ID: id, Version: version, Meta: []byte("sealed"), ModTime: 1} // a deletion-sized change: no blocks
+}
+
+// The race that used to leave data on the relay: B's acknowledgement by probe
+// removes a change, then B's own announcement of the same version arrives. That
+// must not look like a brand new change (the relay would fetch it again).
+func TestLateAnnouncementOfADeliveredChangeIsIgnored(t *testing.T) {
+	r := New(config.Folder{ID: "f", Path: t.TempDir(), Role: config.RoleRelay,
+		Devices: []config.FolderDevice{{ID: "A"}, {ID: "B"}}}, "SELF", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := r.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Stop()
+	id := "0123456789abcdef0123456789abcdef"
+	v := model.Vector{"A": 5}
+
+	r.ingest("A", []protocol.SealedEntry{sealedEntry(id, v)})
+	r.mu.Lock()
+	if r.pending[id] == nil {
+		t.Fatal("change not recorded")
+	}
+	r.pending[id].Acked["B"] = true // acknowledged through a probe
+	r.mu.Unlock()
+	r.evaluate()
+	r.mu.Lock()
+	gone := r.pending[id] == nil
+	r.mu.Unlock()
+	if !gone {
+		t.Fatal("delivered change was not removed")
+	}
+
+	r.ingest("B", []protocol.SealedEntry{sealedEntry(id, v)}) // B's announcement arrives late
+	r.mu.Lock()
+	_, resurrected := r.pending[id]
+	r.mu.Unlock()
+	if resurrected {
+		t.Fatal("a late acknowledgement resurrected a delivered change")
+	}
+
+	// A genuinely newer version of the same file is a new change, of course.
+	r.ingest("A", []protocol.SealedEntry{sealedEntry(id, model.Vector{"A": 6})})
+	r.mu.Lock()
+	_, isNew := r.pending[id]
+	r.mu.Unlock()
+	if !isNew {
+		t.Fatal("a newer version was ignored")
+	}
+}
+
+func TestDeliveredTableSurvivesRestartAndIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	mk := func() *Relay {
+		return New(config.Folder{ID: "f", Path: dir, Role: config.RoleRelay,
+			Devices: []config.FolderDevice{{ID: "A"}, {ID: "B"}}}, "SELF", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}
+	id := "fedcba9876543210fedcba9876543210"
+	r := mk()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(r.Start(t.Context()))
+	r.ingest("A", []protocol.SealedEntry{sealedEntry(id, model.Vector{"A": 1})})
+	r.mu.Lock()
+	r.pending[id].Acked["B"] = true
+	r.mu.Unlock()
+	r.evaluate()
+	r.Stop()
+
+	r2 := mk()
+	must(r2.Start(t.Context()))
+	defer r2.Stop()
+	r2.ingest("B", []protocol.SealedEntry{sealedEntry(id, model.Vector{"A": 1})})
+	r2.mu.Lock()
+	n := len(r2.pending)
+	r2.mu.Unlock()
+	if n != 0 {
+		t.Fatal("delivery was forgotten across a restart")
+	}
+
+	old := deliveredMax
+	deliveredMax = 3
+	defer func() { deliveredMax = old }()
+	r2.mu.Lock()
+	for i := 0; i < 10; i++ {
+		r2.delivered[fmt.Sprintf("%032d", i)] = delivery{Version: model.Vector{"A": 1}, At: time.Now().Add(time.Duration(i) * time.Second)}
+	}
+	r2.pruneDeliveredLocked(time.Now())
+	size := len(r2.delivered)
+	r2.mu.Unlock()
+	if size != 3 {
+		t.Fatalf("table not bounded: %d", size)
 	}
 }

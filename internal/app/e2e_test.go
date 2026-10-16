@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -184,6 +185,28 @@ func storeEmpty(d *dev) bool {
 	return empty
 }
 
+// relayHolds reports whether a relay holds at least n pending changes and every
+// one of them is complete. Waiting for "something" is not enough before taking the
+// source device offline: a second file may not even have been announced yet.
+func relayHolds(d *dev, n int) bool {
+	b, err := os.ReadFile(filepath.Join(d.dir, "pending.json"))
+	if err != nil {
+		return false
+	}
+	var pending map[string]struct {
+		Have bool `json:"have"`
+	}
+	if json.Unmarshal(b, &pending) != nil {
+		return false
+	}
+	for _, p := range pending {
+		if !p.Have {
+			return false
+		}
+	}
+	return len(pending) >= n
+}
+
 // storeHasBlocks reports whether a relay completely holds at least one pending
 // change (all of its data blocks are stored).
 func storeHasBlocks(d *dev) bool {
@@ -283,7 +306,8 @@ func TestRelayDeliversToAbsentDeviceThenForgets(t *testing.T) {
 	a.write(t, "notes/todo.txt", []byte("buy milk"))
 	a.write(t, "photo.bin", big)
 
-	eventually(t, "relay stored the changes", func() bool { return storeHasBlocks(r) })
+	// notes/ (directory), notes/todo.txt and photo.bin: all three, complete.
+	eventually(t, "relay stored every change", func() bool { return relayHolds(r, 3) })
 	a.stop() // A goes away before B ever existed on the network
 
 	b.start(t, a, r)
@@ -299,7 +323,8 @@ func TestRelayDeliversToAbsentDeviceThenForgets(t *testing.T) {
 	if err := os.Remove(a.path("notes/todo.txt")); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "relay stores new change", func() bool { return storeHasBlocks(r) })
+	// later.txt and the deletion of notes/todo.txt.
+	eventually(t, "relay stores both new changes", func() bool { return relayHolds(r, 2) })
 	a.stop()
 	b.start(t, a, r)
 	eventually(t, "B got new file and deletion", func() bool {

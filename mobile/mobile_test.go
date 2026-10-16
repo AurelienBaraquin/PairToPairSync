@@ -310,3 +310,70 @@ func TestRing(t *testing.T) {
 		t.Fatalf("ring: %q", got)
 	}
 }
+
+// Removing a folder while the relay runs must not leave data behind: the engine
+// still had the folder open and could have written to it again after deletion.
+func TestRemoveFolderWhileRunningLeavesNothingBehind(t *testing.T) {
+	pc := newComputer(t)
+	home, storage := newPhone(t)
+	_, err := Pair(home, pc.invite(t, true, 0), storage, 0)
+	must(t, err)
+	must(t, Start(home))
+	dir := filepath.Join(storage, "docs")
+	eventually(t, "relay created its store", func() bool { _, e := os.Stat(filepath.Join(dir, "blocks")); return e == nil })
+
+	must(t, RemoveFolder(home, "docs"))
+	time.Sleep(4 * time.Second) // longer than the supervisor tick: nothing may reappear
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("storage reappeared after RemoveFolder: %v", err)
+	}
+	if !IsRunning() {
+		t.Fatal("the relay itself must keep running")
+	}
+}
+
+// Concurrent edits and pairing must not lose each other's changes.
+func TestConcurrentEditsDoNotLoseUpdates(t *testing.T) {
+	pc := newComputer(t)
+	home, storage := newPhone(t)
+	_, err := Pair(home, pc.invite(t, true, 0), storage, 0)
+	must(t, err)
+	done := make(chan error, 20)
+	for i := 0; i < 20; i++ {
+		go func(i int) {
+			if i%2 == 0 {
+				done <- SetQuota(home, "docs", int64(100+i))
+			} else {
+				done <- SetRetentionHours(home, "docs", 10+i)
+			}
+		}(i)
+	}
+	for i := 0; i < 20; i++ {
+		must(t, <-done)
+	}
+	cj, _ := ConfigJSON(home)
+	var v struct {
+		Folders []struct {
+			QuotaMB        int64 `json:"quota_mb"`
+			RetentionHours int   `json:"retention_hours"`
+		}
+	}
+	_ = json.Unmarshal([]byte(cj), &v)
+	// 18 is the last even i writing quota (100+18), 19 the last odd writing retention (10+19).
+	if len(v.Folders) != 1 || v.Folders[0].QuotaMB < 100 || v.Folders[0].RetentionHours < 11 {
+		t.Fatalf("an update was lost or the file corrupted: %s", cj)
+	}
+}
+
+// A configuration change made right after Start returns (a pairing completing as
+// the relay starts) must not be mistaken for the version the engine already runs.
+func TestChangeRightAfterStartIsNotMissed(t *testing.T) {
+	for i := 0; i < 4; i++ {
+		home, _ := newPhone(t)
+		must(t, Start(home))
+		first := currentApp()
+		must(t, SetDeviceName(home, fmt.Sprintf("Immediate%d", i)))
+		eventually(t, "the immediate change was picked up", func() bool { a := currentApp(); return a != nil && a != first })
+		Stop()
+	}
+}

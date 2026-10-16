@@ -40,6 +40,17 @@ var (
 
 const fetchWorkers = 4
 
+// deliveredTTL bounds how long a delivery is remembered; deliveredMax bounds the table.
+var (
+	deliveredTTL = 24 * time.Hour
+	deliveredMax = 20000
+)
+
+type delivery struct {
+	Version model.Vector `json:"version"`
+	At      time.Time    `json:"at"`
+}
+
 // Pending is one change waiting to be delivered to every full device.
 type Pending struct {
 	Entry protocol.SealedEntry `json:"entry"`
@@ -54,11 +65,16 @@ type Relay struct {
 	dir  string
 	log  *slog.Logger
 
-	mu       sync.Mutex
-	pending  map[string]*Pending
-	peers    map[string]*node.Peer
-	fetching map[string]bool
-	overflow bool // quota warning already logged
+	mu      sync.Mutex
+	pending map[string]*Pending
+	// delivered remembers, for a day, the version of each change just handed to every
+	// device. Without it, a device announcing a version the relay has already
+	// forgotten (its acknowledgement raced the relay's own probe) would look like a
+	// new change, and the relay would download it again to wait for devices that have it.
+	delivered map[string]delivery
+	peers     map[string]*node.Peer
+	fetching  map[string]bool
+	overflow  bool // quota warning already logged
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -69,7 +85,7 @@ type Relay struct {
 func New(cfg config.Folder, selfID string, log *slog.Logger) *Relay {
 	return &Relay{
 		cfg: cfg, self: selfID, dir: filepath.Clean(cfg.Path), log: log.With("folder", cfg.ID, "role", "relay"),
-		pending: map[string]*Pending{}, peers: map[string]*node.Peer{}, fetching: map[string]bool{},
+		pending: map[string]*Pending{}, delivered: map[string]delivery{}, peers: map[string]*node.Peer{}, fetching: map[string]bool{},
 		wake: make(chan struct{}, 1),
 	}
 }
@@ -91,6 +107,12 @@ func (r *Relay) Start(ctx context.Context) error {
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	if b, err := os.ReadFile(filepath.Join(r.dir, "delivered.json")); err == nil {
+		_ = json.Unmarshal(b, &r.delivered) // best effort: a lost table only costs a redundant fetch
+		if r.delivered == nil {
+			r.delivered = map[string]delivery{}
+		}
 	}
 	r.ctx, r.cancel = context.WithCancel(ctx)
 	r.mu.Lock()
@@ -124,6 +146,12 @@ func (r *Relay) PeerUp(p *node.Peer) {
 		return // relays do not exchange with each other
 	}
 	r.mu.Lock()
+	select {
+	case <-p.Done(): // the session ended (or was replaced) before PeerUp ran: do not register it
+		r.mu.Unlock()
+		return
+	default:
+	}
 	r.peers[p.ID()] = p
 	out := r.announceableLocked(p.ID())
 	r.mu.Unlock()
@@ -196,31 +224,43 @@ func (r *Relay) HandleIndex(p *node.Peer, idx protocol.Index) {
 	if len(idx.Entries) > 0 {
 		r.log.Warn("refusing plaintext entries: this device only accepts encrypted ones", "from", p.Name())
 	}
-	var announce []string
+	announce := r.ingest(p.ID(), idx.Sealed)
+	r.announce(announce...)
+	r.kick()
+}
+
+// ingest records sealed changes announced by the full device `from` and returns
+// the IDs that should be announced to the other devices.
+func (r *Relay) ingest(from string, entries []protocol.SealedEntry) (announce []string) {
 	r.mu.Lock()
-	for _, e := range idx.Sealed {
+	defer r.mu.Unlock()
+	for _, e := range entries {
 		if !validSealed(e) {
 			continue
+		}
+		if d, ok := r.delivered[e.ID]; ok && d.Version.Dominates(e.Version) {
+			continue // already delivered to everyone: a late acknowledgement, not a new change
 		}
 		cur := r.pending[e.ID]
 		switch {
 		case cur == nil:
-			r.pending[e.ID] = r.newPendingLocked(e, p.ID())
+			r.pending[e.ID] = r.newPendingLocked(e, from)
+			delete(r.delivered, e.ID)
 			announce = append(announce, e.ID)
 		default:
 			switch cur.Entry.Version.Compare(e.Version) {
 			case model.Equal:
-				cur.Acked[p.ID()] = true
+				cur.Acked[from] = true
 			case model.Greater:
-				announce = append(announce, e.ID) // peer is behind: tell it
+				announce = append(announce, e.ID) // the sender is behind: tell it
 			case model.Lesser:
-				r.pending[e.ID] = r.newPendingLocked(e, p.ID())
+				r.pending[e.ID] = r.newPendingLocked(e, from)
 				announce = append(announce, e.ID)
 			case model.Concurrent:
 				// Keep only the canonical winner; the loser's device receives the
 				// winner and preserves its own file as a conflict copy.
 				if e.WinsOver(cur.Entry) {
-					r.pending[e.ID] = r.newPendingLocked(e, p.ID())
+					r.pending[e.ID] = r.newPendingLocked(e, from)
 				}
 				announce = append(announce, e.ID)
 			}
@@ -228,9 +268,7 @@ func (r *Relay) HandleIndex(p *node.Peer, idx protocol.Index) {
 	}
 	r.gcBlocksLocked()
 	r.saveLocked() // durable before the node acknowledges the index
-	r.mu.Unlock()
-	r.announce(announce...)
-	r.kick()
+	return announce
 }
 
 func (r *Relay) newPendingLocked(e protocol.SealedEntry, from string) *Pending {
@@ -330,10 +368,12 @@ func (r *Relay) evaluate() {
 			removed = true
 		case len(expected) > 0 && allAcked(pd, expected):
 			r.log.Info("change delivered to every device, removed from relay", "change", short(name))
+			r.delivered[name] = delivery{Version: pd.Entry.Version.Clone(), At: now}
 			delete(r.pending, name)
 			removed = true
 		}
 	}
+	r.pruneDeliveredLocked(now)
 	var toFetch []string
 	for name, pd := range r.pending {
 		if pd.Have || r.fetching[name] {
@@ -354,6 +394,24 @@ func (r *Relay) evaluate() {
 		r.saveLocked()
 	}
 	r.mu.Unlock()
+}
+
+func (r *Relay) pruneDeliveredLocked(now time.Time) {
+	for id, d := range r.delivered {
+		if now.Sub(d.At) > deliveredTTL {
+			delete(r.delivered, id)
+		}
+	}
+	for len(r.delivered) > deliveredMax { // drop the oldest
+		var oldest string
+		var at time.Time
+		for id, d := range r.delivered {
+			if oldest == "" || d.At.Before(at) {
+				oldest, at = id, d.At
+			}
+		}
+		delete(r.delivered, oldest)
+	}
 }
 
 func allAcked(pd *Pending, expected []string) bool {
@@ -388,7 +446,7 @@ func (r *Relay) fetch(name string, pd *Pending) {
 	r.mu.Lock()
 	var src *node.Peer
 	for id := range pd.Acked {
-		if p := r.peers[id]; p != nil {
+		if p := r.peers[id]; p != nil && alive(p) {
 			src = p
 			break
 		}
@@ -543,6 +601,12 @@ func (r *Relay) saveLocked() {
 	if err != nil {
 		r.log.Error("cannot save pending changes", "err", err)
 	}
+	if db, derr := json.Marshal(r.delivered); derr == nil {
+		dpath := filepath.Join(r.dir, "delivered.json")
+		if os.WriteFile(dpath+".tmp", db, 0o600) == nil {
+			_ = os.Rename(dpath+".tmp", dpath)
+		}
+	}
 }
 
 func short(id string) string {
@@ -570,4 +634,15 @@ func validSealed(e protocol.SealedEntry) bool {
 		}
 	}
 	return true
+}
+
+// alive reports whether a session is still open. A table entry can briefly
+// outlive its connection; never pick it as a source.
+func alive(p *node.Peer) bool {
+	select {
+	case <-p.Done():
+		return false
+	default:
+		return true
+	}
 }

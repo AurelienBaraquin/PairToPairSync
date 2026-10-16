@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -28,8 +29,13 @@ type Identity struct {
 	ID     string // canonical device ID (== PeerID.String())
 }
 
+var keyMu sync.Mutex // the UI polls the ID while the first start creates the key
+
 // LoadOrCreate reads the private key stored in dir, generating it on first use.
+// The key file is written atomically: a crash can never leave a truncated key.
 func LoadOrCreate(dir string) (*Identity, error) {
+	keyMu.Lock()
+	defer keyMu.Unlock()
 	path := filepath.Join(dir, keyFile)
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -43,7 +49,11 @@ func LoadOrCreate(dir string) (*Identity, error) {
 		if err = os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
 		}
-		if err = os.WriteFile(path, raw, 0o600); err != nil {
+		tmp := path + ".tmp"
+		if err = os.WriteFile(tmp, raw, 0o600); err != nil {
+			return nil, err
+		}
+		if err = os.Rename(tmp, path); err != nil {
 			return nil, err
 		}
 	} else if err != nil {
@@ -64,6 +74,12 @@ func LoadOrCreate(dir string) (*Identity, error) {
 func Normalize(id string) (string, error) {
 	pid, err := peer.Decode(strings.TrimSpace(id))
 	if err != nil {
+		return "", fmt.Errorf("invalid device ID %q", id)
+	}
+	// A real ID embeds an Ed25519 public key: a truncated or mistyped string that
+	// merely parses as a hash is not a device.
+	pub, err := pid.ExtractPublicKey()
+	if err != nil || pub.Type() != crypto.Ed25519 {
 		return "", fmt.Errorf("invalid device ID %q", id)
 	}
 	return pid.String(), nil

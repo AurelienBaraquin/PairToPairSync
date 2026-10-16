@@ -99,4 +99,30 @@ class ModelsTest {
         assertEquals("1.5 MB", formatBytes(1_500_000))
         assertEquals("2.0 GB", formatBytes(2_000_000_000))
     }
+
+    private fun codeWith(mutate: (JSONObject) -> Unit): String {
+        val payload = fixture("invite.txt").removePrefix(INVITE_PREFIX)
+        val obj = JSONObject(String(Base64.getUrlDecoder().decode(payload)))
+        mutate(obj)
+        return INVITE_PREFIX + Base64.getUrlEncoder().withoutPadding().encodeToString(obj.toString().toByteArray())
+    }
+
+    @Test
+    fun hostileTextIsNeutralisedBeforeItReachesTheConfirmationDialog() {
+        // A right-to-left override can make "evil" look like something else; control characters can hide text.
+        val inv = parseInvite(codeWith {
+            it.put("n", "\u202Eevil\u202C PC\u0000\n")
+            it.put("l", "x".repeat(500))
+        })!!
+        assertEquals("evil PC", inv.inviterName)
+        assertTrue(inv.label.length <= 48)
+        assertTrue(inv.shortId.endsWith("…") && inv.shortId.length == 13)
+    }
+
+    @Test
+    fun refusesPaddedBase64LikeTheEngineDoes() {
+        // Java's decoder tolerates "=", Go's RawURLEncoding does not: do not show a dialog that cannot succeed.
+        val padded = fixture("invite.txt") + "="
+        assertNull(parseInvite(padded))
+    }
 }
