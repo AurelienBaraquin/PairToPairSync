@@ -47,15 +47,17 @@ Prérequis : JDK 17+, Go, Android SDK (plateforme 36) + NDK 27, `gomobile`.
 
 ```sh
 export ANDROID_HOME=~/Android/Sdk
-go install golang.org/x/mobile/cmd/gomobile@latest golang.org/x/mobile/cmd/gobind@latest
-./android/scripts/build-aar.sh          # moteur Go -> android/app/libs/p2psync.aar (arm64 + x86_64)
+go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind   # version épinglée par go.mod
+./android/scripts/build-aar.sh          # moteur Go -> android/app/libs/p2psync.aar (arm64)
 cd android && ./gradlew assembleDebug   # -> app/build/outputs/apk/debug/app-debug.apk
 ./gradlew testDebugUnitTest lintDebug
 ```
 
-L'APK de debug embarque deux architectures (~75 Mo). Pour une version allégée, ne gardez que `arm64-v8a`
-dans `abiFilters` (`app/build.gradle.kts`) et relancez `build-aar.sh` avec `-target=android/arm64`.
-Signature de release : à configurer avec votre propre clé (rien n'est fourni).
+Seule l'architecture arm64 est livrée (les téléphones actuels) ; l'émulateur x86 n'est donc pas pris en charge.
+La bibliothèque native est alignée sur des pages de 16 Ko (Android 15+) et l'APK est vérifié avec `zipalign -P 16`.
+Signature de release : définissez `P2PSYNC_KEYSTORE`, `P2PSYNC_KEYSTORE_PASSWORD`, `P2PSYNC_KEY_ALIAS` (et
+éventuellement `P2PSYNC_KEY_PASSWORD`) avant `./gradlew assembleRelease` ; sans eux l'APK reste non signé. Aucune clé
+n'est fournie.
 
 ## Ce qui est vérifié, ce qui ne l'est pas
 
@@ -68,6 +70,9 @@ appareil : le scanner caméra, le service au premier plan et ses restrictions se
 découverte mDNS, le comportement sur batterie et la reprise après redémarrage.
 
 ## Limites
+
+- Pas de verrou Wi‑Fi (`WifiLock`) : quand l'écran est éteint, certains téléphones coupent la radio Wi‑Fi et le relais
+  n'est alors joignable que par intermittence. À mesurer sur appareil avant d'ajouter ce verrou (coût en batterie).
 
 - Le téléphone est **relais seulement** : une copie complète demanderait l'accès à tout le stockage.
 - Les interfaces sont en anglais et en français ; le reste du monde reçoit l'anglais.

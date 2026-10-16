@@ -32,6 +32,9 @@ var RedialMax time.Duration
 // NodeHook lets tests adjust the network options (e.g. force reachability).
 var NodeHook func(*node.Options)
 
+// LocalIPs, if set, supplies the device's interface addresses (see node.Options.LocalIPs).
+var LocalIPs func() []string
+
 // DefaultHome returns the per-user directory holding config, identity and indexes.
 func DefaultHome() (string, error) {
 	if h := os.Getenv("P2PSYNC_HOME"); h != "" {
@@ -85,7 +88,7 @@ func Start(ctx context.Context, home string, cfg *config.Config, id *identity.Id
 	}
 
 	opts := node.Options{Config: cfg, Identity: id, Handlers: a.handlers, Logger: log, RedialMax: RedialMax,
-		Pairing: newPairer(home, log)}
+		Pairing: newPairer(home, log), LocalIPs: LocalIPs}
 	if NodeHook != nil {
 		NodeHook(&opts)
 	}

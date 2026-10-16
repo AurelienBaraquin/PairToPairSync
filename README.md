@@ -14,41 +14,55 @@ jamais une copie du dossier, n'est pas un stockage permanent, et **ne peut rien 
    modifie un fichier ┘     garde un blob chiffré └── le reçoit, le relais l'efface
 ```
 
+## Plateformes
+
+| Plateforme | Rôle | Livré |
+|---|---|---|
+| **Windows x64** | appareil complet (copie du dossier) | `p2psync.exe` (ligne de commande) et `p2psyncd.exe` (démon sans fenêtre) : `make windows` |
+| **Android (arm64)** | relais temporaire | application dans [`android/`](android/README.md) |
+
+Le code est écrit en Go portable et ses tests tournent sous Linux (c'est là qu'ils sont exécutés ici),
+mais seuls Windows x64 et Android arm64 sont des cibles livrées et maintenues.
+
 ## Un dossier comme les autres
 
-Le dossier synchronisé est **un vrai dossier sur le disque** : il s'ouvre dans l'Explorateur Windows,
-le Finder ou n'importe quel gestionnaire de fichiers, fonctionne hors-ligne et avec tous vos logiciels.
-Un démon en arrière-plan surveille les changements (inotify / FSEvents / ReadDirectoryChangesW) et
-synchronise en une fraction de seconde. Pas de lecteur virtuel, pas de format propriétaire.
+Le dossier synchronisé est **un vrai dossier sur le disque** : il s'ouvre dans l'Explorateur de fichiers
+et fonctionne hors-ligne avec tous vos logiciels. Un démon en arrière-plan surveille les changements
+(ReadDirectoryChangesW sous Windows) et synchronise en une fraction de seconde. Pas de lecteur virtuel,
+pas de format propriétaire. Le dossier de service `.p2psync` (marqueur, téléchargements en cours) est
+masqué. Les noms de fichiers que Windows refuse (`CON`, `aux.txt`, `:`, `?`, point ou espace final…) sont
+signalés et non synchronisés plutôt que mal écrits ; deux noms qui ne diffèrent que par la casse sont
+traités comme conflit sur un disque Windows.
 
 ## Démarrage rapide (avec QR code)
 
 ```sh
-go build -o p2psync ./cmd/p2psync        # ou: make build   (binaire unique)
+make windows                             # dist\p2psync.exe et dist\p2psyncd.exe (ou: go build ./cmd/p2psync)
 
 # Sur le premier appareil (le PC) : créer le dossier et lancer le démon
 p2psync init --name pc
-p2psync folder add ~/Documents/Projets --id projets
-p2psync run
+p2psync folder add "C:\Users\moi\Documents\Projets" --id projets
+p2psync run                              # en continu ; --log fichier.log pour écrire le journal dans un fichier
+
+# Démarrage automatique à l'ouverture de session (tâche planifiée, sans fenêtre) :
+#   powershell -ExecutionPolicy Bypass -File packaging\windows-autostart.ps1 -Exe C:\Outils\p2psyncd.exe
 
 # Inviter le portable (copie complète) : un QR code s'affiche
 p2psync invite
-#   Sur le portable :   p2psync pair <texte du QR> --path ~/Projets
+#   Sur le portable :   p2psync pair <texte du QR> --path "D:\Projets"
 
 # Inviter le téléphone comme relais temporaire
 p2psync invite --as-relay
-#   Application Android : « Scanner un QR code »   (ou, en ligne de commande / Termux :
-#                          p2psync pair <texte du QR> --path ~/relais)
+#   Application Android : « Scanner un QR code »
 
 # Pour que le portable aussi passe par le téléphone, le téléphone l'invite à son tour
-#   (téléphone) p2psync invite     ->     (portable) p2psync pair <texte du QR>
+#   (application, « Inviter un appareil »)     ->     (portable) p2psync pair <texte du QR>
 ```
 
 Le QR code est aussi disponible dans la page d'état locale : `p2psync ui` affiche son lien (il contient un
 jeton d'accès propre à votre session, lu dans un fichier `0600` — un autre compte de la machine ne peut
-ni lire l'état ni créer d'invitation), bouton « Inviter un appareil ». Un téléphone scanne le QR avec son appareil photo ; le texte qu'il affiche
-(`p2psync://pair/…`) se colle dans `p2psync pair`. Une future application Android pourra ouvrir ce lien
-directement.
+ni lire l'état ni créer d'invitation), bouton « Inviter un appareil ». L'application Android scanne ce QR directement (ou ouvre un lien `p2psync://pair/…`, toujours après
+confirmation). Ports par défaut : 22100 (UDP+TCP) pour la synchronisation, 127.0.0.1:8484 pour la page locale.
 
 **Ce que fait un scan.** L'invitation contient l'ID de l'appareil invitant, de quoi le joindre et un
 **jeton aléatoire de 128 bits, valable 10 minutes, utilisable une seule fois**. L'invité se connecte à
@@ -59,8 +73,9 @@ n'est à recopier à la main. Traitez le QR comme un mot de passe : quiconque le
 peut rejoindre le dossier. Un appareil qui présente 3 jetons erronés est
 refusé pendant 10 minutes, sans pouvoir gêner les autres invités.
 
-Le démon recharge `config.json` tout seul. Les commandes manuelles (`device add`, `folder add --secret`,
-`folder add-relay`…) restent disponibles : voir `p2psync` sans argument.
+Le démon recharge `config.json` tout seul. Si `config.json` devient illisible, le démon
+garde la configuration qui tournait et le dit dans le journal. Les commandes manuelles (`device add`,
+`folder add --secret-file`, `folder add-relay`…) restent disponibles : voir `p2psync` sans argument.
 
 ## Sécurité
 
@@ -74,7 +89,7 @@ Le démon recharge `config.json` tout seul. Les commandes manuelles (`device add
 | Appairage | Invitation à usage unique (128 bits, 10 min). Les inconnus ne sont acceptés **que pendant une invitation**, 6 au plus (2 par adresse IP), 15 s au plus, un seul échange à la fois, et ne peuvent faire qu'une chose : présenter le jeton (requête limitée à 4 Ko). L'annuaire DHT leur est fermé. |
 | Contenu venu d'un autre appareil | Identifiants de dossier, noms et libellés sont validés/filtrés (pas de `/`, `..`, ni balisage) ; un invité vérifie la réponse de l'invitant avant d'appliquer quoi que ce soit. |
 | Page locale | `127.0.0.1` seulement ; jeton d'accès obligatoire ; refuse tout `Host` non local (anti DNS-rebinding) ; création d'invitation = POST JSON de même origine ; aucun script en ligne, texte inséré via `textContent`, politique CSP stricte. |
-| Fichiers de config | `config.json`, clé, index : permissions `0600`. |
+| Fichiers de config | `config.json`, clé, index : permissions `0600` ; sous Windows, le dossier de données (`%LOCALAPPDATA%\p2psync`) n'est accessible qu'à votre compte (liste d'accès non héritée). Écritures atomiques et synchronisées sur disque. |
 
 **Le relais est aveugle.** Tous les appareils *complets* d'un dossier partagent un secret de 256 bits que
 le relais n'a jamais (la configuration d'un relais refuse même d'en contenir un). Ce qui est remis au
@@ -85,7 +100,7 @@ peut pas injecter ou modifier un fichier (testé). Un téléphone perdu ou saisi
 approximatives, dates, compteurs de version, et que deux blocs sont identiques.
 
 **Ce que le chiffrement ne couvre pas.** Le dossier synchronisé lui-même est un dossier normal, en clair sur
-vos disques : activez le chiffrement du disque (BitLocker, FileVault, LUKS). Un appareil *complet*
+vos disques : activez le chiffrement du disque (BitLocker). Un appareil *complet*
 compromis voit tout (il est de confiance par définition). La découverte sur le réseau local (mDNS) annonce
 la présence de l'ID de votre appareil ; désactivez-la avec `"lan_discovery": false` si cela vous gêne.
 Le secret du dossier se trouve dans `config.json` des appareils complets : protégez ce fichier.
@@ -139,18 +154,23 @@ Fichier `.p2pignore` à la racine du dossier (`*.tmp`, `build/`, `/brouillons/*`
 
 - **Ce qui est testé** : tests de bout en bout sous Linux avec `-race` (synchro directe, conflits, relais
   aveugle, falsification, reprise après coupure, connexion à travers un appareil-relais, annuaire DHT,
-  quota, appareil inconnu). **Non testé en conditions réelles** : mDNS (ne fonctionne pas dans mon
-  environnement de test), UPnP/NAT-PMP, et le perçage de NAT entre vraies box — ce sont les fonctions
-  éprouvées de libp2p, mais je n'ai pas pu les valider sur de vrais réseaux. Windows/macOS/ARM sont
-  compilés en CI mais pas exécutés.
+  quota, appareil inconnu, données hostiles d'un pair, index corrompu, relais qui redémarre). Un audit
+  indépendant (4 relectures + `govulncheck` + `staticcheck`) a été mené et ses constats vérifiés puis corrigés.
+- **Windows n'a jamais été exécuté par moi.** Le code propre à Windows (renommage avec nouvelles tentatives
+  sur « fichier utilisé », liste d'accès, attribut masqué, noms insensibles à la casse) compile et passe
+  `go vet`, et la CI exécute les tests sur un runner `windows-latest` : c'est cette exécution, pas ce texte,
+  qui en fait foi. Je n'ai pas pu tester non plus l'Explorateur, les antivirus ni les fichiers OneDrive.
+- **Non testé en conditions réelles** : mDNS, UPnP/NAT-PMP et le perçage de NAT entre vraies box. Ce sont
+  les fonctions de libp2p, mais je n'ai pas pu les valider sur de vrais réseaux.
 - **Téléphone** : une **application Android native** est fournie dans [`android/`](android/README.md)
-  (Kotlin/Compose, scan de QR code, service au premier plan, mode Wi‑Fi uniquement). Elle compile (APK, tests
-  JVM, lint) mais **n'a jamais été exécutée sur un téléphone ni un émulateur** : à valider sur appareil.
+  (Kotlin/Compose, scan de QR code, service au premier plan, mode Wi‑Fi uniquement, arm64). Elle compile (APK,
+  tests JVM, lint, bibliothèque alignée pour les pages mémoire de 16 Ko) mais **n'a jamais été exécutée sur un
+  téléphone ni un émulateur** : à valider sur appareil, en particulier la caméra, le service au premier plan
+  et l'économie d'énergie constructeur (Doze).
 - L'index complet est échangé à chaque connexion entre appareils complets ; les suppressions ne sont
   jamais purgées ; pas de détection de renommage (retransfert complet) ; liens symboliques ignorés ; pas de
   corbeille/versionnage ; seuls les bits de permission sont propagés.
-- Le scan du QR se fait avec l'appareil photo d'un téléphone puis un copier-coller du texte : il n'y a pas
-  encore d'application mobile qui scanne et appaire en un geste. Pas de rotation du secret du dossier.
+- Pas de rotation du secret du dossier.
 - Un appairage est bilatéral (deux appareils) : relier trois appareils demande plusieurs invitations
   (A↔B, A↔relais, B↔relais), comme dans l'exemple ci-dessus.
 
@@ -159,6 +179,8 @@ Détails techniques : [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Développement
 
 ```sh
-make test      # go test ./... -race     (Go 1.26)
-make dist      # binaires pour Linux/Windows/macOS (amd64/arm64)
+make test      # go test ./... -race     (Go 1.26.9, versions épinglées dans go.mod)
+make check     # gofmt + go vet (Linux et Windows) + tests
+make windows   # dist/p2psync.exe + dist/p2psyncd.exe
+make android   # bibliothèque Go (gomobile) + tests JVM + lint + APK de debug
 ```

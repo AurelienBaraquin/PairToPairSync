@@ -5,7 +5,7 @@
 // directory and forgets them once every full device has them. All state lives
 // under the `home` directory the app passes in (its private files directory).
 //
-//	gomobile bind -target=android/arm64,android/amd64 -androidapi 26 \
+//	gomobile bind -target=android/arm64 -androidapi 26 \
 //	    -ldflags="-checklinkname=0" -o p2psync.aar github.com/aurelienbaraquin/pairtopairsync/mobile
 package mobile
 
@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,17 @@ import (
 	"github.com/aurelienbaraquin/pairtopairsync/internal/pairing"
 )
 
+// guard turns a panic inside the engine into an error: the Go runtime lives in the
+// app's process, so an unrecovered panic would kill the whole app.
+func guard(err *error) {
+	if r := recover(); r != nil {
+		*err = fmt.Errorf("internal error: %v", r)
+	}
+}
+
+// quiet is guard for functions that return no error.
+func quiet() { _ = recover() }
+
 // Version of the embedded engine.
 func Version() string { return "0.3.0" }
 
@@ -33,7 +45,8 @@ func Version() string { return "0.3.0" }
 
 // Init creates the identity and a default configuration on first use and returns
 // the device ID. It is idempotent.
-func Init(home, deviceName string) (string, error) {
+func Init(home, deviceName string) (res string, err error) {
+	defer guard(&err)
 	id, err := app.Init(home, config.Clean(deviceName), 0, "-") // "-": no local web page on a phone
 	if err != nil {
 		return "", err
@@ -43,6 +56,7 @@ func Init(home, deviceName string) (string, error) {
 
 // DeviceID returns this device's ID ("" if not initialised).
 func DeviceID(home string) string {
+	defer quiet()
 	id, err := identity.LoadOrCreate(home)
 	if err != nil {
 		return ""
@@ -56,7 +70,8 @@ func DeviceID(home string) string {
 // only be a relay, so the invitation must have been created with "--as-relay"
 // (or "as relay" in the page). storageDir is where undelivered changes are kept
 // temporarily. It returns a small JSON summary for the UI.
-func Pair(home, code, storageDir string, quotaMB int64) (string, error) {
+func Pair(home, code, storageDir string, quotaMB int64) (res string, err error) {
+	defer guard(&err)
 	inv, err := pairing.Decode(code)
 	if err != nil {
 		return "", err
@@ -114,7 +129,8 @@ func Pair(home, code, storageDir string, quotaMB int64) (string, error) {
 // NewInvite creates a single-use invitation for a full device that should use
 // this phone as its relay (the phone shows the QR, the computer scans it with
 // `p2psync pair`). The engine must be running. It returns the invitation text.
-func NewInvite(home, folderID string) (string, error) {
+func NewInvite(home, folderID string) (res string, err error) {
+	defer guard(&err)
 	mu.Lock()
 	r := current
 	mu.Unlock()
@@ -153,7 +169,8 @@ type folderView struct {
 }
 
 // ConfigJSON describes devices and folders for the UI. It never contains secrets.
-func ConfigJSON(home string) (string, error) {
+func ConfigJSON(home string) (res string, err error) {
+	defer guard(&err)
 	cfg, err := app.LoadConfig(home)
 	if err != nil {
 		return "", err
@@ -185,6 +202,7 @@ func ConfigJSON(home string) (string, error) {
 }
 
 func edit(home string, fn func(*config.Config) error) (err error) {
+	defer guard(&err)
 	app.WithConfigLock(func() {
 		var cfg *config.Config
 		if cfg, err = app.LoadConfig(home); err != nil {
@@ -227,9 +245,10 @@ func RemoveDevice(home, deviceID string) error {
 }
 
 // RemoveFolder stops relaying a folder and deletes everything stored for it.
-func RemoveFolder(home, folderID string) error {
+func RemoveFolder(home, folderID string) (err error) {
+	defer guard(&err)
 	var path string
-	err := edit(home, func(c *config.Config) error {
+	err = edit(home, func(c *config.Config) error {
 		var keep []config.Folder
 		for _, f := range c.Folders {
 			if f.ID == folderID {
@@ -353,7 +372,8 @@ func startApp(ctx context.Context, home string, log *slog.Logger) (*app.App, err
 
 // Start runs the relay. It returns once the engine is listening; a supervisor
 // then keeps it running until Stop.
-func Start(home string) error {
+func Start(home string) (err error) {
+	defer guard(&err)
 	mu.Lock()
 	defer mu.Unlock()
 	if current != nil {
@@ -443,6 +463,7 @@ func (r *runner) supervise(ctx context.Context, stamp stamp) {
 
 // Stop shuts the relay down and waits for it.
 func Stop() {
+	defer quiet()
 	mu.Lock()
 	r := current
 	current = nil
@@ -460,6 +481,7 @@ func Stop() {
 // Restart makes the engine rebind and redial; call it when the network changed
 // (new Wi-Fi, mobile data, VPN).
 func Restart() {
+	defer quiet()
 	mu.Lock()
 	r := current
 	mu.Unlock()
@@ -483,6 +505,7 @@ func IsRunning() bool {
 
 // StatusJSON returns what the UI shows: relay state, peers, addresses.
 func StatusJSON() string {
+	defer quiet()
 	mu.Lock()
 	r := current
 	mu.Unlock()
@@ -497,5 +520,36 @@ func StatusJSON() string {
 	return string(b)
 }
 
+// SetLocalAddrs tells the engine which addresses this phone's network interfaces
+// have (comma-separated IPs, from the system's LinkProperties). Android hides
+// interface lists from apps on some versions; without this the phone could not
+// announce an address a computer on the same Wi-Fi can reach. Call it before
+// Start and whenever the network changes.
+func SetLocalAddrs(csv string) {
+	defer quiet()
+	var ips []string
+	for _, s := range strings.Split(csv, ",") {
+		if s = strings.TrimSpace(s); s != "" && len(ips) < 16 {
+			ips = append(ips, s)
+		}
+	}
+	localMu.Lock()
+	localIPs = ips
+	localMu.Unlock()
+}
+
+var (
+	localMu  sync.Mutex
+	localIPs []string
+)
+
+func init() {
+	app.LocalIPs = func() []string {
+		localMu.Lock()
+		defer localMu.Unlock()
+		return append([]string(nil), localIPs...)
+	}
+}
+
 // Logs returns the most recent log lines, for the in-app diagnostics screen.
-func Logs() string { return logs.String() }
+func Logs() string { defer quiet(); return logs.String() }

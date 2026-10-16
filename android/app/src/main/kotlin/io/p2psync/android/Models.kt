@@ -120,8 +120,8 @@ data class InviteInfo(
     fun expired(nowMs: Long = System.currentTimeMillis()) = nowMs / 1000 > expiresAtSec
     val shownName get() = inviterName.ifBlank { shortId }
     val shownFolder get() = label.ifBlank { folder }
-    /** The start of the inviter's ID: names are free text, the ID is what actually identifies a device. */
-    val shortId get() = inviterId.take(12) + "…"
+    /** The start and end of the inviter's ID (all IDs begin alike): names are free text, the ID is what actually identifies a device. */
+    val shortId get() = if (inviterId.length <= 14) inviterId else inviterId.take(6) + "…" + inviterId.takeLast(6)
 }
 
 // Text in a QR code is chosen by whoever made it. Before it is shown in a

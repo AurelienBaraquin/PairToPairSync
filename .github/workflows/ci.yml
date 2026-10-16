@@ -1,37 +1,66 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with: { go-version: "1.26" }
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with: { go-version-file: go.mod }
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test ./... -race -count=1
-      - name: cross-compile
+      - name: Windows build and vet
         run: |
-          for t in linux/amd64 linux/arm64 windows/amd64 darwin/arm64 darwin/amd64; do
-            GOOS=${t%/*} GOARCH=${t#*/} go build -o /dev/null ./cmd/p2psync
-          done
-          GOOS=android GOARCH=arm64 go build -ldflags=-checklinkname=0 -o /dev/null ./cmd/p2psync
+          GOOS=windows GOARCH=amd64 go vet ./...
+          make windows
+      # GO-2024-3218 (content routing on the *public* IPFS DHT) has no fix and does not apply:
+      # the DHT here is private, limited to configured devices, with providers and values off.
+      # Anything else fails the build.
+      - name: Known vulnerabilities
+        run: |
+          out=$(go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./... || true)
+          echo "$out"
+          other=$(echo "$out" | grep -oE '^Vulnerability #[0-9]+: GO-[0-9]+-[0-9]+' | grep -v 'GO-2024-3218' || true)
+          test -z "$other"
+
+  # The code that touches the Windows file system (renames, access lists, hidden
+  # attribute, case-insensitive names) only really runs here.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with: { go-version-file: go.mod }
+      - run: go test ./... -count=1
 
   android:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with: { go-version: "1.26" }
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with: { go-version-file: go.mod }
+      - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "21" }
-      - uses: android-actions/setup-android@v3
+      # The runner image already ships the Android SDK (ANDROID_HOME).
       - name: SDK and NDK
-        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018"
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018"
       - name: Build the engine library
         run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest golang.org/x/mobile/cmd/gobind@latest
+          go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
           ./android/scripts/build-aar.sh
+      - name: Check the library is aligned for 16 KB pages
+        run: |
+          unzip -o -q android/app/libs/p2psync.aar 'jni/*' -d /tmp/aar
+          readelf -lW /tmp/aar/jni/arm64-v8a/libgojni.so | awk '$1=="LOAD" && $NF!="0x4000" && $NF!="0x10000" {bad=1} END {exit bad}'
       - name: APK, unit tests, lint
         working-directory: android
         run: ./gradlew assembleDebug testDebugUnitTest lintDebug

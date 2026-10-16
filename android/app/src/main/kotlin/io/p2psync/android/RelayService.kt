@@ -111,6 +111,7 @@ class RelayService : Service() {
         if (stopping) return
         val allowed = !settings.wifiOnly || onUnmeteredNetwork()
         try {
+            publishLocalAddresses()
             if (allowed) {
                 if (!Mobile.isRunning()) {
                     RelayState.set(Phase.Starting)
@@ -136,6 +137,18 @@ class RelayService : Service() {
 
     private val retry = Runnable {
         if (!stopping) runCatching { worker.execute { reconcile(networkChanged = false) } }
+    }
+
+    /**
+     * Tells the engine which addresses the active network gave this phone. Android
+     * restricts how apps list network interfaces, so this is the reliable source for
+     * the address a computer on the same Wi‑Fi should use.
+     */
+    private fun publishLocalAddresses() {
+        val lp = connectivity.getLinkProperties(connectivity.activeNetwork)
+        val ips = lp?.linkAddresses.orEmpty()
+            .mapNotNull { it.address.hostAddress?.substringBefore('%') }
+        runCatching { Mobile.setLocalAddrs(ips.joinToString(",")) }
     }
 
     private fun onUnmeteredNetwork(): Boolean {

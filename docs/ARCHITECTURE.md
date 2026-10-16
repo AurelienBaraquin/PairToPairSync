@@ -70,11 +70,14 @@ ne peut pas inviter un relais.
 
 ## Application Android (`android/`, `mobile/`)
 
-Le moteur Go est compilé en AAR par `gomobile bind` (arm64 + x86_64) et appelé via la classe générée
+Le moteur Go est compilé en AAR par `gomobile bind` (arm64 seulement, segments alignés sur 16 Ko) et appelé via la classe générée
 `mobile.Mobile`. Frontière volontairement étroite : chaînes JSON (`StatusJSON`, `ConfigJSON`) et entiers ; le
 code Kotlin ne touche jamais aux clés ni au secret (la vue de configuration n'en contient pas, testé des deux
 côtés). `Start` lance un superviseur qui redémarre le moteur quand `config.json` change (appairage, réglages)
-ou sur `Restart()` (changement de réseau). Côté Kotlin, `RelayService` (premier plan, `specialUse`) sérialise
+ou sur `Restart()` (changement de réseau). Chaque fonction exportée récupère les paniques (le runtime Go vit dans
+le processus de l'application : une panique non rattrapée la tuerait). Android restreignant l'énumération des
+interfaces réseau, le service transmet les adresses de la connexion active (`LinkProperties`) via
+`SetLocalAddrs`, que le nœud ajoute aux adresses annoncées (`Options.LocalIPs`). Côté Kotlin, `RelayService` (premier plan, `specialUse`) sérialise
 démarrage/arrêt sur un thread unique, applique « Wi‑Fi uniquement » via un `NetworkCallback` avec
 temporisation, et ne demande jamais l'état du moteur sur le thread principal. Les liens `p2psync://pair/…` ne
 déclenchent qu'une boîte de confirmation (`InviteInfo` est lu côté Kotlin pour l'affichage ; la vraie
@@ -142,3 +145,23 @@ refuse de servir un bloc en clair à un relais.
 Index différentiel entre appareils complets, purge des pierres tombales, détection de renommage, échange
 assisté et rotation du secret (QR code), application Android native, intégration shell (icônes de statut),
 sélection de sous-dossiers, versionnage, validation sur de vrais réseaux (NAT, mDNS, UPnP).
+
+## Robustesse face aux données reçues
+
+Un pair de confiance peut être bogué ou compromis, et le relais est opaque : tout ce qui arrive du réseau est
+validé (`validEntry` : tailles, nombre et taille des blocs, empreintes ; noms de fichiers, y compris les règles
+de Windows). Les trames sont lues par morceaux (jamais d'allocation de la taille annoncée), avec des limites
+propres à chaque message ; les goroutines par connexion, le scan et l'application d'un changement rattrapent
+les paniques. Un changement reçu est **ré-évalué contre la version locale courante**, et une dernière fois
+juste avant de remplacer le fichier : un téléchargement en file ne peut pas écraser une modification locale
+plus récente. Les écritures d'état (index, `pending.json`, config, clé) sont atomiques et synchronisées ; un
+index ou un fichier du relais endommagé est mis de côté (`.corrupt`) au lieu d'empêcher le démarrage.
+Le relais n'acquitte un changement qu'après l'avoir écrit durablement.
+
+## Windows
+
+`internal/fsutil` regroupe ce qui diffère : renommage/suppression avec nouvelles tentatives sur les erreurs
+transitoires (antivirus, indexeur, fichier ouvert), écriture atomique, attribut « masqué » pour `.p2psync`,
+liste d'accès restreinte au compte courant pour le dossier de données. Les dossiers synchronisés ne peuvent
+pas se chevaucher ni contenir le dossier de données (`config.CheckPaths`). Le démon (`p2psyncd.exe`, sous-système
+graphique) ne montre aucune fenêtre ; `run --log` écrit son journal dans un fichier.

@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"net"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -94,6 +95,10 @@ type Options struct {
 	// Reachability forces "public" or "private" instead of auto-detecting
 	// (testing, or a server that knows better).
 	Reachability string
+	// LocalIPs, if set, lists the addresses of this device's network interfaces as the
+	// operating system reports them. Android restricts interface enumeration for apps,
+	// so the app passes them in; they are announced next to what libp2p finds itself.
+	LocalIPs func() []string
 }
 
 type Node struct {
@@ -222,6 +227,9 @@ func (n *Node) libp2pOptions() []libp2p.Option {
 		libp2p.EnableRelay(),
 		libp2p.WithDialTimeout(12 * time.Second),
 	}
+	if n.opts.LocalIPs != nil {
+		opts = append(opts, libp2p.AddrsFactory(n.withLocalIPs))
+	}
 	switch n.opts.Reachability {
 	case "public":
 		opts = append(opts, libp2p.ForceReachabilityPublic())
@@ -255,6 +263,34 @@ func (n *Node) libp2pOptions() []libp2p.Option {
 		}))
 	}
 	return opts
+}
+
+// withLocalIPs adds the interface addresses supplied by the app (on the listen
+// port) to those the host would announce, without duplicates.
+func (n *Node) withLocalIPs(in []ma.Multiaddr) []ma.Multiaddr {
+	out := append([]ma.Multiaddr(nil), in...)
+	port := strconv.Itoa(n.cfg.ListenPort)
+	for _, s := range n.opts.LocalIPs() {
+		ip := net.ParseIP(s)
+		if ip == nil || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLoopback() {
+			continue
+		}
+		proto := "ip4"
+		if ip.To4() == nil {
+			proto = "ip6"
+			if ip.IsLinkLocalUnicast() {
+				continue // needs a zone; useless to a remote device
+			}
+		}
+		for _, suffix := range []string{"/udp/" + port + "/quic-v1", "/tcp/" + port} {
+			a, err := ma.NewMultiaddr("/" + proto + "/" + ip.String() + suffix)
+			if err != nil || slices.ContainsFunc(out, a.Equal) {
+				continue
+			}
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func (n *Node) isKnown(p peer.ID) bool { _, ok := n.known[p]; return ok }

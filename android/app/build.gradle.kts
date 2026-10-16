@@ -14,14 +14,33 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.3.0"
-        // The engine ships native code for these ABIs only (see scripts/build-aar.sh).
-        ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+        // The engine ships native code for 64-bit ARM phones only (see scripts/build-aar.sh).
+        ndk { abiFilters += listOf("arm64-v8a") }
     }
 
+    // No signing key lives in the repository. A release build is signed when the
+    // keystore is given through the environment (CI secrets, or your own shell).
+    val keystore = System.getenv("P2PSYNC_KEYSTORE")
+    signingConfigs {
+        if (keystore != null) {
+            create("release") {
+                storeFile = file(keystore)
+                storePassword = System.getenv("P2PSYNC_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("P2PSYNC_KEY_ALIAS")
+                keyPassword = System.getenv("P2PSYNC_KEY_PASSWORD") ?: System.getenv("P2PSYNC_KEYSTORE_PASSWORD")
+            }
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = false // the Go engine is native; nothing useful to shrink
+            if (keystore != null) signingConfig = signingConfigs.getByName("release")
         }
+    }
+    // Do not embed Google's encrypted dependency metadata blob in the APK.
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

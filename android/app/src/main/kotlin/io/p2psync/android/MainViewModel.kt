@@ -26,7 +26,6 @@ data class UiState(
     val busy: String? = null,
     val notice: Notice? = null,
     val toConfirm: InviteInfo? = null,
-    val confirmExists: Boolean = false, // the folder is already paired on this phone
     val showPaste: Boolean = false,
     val invite: InviteView? = null,
     val logs: String = "",
@@ -81,8 +80,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
         _ui.update {
             if (problem == null) {
-                val exists = it.config?.folders?.any { f -> f.id == info!!.folder } == true
-                it.copy(toConfirm = info, confirmExists = exists, screen = Screen.Home, showPaste = false)
+                it.copy(toConfirm = info, screen = Screen.Home, showPaste = false)
             } else {
                 it.copy(notice = Notice(str(problem), error = true), screen = Screen.Home, showPaste = false)
             }

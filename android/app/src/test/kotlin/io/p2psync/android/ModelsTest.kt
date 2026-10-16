@@ -116,7 +116,7 @@ class ModelsTest {
         })!!
         assertEquals("evil PC", inv.inviterName)
         assertTrue(inv.label.length <= 48)
-        assertTrue(inv.shortId.endsWith("…") && inv.shortId.length == 13)
+        assertTrue(inv.shortId.contains("…") && inv.shortId.length == 13 && inv.shortId.endsWith(inv.inviterId.takeLast(6)))
     }
 
     @Test

@@ -177,8 +177,8 @@ fun AppRoot(vm: MainViewModel, onToggleRelay: (Boolean) -> Unit) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(stringResource(R.string.confirm_body, info.shownFolder))
                     // A name is free text chosen by whoever made the code; the ID is what identifies a device.
-                    Text(stringResource(R.string.confirm_id, info.shortId), fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-                    if (ui.confirmExists) {
+                    Text(stringResource(R.string.confirm_id, info.inviterId), fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                    if (ui.config?.folders?.any { it.id == info.folder } == true) { // looked up now, not when the code arrived
                         Text(
                             stringResource(R.string.confirm_exists, info.shownFolder),
                             color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium,

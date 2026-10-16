@@ -1,12 +1,27 @@
-.PHONY: build test dist
+# Supported targets: Windows x64 and Android (arm64). The code also builds and
+# runs on Linux/macOS, which is how the tests run, but nothing else is shipped.
+.PHONY: build test windows android check
+GOFLAGS_REL = -trimpath -ldflags "-s -w -buildid="
+
 build:
 	go build -o bin/p2psync ./cmd/p2psync
+
 test:
 	go test ./... -race -count=1
-dist:
-	@for t in linux/amd64 linux/arm64 windows/amd64 darwin/arm64 darwin/amd64; do \
-	  os=$${t%/*}; arch=$${t#*/}; ext=; [ $$os = windows ] && ext=.exe; \
-	  GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 go build -ldflags "-s -w" -o dist/p2psync-$$os-$$arch$$ext ./cmd/p2psync; \
-	done
-	# Android needs a linker flag because a libp2p dependency (anet) works around Android's restricted network-interface API.
-	GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w -checklinkname=0" -o dist/p2psync-android-arm64 ./cmd/p2psync
+
+check:
+	test -z "$$(gofmt -l .)"
+	go vet ./...
+	GOOS=windows GOARCH=amd64 go vet ./...
+	go test ./... -race -count=1
+
+# p2psync.exe: the command line. p2psyncd.exe: the same program without a console
+# window, for the logon task (packaging/windows-autostart.ps1).
+windows:
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build $(GOFLAGS_REL) -o dist/p2psync.exe ./cmd/p2psync
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -buildid= -H=windowsgui" -o dist/p2psyncd.exe ./cmd/p2psync
+
+# Needs ANDROID_HOME (SDK + NDK) and JDK 17+; produces android/app/build/outputs/apk/.
+android:
+	./android/scripts/build-aar.sh
+	cd android && ./gradlew testDebugUnitTest lintDebug assembleDebug
