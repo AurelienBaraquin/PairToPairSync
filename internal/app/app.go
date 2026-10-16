@@ -10,12 +10,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/aurelienbaraquin/pairtopairsync/internal/api"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/folder"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/fsutil"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/node"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/pairing"
@@ -35,7 +37,13 @@ func DefaultHome() (string, error) {
 	if h := os.Getenv("P2PSYNC_HOME"); h != "" {
 		return h, nil
 	}
+	// On Windows use the machine-local profile (%LOCALAPPDATA%), not the roaming one
+	// (%APPDATA%): a roaming profile would copy the device key and the folder secrets
+	// to a server, and two PCs sharing a profile would end up with the same identity.
 	dir, err := os.UserConfigDir()
+	if runtime.GOOS == "windows" {
+		dir, err = os.UserCacheDir()
+	}
 	if err != nil {
 		return "", err
 	}
@@ -162,5 +170,5 @@ func APIToken(home string) (string, error) {
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		return "", err
 	}
-	return tok, os.WriteFile(path, []byte(tok), 0o600)
+	return tok, fsutil.WriteFileAtomic(path, []byte(tok), 0o600)
 }

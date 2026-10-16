@@ -51,7 +51,7 @@ func newComputer(t *testing.T) *computer {
 	cfg.DeviceName, cfg.ListenPort, cfg.APIAddr = "pc", c.port, "-"
 	cfg.LANDiscover, cfg.NATTraversal, cfg.DHT, cfg.RelayService = false, false, false, false
 	cfg.ListenAddresses = []string{fmt.Sprintf("/ip4/127.0.0.1/udp/%d/quic-v1", c.port), fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", c.port)}
-	cfg.Folders = []config.Folder{{ID: "docs", Label: "Documents", Path: filepath.Join(c.home, "docs"), Role: config.RoleFull, Secret: secret}}
+	cfg.Folders = []config.Folder{{ID: "docs", Label: "Documents", Path: filepath.Join(t.TempDir(), "docs"), Role: config.RoleFull, Secret: secret}}
 	if err := app.SaveConfig(c.home, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,8 @@ func newPhone(t *testing.T) (home, storage string) {
 	must(t, SetListenPort(home, freePort(t)))
 	must(t, SetLANDiscovery(home, false))
 	t.Cleanup(Stop)
-	return home, filepath.Join(home, "relay")
+	// Like on a phone: the relay store is a sibling of the data directory, never inside it.
+	return home, filepath.Join(t.TempDir(), "relay")
 }
 
 func must(t *testing.T, err error) {

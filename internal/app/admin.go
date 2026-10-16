@@ -1,12 +1,15 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/fsutil"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/seal"
 )
@@ -14,6 +17,12 @@ import (
 // Init creates the identity and a default configuration if they do not exist,
 // and returns the device ID.
 func Init(home, deviceName string, port int, apiAddr string) (string, error) {
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return "", err
+	}
+	// Keep the key and the folder secrets private to this user (a no-op chmod on
+	// Unix; a restricted access list on Windows, whatever drive the user chose).
+	_ = fsutil.Protect(home)
 	id, err := identity.LoadOrCreate(home)
 	if err != nil {
 		return "", err
@@ -38,14 +47,40 @@ func Init(home, deviceName string, port int, apiAddr string) (string, error) {
 }
 
 func LoadConfig(home string) (*config.Config, error) {
-	return config.Load(filepath.Join(home, ConfigFile))
+	cfg, err := config.Load(filepath.Join(home, ConfigFile))
+	if err != nil {
+		return nil, err
+	}
+	return cfg, cfg.CheckPaths(home)
 }
 
 func SaveConfig(home string, cfg *config.Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
+	if err := cfg.CheckPaths(home); err != nil {
+		return err
+	}
 	return cfg.Save(filepath.Join(home, ConfigFile))
+}
+
+// NormalizePath turns what a user typed into an absolute path. Shells differ:
+// PowerShell and cmd do not expand "~", and a quoted Windows path ending in a
+// backslash ("C:\My Docs\") reaches the program as C:\My Docs" with a stray quote.
+func NormalizePath(p string) (string, error) {
+	p = strings.TrimSpace(p)
+	p = strings.Trim(p, `"'`)
+	if p == "~" || strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+		h, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		p = filepath.Join(h, p[1:])
+	}
+	if p == "" {
+		return "", errors.New("empty path")
+	}
+	return filepath.Abs(p)
 }
 
 // AddDevice registers (or updates) a remote device.
@@ -104,18 +139,18 @@ func ShareFolder(cfg *config.Config, folderID, rawDevID string, relay bool) erro
 // one on every full device of the folder). It is returned so it can be shown to
 // the user once. A relay never gets one.
 func AddFolder(cfg *config.Config, id, path, role string, quotaMB int64, retentionHours int, secret string) (string, error) {
+	abs, err := NormalizePath(path)
+	if err != nil {
+		return "", err
+	}
 	if id == "" {
-		id = config.SlugID(filepath.Base(path))
+		id = config.SlugID(filepath.Base(abs)) // from the absolute path: "." has no useful name
 	}
 	if !config.ValidFolderID(id) {
 		return "", fmt.Errorf("invalid folder id %q: use 1-64 letters, digits, '.', '_' or '-'", id)
 	}
 	if cfg.Folder(id) != nil {
 		return "", fmt.Errorf("folder %q already exists", id)
-	}
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
 	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		return "", err

@@ -18,6 +18,7 @@ import (
 
 	"github.com/aurelienbaraquin/pairtopairsync/internal/app"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/fsutil"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/pairing"
 )
@@ -35,7 +36,7 @@ Setup:
   id                                    print this device's ID (give it to your other devices)
   device add <ID> [--name N] [--addr HOST:PORT]...   (ID may also be a full /ip4/…/p2p/ID address)
   device list | device remove <ID>
-  folder add <PATH> [--id ID] [--device ID[:relay]]...
+  folder add <PATH> [--id ID] [--device ID[:relay]]... [--secret-file FILE|-]
                                         synchronise PATH (a normal directory) with those devices
   folder add-relay <STORAGE_PATH> --id ID --device ID... [--quota-mb N] [--retention-hours N]
                                         turn THIS device into a temporary relay for folder ID
@@ -49,7 +50,7 @@ Pairing with a QR code (no IDs to copy, the folder secret is handed over securel
                                         use the code shown by 'invite' (scan it with a phone, then paste its text)
 
 Running:
-  run                                   run the sync daemon in the foreground
+  run [--log FILE]                      run the sync daemon in the foreground (--log: write the log to FILE)
   status                                show what the running daemon is doing
   ui                                    print the link of the local web page (status, QR invitations)
   version
@@ -73,8 +74,8 @@ func main() {
 		var name, apiAddr string
 		var port int
 		fs.StringVar(&name, "name", "", "device name")
-		fs.IntVar(&port, "port", 0, "UDP+TCP port to listen on (default 22000)")
-		fs.StringVar(&apiAddr, "api", "", "local status page address (default 127.0.0.1:8384, - to disable)")
+		fs.IntVar(&port, "port", 0, "UDP+TCP port to listen on (default 22100)")
+		fs.StringVar(&apiAddr, "api", "", "local status page address (default 127.0.0.1:8484, - to disable)")
 		parse(fs, args)
 		id, err := app.Init(home, name, port, apiAddr)
 		check(err)
@@ -94,7 +95,7 @@ func main() {
 	case "pair":
 		cmdPair(home, args)
 	case "run":
-		check(run(home))
+		cmdRun(home, args)
 	case "status":
 		check(status(home))
 	case "version":
@@ -195,6 +196,9 @@ func cmdDevice(home string, args []string) {
 		id, err := identity.Normalize(args[1])
 		check(err)
 		cfg := loadForEdit(home)
+		if cfg.Device(id) == nil {
+			fatal(fmt.Errorf("no such device: %s", identity.Format(id)))
+		}
 		var keep []config.Device
 		for _, d := range cfg.Devices {
 			if d.ID != id {
@@ -212,7 +216,7 @@ func cmdDevice(home string, args []string) {
 			cfg.Folders[i].Devices = fd
 		}
 		check(app.SaveConfig(home, cfg))
-		fmt.Println("device removed")
+		fmt.Println("device removed from every folder (a running daemon applies this by itself)")
 	default:
 		fatal(fmt.Errorf("unknown device command %q", args[0]))
 	}
@@ -226,13 +230,14 @@ func cmdFolder(home string, args []string) {
 	case "add", "add-relay":
 		isRelay := args[0] == "add-relay"
 		fs := flag.NewFlagSet(args[0], flag.ExitOnError)
-		var id, secret string
+		var id, secret, secretFile string
 		var devs list
 		var quota int64
 		var retention int
 		fs.StringVar(&id, "id", "", "folder ID shared by all devices (default: directory name)")
 		fs.Var(&devs, "device", "device ID to share with; suffix :relay if that device is a temporary relay (repeatable)")
-		fs.StringVar(&secret, "secret", "", "full folder: secret shared by all your full devices (generated if omitted)")
+		fs.StringVar(&secret, "secret", "", "full folder: secret shared by all your full devices (generated if omitted); visible in the process list, prefer --secret-file")
+		fs.StringVar(&secretFile, "secret-file", "", "full folder: read the secret from this file, or from standard input if -")
 		fs.Int64Var(&quota, "quota-mb", 0, "relay: maximum temporary storage in MB (default 2048)")
 		fs.IntVar(&retention, "retention-hours", 0, "relay: drop undelivered changes after this many hours (default 720)")
 		pos := parse(fs, args[1:])
@@ -294,40 +299,130 @@ func cmdFolder(home string, args []string) {
 	}
 }
 
-// run keeps a device running, restarting it when its configuration changes.
-func run(home string) error {
+// cmdRun parses the run options and runs the daemon until it is told to stop.
+func cmdRun(home string, args []string) {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	var logFile string
+	fs.StringVar(&logFile, "log", "", "write the log to this file instead of the terminal")
+	parse(fs, args)
+
+	var w io.Writer = os.Stderr
+	if logFile != "" {
+		f, err := openLog(logFile)
+		check(err)
+		defer f.Close()
+		w = f
+	}
+	logger := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	if err := run(home, logger); err != nil {
+		logger.Error("stopped", "err", err)
+		fatal(err)
+	}
+}
+
+// openLog opens a log file for appending, keeping one previous generation when it
+// grows past a few megabytes (a daemon without a console has nothing else to show).
+func openLog(path string) (*os.File, error) {
+	const maxLog = 5 << 20
+	if fi, err := os.Stat(path); err == nil && fi.Size() > maxLog {
+		_ = fsutil.Remove(path + ".1")
+		_ = fsutil.Rename(path, path+".1")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+}
+
+// loadConfig reads config.json, trying a few times: an editor may be half-way
+// through saving it.
+func loadConfig(home string) (cfg *config.Config, err error) {
+	for i := 0; i < 3; i++ {
+		if cfg, err = app.LoadConfig(home); err == nil {
+			return cfg, nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return nil, err
+}
+
+// run keeps a device running, restarting it when its configuration changes. It
+// only gives up when told to: a configuration that cannot be read or started
+// (a typo, a port still in use after a crash) is logged and the previous working
+// configuration keeps running, or the start is retried with a growing delay.
+func run(home string, logger *slog.Logger) error {
 	id, err := identity.LoadOrCreate(home)
 	if err != nil {
 		return err
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfgPath := filepath.Join(home, app.ConfigFile)
+	if _, err := os.Stat(cfgPath); err != nil {
+		return fmt.Errorf("not initialised: run `p2psync init` first")
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	reload := make(chan struct{}, 1)
 	notifyReload(reload)
 
+	var (
+		a     *app.App
+		good  *config.Config // last configuration that started
+		delay = time.Second
+	)
+	start := func(cfg *config.Config) error {
+		next, err := app.Start(context.Background(), home, cfg, id, logger)
+		if err != nil {
+			return err
+		}
+		a, good = next, cfg
+		logger.Info("running", "device", identity.Format(id.ID), "port", cfg.ListenPort)
+		return nil
+	}
+
 	for {
 		// Note the version of config.json *before* loading it: a change made in between
 		// must trigger the next restart, not be mistaken for the version we already run.
 		stamp := modTime(cfgPath)
-		cfg, err := app.LoadConfig(home)
-		if err != nil {
-			return err
+		cfg, err := loadConfig(home)
+		switch {
+		case err != nil && a != nil:
+			logger.Error("config.json is not usable, keeping the previous configuration", "err", err)
+		case err != nil:
+			logger.Error("config.json is not usable, waiting for a fix", "err", err)
+		default:
+			if a != nil {
+				logger.Info("configuration changed, restarting")
+				a.Stop()
+				a = nil
+			}
+			if err := start(cfg); err != nil {
+				logger.Error("cannot start with this configuration", "err", err)
+				if good != nil && good != cfg {
+					if err := start(good); err != nil {
+						logger.Error("cannot restart the previous configuration either", "err", err)
+					} else {
+						logger.Warn("running the previous configuration; fix config.json to apply the new one")
+					}
+				}
+			} else {
+				delay = time.Second
+			}
 		}
-		a, err := app.Start(context.Background(), home, cfg, id, logger)
-		if err != nil {
-			return err
-		}
-		logger.Info("running", "device", identity.Format(id.ID), "port", cfg.ListenPort)
 
 		poll := time.NewTicker(3 * time.Second)
-		restart := false
-		for !restart {
+		for restart := false; !restart; {
+			var retry <-chan time.Time
+			if a == nil {
+				retry = time.After(delay)
+			}
 			select {
 			case <-sig:
+				poll.Stop()
 				logger.Info("shutting down")
+				if a == nil {
+					return nil
+				}
 				stopped := make(chan struct{})
 				go func() { a.Stop(); close(stopped) }()
 				select {
@@ -341,11 +436,12 @@ func run(home string) error {
 				restart = true
 			case <-poll.C:
 				restart = modTime(cfgPath) != stamp
+			case <-retry:
+				restart = true
+				delay = min(2*delay, 30*time.Second)
 			}
 		}
 		poll.Stop()
-		logger.Info("configuration changed, restarting")
-		a.Stop()
 	}
 }
 
@@ -515,6 +611,7 @@ func cmdPair(home string, args []string) {
 		opts.Path = filepath.Join(home, "relay", inv.Folder)
 	}
 	check(app.PreflightJoin(cfg, inv, opts)) // before the invitation is spent
+	check(app.CheckJoinPath(home, cfg, inv, opts))
 
 	fmt.Printf("Connecting to %s…\n", firstNonEmpty(inv.Name, identity.Format(inv.ID)))
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -522,8 +619,20 @@ func cmdPair(home string, args []string) {
 	resp, err := pairing.Dial(ctx, id.Key, inv, app.GuestRequest(cfg))
 	check(err)
 
-	check(app.Join(cfg, inv, resp, opts))
-	check(app.SaveConfig(home, cfg))
+	// The invitation is spent now: if this device cannot record the result, say what
+	// it needs to be added by hand rather than losing it.
+	err = app.Join(cfg, inv, resp, opts)
+	if err == nil {
+		err = app.SaveConfig(home, cfg)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "The other device accepted us, but this device could not save the result: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Add it by hand:\n  p2psync device add %s --name %q\n", identity.Format(inv.ID), firstNonEmpty(resp.Name, inv.Name))
+		if resp.Secret != "" {
+			fmt.Fprintf(os.Stderr, "  echo %s | p2psync folder add <PATH> --id %s --device %s --secret-file -\n", resp.Secret, inv.Folder, identity.Format(inv.ID))
+		}
+		os.Exit(1)
+	}
 	switch {
 	case inv.InviteeRelay:
 		fmt.Printf("Paired. This device is now a temporary relay for %q (storage: %s).\n", inv.Folder, opts.Path)
@@ -535,12 +644,33 @@ func cmdPair(home string, args []string) {
 	fmt.Println("If the daemon is running it reloads by itself; otherwise start it with `p2psync run`.")
 }
 
+// readSecret reads a folder secret from a file, or from standard input for "-".
+func readSecret(path string) (string, error) {
+	var b []byte
+	var err error
+	if path == "-" {
+		b, err = io.ReadAll(io.LimitReader(os.Stdin, 4096))
+	} else {
+		b, err = os.ReadFile(path)
+	}
+	if err != nil {
+		return "", err
+	}
+	sec := strings.TrimSpace(string(b))
+	if sec == "" {
+		return "", fmt.Errorf("the secret is empty")
+	}
+	return sec, nil
+}
+
 func firstNonEmpty(a, b string) string {
 	if a != "" {
 		return a
 	}
 	return b
 }
+
+var apiClient = &http.Client{Timeout: 10 * time.Second}
 
 // apiGet queries the daemon's status endpoint with the local access token.
 func apiGet(home, addr string) (*http.Response, error) {
@@ -550,7 +680,7 @@ func apiGet(home, addr string) (*http.Response, error) {
 	}
 	req, _ := http.NewRequest("GET", "http://"+addr+"/api/status", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiClient.Do(req)
 	if err == nil && resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
 		return nil, fmt.Errorf("daemon answered %s", resp.Status)

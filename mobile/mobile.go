@@ -79,6 +79,9 @@ func Pair(home, code, storageDir string, quotaMB int64) (string, error) {
 	if err := app.PreflightJoin(cfg, inv, opts); err != nil {
 		return "", err
 	}
+	if err := app.CheckJoinPath(home, cfg, inv, opts); err != nil {
+		return "", err
+	}
 	id, err := identity.LoadOrCreate(home)
 	if err != nil {
 		return "", err

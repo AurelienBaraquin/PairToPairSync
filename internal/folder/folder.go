@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aurelienbaraquin/pairtopairsync/internal/config"
+	"github.com/aurelienbaraquin/pairtopairsync/internal/fsutil"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/model"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/node"
@@ -151,6 +152,7 @@ func (f *Folder) prepareRoot() error {
 	default:
 		return err
 	}
+	_ = fsutil.Hide(marker) // dot-names are hidden on Unix; Windows needs the attribute
 	tmp := filepath.Join(marker, "tmp")
 	if err := os.MkdirAll(tmp, 0o755); err != nil {
 		return err

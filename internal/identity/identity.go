@@ -19,6 +19,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
+
+	"github.com/aurelienbaraquin/pairtopairsync/internal/fsutil"
 )
 
 const keyFile = "identity.key"
@@ -49,11 +51,9 @@ func LoadOrCreate(dir string) (*Identity, error) {
 		if err = os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
 		}
-		tmp := path + ".tmp"
-		if err = os.WriteFile(tmp, raw, 0o600); err != nil {
-			return nil, err
-		}
-		if err = os.Rename(tmp, path); err != nil {
+		// Flushed to disk before it becomes visible under its real name: after a power
+		// cut an empty key file would mean a lost device identity.
+		if err = fsutil.WriteFileAtomic(path, raw, 0o600); err != nil {
 			return nil, err
 		}
 	} else if err != nil {

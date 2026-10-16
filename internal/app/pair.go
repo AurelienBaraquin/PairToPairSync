@@ -245,6 +245,22 @@ func PreflightJoin(cfg *config.Config, inv pairing.Invite, o JoinOptions) error 
 	return nil
 }
 
+// CheckJoinPath verifies, before an invitation is spent, that the folder this
+// device would create does not overlap another folder or the private data
+// directory (SaveConfig would refuse it afterwards, when the token is gone).
+func CheckJoinPath(home string, cfg *config.Config, inv pairing.Invite, o JoinOptions) error {
+	if cfg.Folder(inv.Folder) != nil || o.Path == "" {
+		return nil
+	}
+	abs, err := NormalizePath(o.Path)
+	if err != nil {
+		return err
+	}
+	probe := *cfg
+	probe.Folders = append(append([]config.Folder{}, cfg.Folders...), config.Folder{ID: inv.Folder, Path: abs})
+	return probe.CheckPaths(home)
+}
+
 // Join applies the inviter's answer to the local configuration. The answer is
 // checked against the invitation first: whoever made the QR code is not trusted.
 func Join(cfg *config.Config, inv pairing.Invite, resp protocol.PairResponse, o JoinOptions) error {

@@ -2,6 +2,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/aurelienbaraquin/pairtopairsync/internal/fsutil"
 	"github.com/aurelienbaraquin/pairtopairsync/internal/identity"
 )
 
@@ -69,9 +71,16 @@ type Config struct {
 	Folders []Folder `json:"folders"`
 }
 
+// Defaults are deliberately not 22000 and 8384: those are Syncthing's, a program
+// many users of this kind of tool already run.
+const (
+	DefaultPort    = 22100
+	DefaultAPIAddr = "127.0.0.1:8484"
+)
+
 func Default() *Config {
 	host, _ := os.Hostname()
-	return &Config{DeviceName: host, ListenPort: 22000, APIAddr: "127.0.0.1:8384",
+	return &Config{DeviceName: host, ListenPort: DefaultPort, APIAddr: DefaultAPIAddr,
 		LANDiscover: true, NATTraversal: true, DHT: true, RelayService: true}
 }
 
@@ -85,13 +94,15 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	c := Default()
-	if err := json.Unmarshal(b, c); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields() // a mistyped key would otherwise be silently ignored
+	if err := dec.Decode(c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return c, c.Validate()
 }
 
-// Save writes the configuration atomically.
+// Save writes the configuration atomically and durably (see fsutil).
 func (c *Config) Save(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -100,15 +111,14 @@ func (c *Config) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsutil.WriteFileAtomic(path, b, 0o600)
 }
 
 // Validate normalises device IDs and checks references.
 func (c *Config) Validate() error {
+	if c.ListenPort < 0 || c.ListenPort > 65535 {
+		return fmt.Errorf("listen_port %d is out of range", c.ListenPort)
+	}
 	known := map[string]bool{}
 	for i := range c.Devices {
 		id, err := identity.Normalize(c.Devices[i].ID)
@@ -124,6 +134,15 @@ func (c *Config) Validate() error {
 		f := &c.Folders[i]
 		if f.Path == "" {
 			return errors.New("folder needs a path")
+		}
+		// A relative path would be resolved against whatever directory the daemon
+		// happens to start in (System32 for a scheduled task).
+		if !filepath.IsAbs(f.Path) {
+			return fmt.Errorf("folder %q: the path must be absolute, got %q", f.ID, f.Path)
+		}
+		if f.ScanIntervalSec < 0 || f.ScanIntervalSec > 86400 || f.RetentionHours < 0 || f.RetentionHours > 24*366 ||
+			f.QuotaMB < 0 || f.QuotaMB > 1<<20 {
+			return fmt.Errorf("folder %q: scan interval, retention or quota out of range", f.ID)
 		}
 		if !ValidFolderID(f.ID) {
 			return fmt.Errorf("invalid folder id %q: use 1-64 letters, digits, '.', '_' or '-'", f.ID)

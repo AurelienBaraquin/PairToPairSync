@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/aurelienbaraquin/pairtopairsync/internal/fsutil"
 )
 
 // Pending is what the inviter remembers about an outstanding invitation. The
@@ -35,11 +37,7 @@ func (s *Store) Add(token string, p Pending) error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path(token) + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path(token))
+	return fsutil.WriteFileAtomic(s.path(token), b, 0o600)
 }
 
 // Consume validates a token and burns it. It returns false for an unknown,
@@ -53,7 +51,7 @@ func (s *Store) Consume(token string, now time.Time) (Pending, bool) {
 	if err != nil {
 		return Pending{}, false
 	}
-	if err := os.Remove(path); err != nil {
+	if err := fsutil.Remove(path); err != nil {
 		return Pending{}, false // someone else consumed it first
 	}
 	var p Pending
