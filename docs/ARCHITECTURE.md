@@ -15,7 +15,8 @@ internal/model       vecteurs de versions, FileInfo, blocs SHA-256
 internal/pairing     invitations QR : format, jetons à usage unique, client d'appairage
 internal/identity    clé Ed25519, ID d'appareil = peer ID libp2p
 internal/api         page d'état locale (127.0.0.1, jeton, CSP) et création d'invitations
-mobile               API compatible gomobile
+mobile               API gomobile (Pair, Start/Stop/Restart supervisés, NewInvite, ConfigJSON, Logs…)
+android              application Kotlin/Compose autour du moteur (AAR), service au premier plan
 ```
 
 ## Réseau
@@ -66,6 +67,18 @@ mobile               API compatible gomobile
 Cas gérés : invitant complet → invité complet (secret transmis) ; invitant complet → invité relais
 (pas de secret) ; invitant relais → invité complet (qui possède déjà le dossier et son secret). Un relais
 ne peut pas inviter un relais.
+
+## Application Android (`android/`, `mobile/`)
+
+Le moteur Go est compilé en AAR par `gomobile bind` (arm64 + x86_64) et appelé via la classe générée
+`mobile.Mobile`. Frontière volontairement étroite : chaînes JSON (`StatusJSON`, `ConfigJSON`) et entiers ; le
+code Kotlin ne touche jamais aux clés ni au secret (la vue de configuration n'en contient pas, testé des deux
+côtés). `Start` lance un superviseur qui redémarre le moteur quand `config.json` change (appairage, réglages)
+ou sur `Restart()` (changement de réseau). Côté Kotlin, `RelayService` (premier plan, `specialUse`) sérialise
+démarrage/arrêt sur un thread unique, applique « Wi‑Fi uniquement » via un `NetworkCallback` avec
+temporisation, et ne demande jamais l'état du moteur sur le thread principal. Les liens `p2psync://pair/…` ne
+déclenchent qu'une boîte de confirmation (`InviteInfo` est lu côté Kotlin pour l'affichage ; la vraie
+validation est celle du moteur Go).
 
 ## Modèle de données
 

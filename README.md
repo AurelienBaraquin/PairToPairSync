@@ -37,7 +37,8 @@ p2psync invite
 
 # Inviter le téléphone comme relais temporaire
 p2psync invite --as-relay
-#   Sur le téléphone :  p2psync pair <texte du QR> --path ~/relais
+#   Application Android : « Scanner un QR code »   (ou, en ligne de commande / Termux :
+#                          p2psync pair <texte du QR> --path ~/relais)
 
 # Pour que le portable aussi passe par le téléphone, le téléphone l'invite à son tour
 #   (téléphone) p2psync invite     ->     (portable) p2psync pair <texte du QR>
@@ -142,10 +143,9 @@ Fichier `.p2pignore` à la racine du dossier (`*.tmp`, `build/`, `/brouillons/*`
   environnement de test), UPnP/NAT-PMP, et le perçage de NAT entre vraies box — ce sont les fonctions
   éprouvées de libp2p, mais je n'ai pas pu les valider sur de vrais réseaux. Windows/macOS/ARM sont
   compilés en CI mais pas exécutés.
-- **Téléphone** : `make dist` produit `p2psync-android-arm64` (et `linux-arm64`) à lancer via Termux ; la
-  compilation Android exige `-ldflags=-checklinkname=0` (déjà dans le Makefile). **Jamais exécuté sur un vrai
-  téléphone.** Le paquet `mobile/` est prêt pour `gomobile bind` ; l'application Android native (service au
-  premier plan, économie d'énergie) reste à écrire.
+- **Téléphone** : une **application Android native** est fournie dans [`android/`](android/README.md)
+  (Kotlin/Compose, scan de QR code, service au premier plan, mode Wi‑Fi uniquement). Elle compile (APK, tests
+  JVM, lint) mais **n'a jamais été exécutée sur un téléphone ni un émulateur** : à valider sur appareil.
 - L'index complet est échangé à chaque connexion entre appareils complets ; les suppressions ne sont
   jamais purgées ; pas de détection de renommage (retransfert complet) ; liens symboliques ignorés ; pas de
   corbeille/versionnage ; seuls les bits de permission sont propagés.
