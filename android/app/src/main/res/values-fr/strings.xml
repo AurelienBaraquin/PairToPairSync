@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PairToPairSync</string>
+    <string name="back">Retour</string>
+    <string name="cancel">Annuler</string>
+    <string name="continue_">Continuer</string>
+    <string name="copy">Copier</string>
+    <string name="remove">Retirer</string>
+    <string name="refresh">Actualiser</string>
+
+    <string name="home_title">Point de relais</string>
+    <string name="relay_running">Relais actif</string>
+    <string name="relay_stopped">Relais arrêté</string>
+    <string name="relay_paused">En pause – en attente du Wi‑Fi</string>
+    <string name="relay_starting">Démarrage…</string>
+    <string name="relay_error">Erreur : %1$s</string>
+    <string name="relay_hint">Garde les dernières modifications de vos appareils jusqu\'à ce que chacun les ait reçues, puis les oublie. Ce n\'est jamais une copie permanente, et il ne peut pas lire vos fichiers.</string>
+    <string name="stat_pending">%1$d modification(s) en attente</string>
+    <string name="stat_storage">%1$s utilisés sur %2$s</string>
+    <string name="stat_waiting">En attente de %1$d appareil(s)</string>
+    <string name="stat_connected">Connectés : %1$s</string>
+    <string name="stat_none_connected">Aucun appareil connecté</string>
+    <string name="stat_relayed"> (via un autre appareil)</string>
+
+    <string name="btn_scan">Scanner un QR code</string>
+    <string name="btn_paste">Coller un code</string>
+    <string name="btn_invite">Afficher un QR code pour un ordinateur</string>
+    <string name="folders_title">Dossiers</string>
+    <string name="empty_title">Rien n\'est encore appairé</string>
+    <string name="empty_body">Sur votre ordinateur, lancez « p2psync invite --as-relay », puis scannez le QR code ici.</string>
+
+    <string name="paste_title">Coller une invitation</string>
+    <string name="paste_hint">p2psync://pair/…</string>
+
+    <string name="scan_title">Scanner le QR code</string>
+    <string name="scan_hint">Visez le code affiché par « p2psync invite --as-relay ».</string>
+    <string name="scan_permission">L\'appareil photo sert uniquement à lire le QR code. Rien n\'est enregistré ni envoyé.</string>
+    <string name="scan_grant">Autoriser l\'appareil photo</string>
+
+    <string name="confirm_title">Appairer avec %1$s ?</string>
+    <string name="confirm_body">Ce téléphone deviendra un relais temporaire pour le dossier « %1$s ». Il ne pourra pas lire vos fichiers : tout ce qu\'il garde est chiffré pour vos ordinateurs uniquement.</string>
+    <string name="confirm_yes">Appairer</string>
+    <string name="confirm_expired">Cette invitation a expiré. Créez-en une nouvelle.</string>
+    <string name="confirm_not_relay">Cette invitation est pour une copie complète, qu\'un téléphone ne peut pas contenir. Créez-la avec « p2psync invite --as-relay ».</string>
+    <string name="invalid_code">Ce n\'est pas une invitation PairToPairSync.</string>
+    <string name="pairing_busy">Appairage…</string>
+    <string name="paired_ok">Appairé avec %1$s.</string>
+    <string name="pair_failed">Échec de l\'appairage : %1$s</string>
+
+    <string name="invite_title">Inviter un ordinateur</string>
+    <string name="invite_body">Sur l\'ordinateur, lancez « p2psync pair » avec ce code. Il est valable 10 minutes et ne sert qu\'une fois. Traitez-le comme un mot de passe.</string>
+    <string name="invite_need_running">Démarrez d\'abord le relais.</string>
+    <string name="invite_generate">Générer un code</string>
+    <string name="invite_expires">Valable jusqu\'à %1$s</string>
+
+    <string name="settings_title">Réglages</string>
+    <string name="setting_wifi_only">Wi‑Fi uniquement</string>
+    <string name="setting_wifi_only_desc">Met en pause sur données mobiles pour préserver votre forfait.</string>
+    <string name="setting_lan">Trouver les appareils sur le réseau local</string>
+    <string name="setting_name">Nom de l\'appareil</string>
+    <string name="setting_quota">Limite de stockage : %1$d Mo</string>
+    <string name="setting_retention">Oublier les modifications non livrées après %1$d h</string>
+    <string name="devices_title">Appareils appairés</string>
+    <string name="remove_device_q">Retirer %1$s ?</string>
+    <string name="remove_device_body">Il ne pourra plus se connecter à ce relais.</string>
+    <string name="remove_folder">Ne plus relayer ce dossier et effacer ce qui est stocké</string>
+    <string name="remove_folder_q">Ne plus relayer « %1$s » ?</string>
+    <string name="remove_folder_body">Les modifications pas encore livrées à vos appareils seront perdues sur ce relais.</string>
+
+    <string name="battery_title">Garder le relais actif</string>
+    <string name="battery_body">Android peut arrêter les applications en arrière-plan pour économiser la batterie. Autorisez cette application à fonctionner sans restriction pour que vos ordinateurs puissent toujours joindre le relais.</string>
+    <string name="battery_action">Ouvrir les réglages de batterie</string>
+
+    <string name="device_id">Identifiant de l\'appareil</string>
+    <string name="logs_title">Diagnostic</string>
+    <string name="logs_empty">Rien n\'a encore été journalisé.</string>
+    <string name="logs_note">Gardé en mémoire uniquement. Jamais écrit sur le disque ni dans le journal système.</string>
+
+    <string name="notif_channel">État du relais</string>
+    <string name="notif_running">Relais actif</string>
+    <string name="notif_paused">Relais en pause (pas de Wi‑Fi)</string>
+    <string name="notif_text">%1$d modification(s) en attente · %2$d appareil(s) connecté(s)</string>
+    <string name="notif_stop">Arrêter</string>
+</resources>

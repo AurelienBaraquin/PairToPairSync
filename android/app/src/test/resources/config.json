@@ -1,0 +1,1 @@
+{"device_name":"Pixel","listen_port":36617,"lan_discovery":false,"devices":[{"id":"12D3KooWMgs3kmwn3bUEEbYkLRGCPQRRunkeBVPCpeyMW15bcq1n","name":"pc"}],"folders":[{"id":"docs","label":"Documents","role":"relay","quota_mb":512,"retention_hours":720,"devices":[{"id":"12D3KooWMgs3kmwn3bUEEbYkLRGCPQRRunkeBVPCpeyMW15bcq1n","name":"pc"}]}]}

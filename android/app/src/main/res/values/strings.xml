@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PairToPairSync</string>
+    <string name="back">Back</string>
+    <string name="cancel">Cancel</string>
+    <string name="continue_">Continue</string>
+    <string name="copy">Copy</string>
+    <string name="remove">Remove</string>
+    <string name="refresh">Refresh</string>
+
+    <string name="home_title">Relay point</string>
+    <string name="relay_running">Relay running</string>
+    <string name="relay_stopped">Relay stopped</string>
+    <string name="relay_paused">Paused – waiting for Wi‑Fi</string>
+    <string name="relay_starting">Starting…</string>
+    <string name="relay_error">Error: %1$s</string>
+    <string name="relay_hint">Keeps your devices\' latest changes until each one has received them, then forgets them. It is never a permanent copy, and it cannot read your files.</string>
+    <string name="stat_pending">%1$d change(s) waiting</string>
+    <string name="stat_storage">%1$s used of %2$s</string>
+    <string name="stat_waiting">Waiting for %1$d device(s)</string>
+    <string name="stat_connected">Connected: %1$s</string>
+    <string name="stat_none_connected">No device connected</string>
+    <string name="stat_relayed"> (via another device)</string>
+
+    <string name="btn_scan">Scan a QR code</string>
+    <string name="btn_paste">Paste a code</string>
+    <string name="btn_invite">Show a QR code for a computer</string>
+    <string name="folders_title">Folders</string>
+    <string name="empty_title">Nothing paired yet</string>
+    <string name="empty_body">On your computer run “p2psync invite --as-relay”, then scan the QR code here.</string>
+
+    <string name="paste_title">Paste an invitation</string>
+    <string name="paste_hint">p2psync://pair/…</string>
+
+    <string name="scan_title">Scan the QR code</string>
+    <string name="scan_hint">Point the camera at the code shown by “p2psync invite --as-relay”.</string>
+    <string name="scan_permission">The camera is only used to read the QR code. Nothing is recorded or sent anywhere.</string>
+    <string name="scan_grant">Allow camera</string>
+
+    <string name="confirm_title">Pair with %1$s?</string>
+    <string name="confirm_body">This phone will become a temporary relay for the folder “%1$s”. It will not be able to read your files: everything it keeps is encrypted for your computers only.</string>
+    <string name="confirm_yes">Pair</string>
+    <string name="confirm_expired">This invitation has expired. Create a new one.</string>
+    <string name="confirm_not_relay">This invitation is for a full copy, which a phone cannot hold. Create it with “p2psync invite --as-relay”.</string>
+    <string name="invalid_code">That is not a PairToPairSync invitation.</string>
+    <string name="pairing_busy">Pairing…</string>
+    <string name="paired_ok">Paired with %1$s.</string>
+    <string name="pair_failed">Pairing failed: %1$s</string>
+
+    <string name="invite_title">Invite a computer</string>
+    <string name="invite_body">On the computer run “p2psync pair” with this code. It is valid for 10 minutes and works once. Treat it like a password.</string>
+    <string name="invite_need_running">Start the relay first.</string>
+    <string name="invite_generate">Generate a code</string>
+    <string name="invite_expires">Valid until %1$s</string>
+
+    <string name="settings_title">Settings</string>
+    <string name="setting_wifi_only">Only on Wi‑Fi</string>
+    <string name="setting_wifi_only_desc">Pause on mobile data to save your data plan.</string>
+    <string name="setting_lan">Find devices on the local network</string>
+    <string name="setting_name">Device name</string>
+    <string name="setting_quota">Storage limit: %1$d MB</string>
+    <string name="setting_retention">Forget undelivered changes after %1$d h</string>
+    <string name="devices_title">Paired devices</string>
+    <string name="remove_device_q">Remove %1$s?</string>
+    <string name="remove_device_body">It will no longer be able to connect to this relay.</string>
+    <string name="remove_folder">Stop relaying this folder and delete what is stored</string>
+    <string name="remove_folder_q">Stop relaying “%1$s”?</string>
+    <string name="remove_folder_body">Changes not yet delivered to your devices will be lost from this relay.</string>
+
+    <string name="battery_title">Keep the relay alive</string>
+    <string name="battery_body">Android may stop background apps to save battery. Allow this app to run without restrictions so your computers can always reach the relay.</string>
+    <string name="battery_action">Open battery settings</string>
+
+    <string name="device_id">Device ID</string>
+    <string name="logs_title">Diagnostics</string>
+    <string name="logs_empty">Nothing logged yet.</string>
+    <string name="logs_note">Kept in memory only. Never written to disk or the system log.</string>
+
+    <string name="notif_channel">Relay status</string>
+    <string name="notif_running">Relay running</string>
+    <string name="notif_paused">Relay paused (no Wi‑Fi)</string>
+    <string name="notif_text">%1$d change(s) waiting · %2$d device(s) connected</string>
+    <string name="notif_stop">Stop</string>
+</resources>

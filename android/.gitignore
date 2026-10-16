@@ -1,0 +1,11 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+# The engine library is built from ../mobile with scripts/build-aar.sh
+app/libs/*
+*.apk
+*.aab
+*.keystore
+*.jks
