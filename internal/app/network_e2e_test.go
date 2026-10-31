@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -388,4 +389,52 @@ func TestTwoRelaysBothDeliverAndBothForget(t *testing.T) {
 	b.start(t, a, r1, r2)
 	eventually(t, "B gets it from the remaining relay", b.hasContent("later.txt", []byte("while B is away and R1 is gone")))
 	eventually(t, "the remaining relay forgets it", func() bool { return storeEmpty(r2) })
+}
+
+// The everyday case, end to end: a phone paired as a relay through one computer carries
+// a change to the other computer while the two are never on at the same time.
+func TestRelayPairedThroughOneComputerCarriesChangesToTheOther(t *testing.T) {
+	root, a, b := networkOf(t)
+	phone, pcfg := freshGuest(t, root, "Phone")
+
+	inv, err := app.CreateNetworkInvite(a.home, a.config(t), a.id.ID, a.a.Node.Addrs(), app.NetworkInviteOptions{AsRelay: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := joinNetwork(t, a, phone, pcfg, inv, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm := app.LoadMembership(phone.home, phone.id, quietLog())
+	app.WithConfigLock(func() {
+		if err := app.JoinNetwork(pm, pcfg, inv, resp, app.JoinOptions{Dir: phone.dir}); err != nil {
+			t.Fatal(err)
+		}
+		if err := app.SaveConfig(phone.home, pcfg); err != nil {
+			t.Fatal(err)
+		}
+	})
+	phone.dir = phone.config(t).Folder("docs").Path // the relay's store
+	if got := phone.config(t).Folder("docs").FullDevices(); !slices.Contains(got, b.id.ID) {
+		t.Fatalf("the relay does not count B as a device to deliver to: %v", got)
+	}
+
+	waitConfigHas(t, a, phone)
+	a.reload(t)
+	eventually(t, "B learnt the relay", func() bool {
+		c, err := app.LoadConfig(b.home)
+		return err == nil && c.Folder("docs").IsRelay(phone.id.ID)
+	})
+	b.reload(t)
+	phone.reload(t)
+	eventually(t, "the relay is connected to A", phone.connectedTo(a))
+	eventually(t, "the relay is connected to B", phone.connectedTo(b))
+
+	b.stop()
+	a.write(t, "while-b-sleeps.txt", []byte("carried by the phone"))
+	eventually(t, "the relay holds the change", func() bool { return relayHolds(phone, 1) })
+	a.stop()
+	b.reload(t)
+	eventually(t, "B got it from the relay", b.hasContent("while-b-sleeps.txt", []byte("carried by the phone")))
+	eventually(t, "the relay forgot it", func() bool { return storeEmpty(phone) })
 }

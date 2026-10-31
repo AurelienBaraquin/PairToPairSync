@@ -187,10 +187,18 @@ func (n *Node) sharesAny(id string) bool {
 // Start brings the node online. It returns once the host is listening.
 func (n *Node) Start(parent context.Context) error {
 	n.ctx, n.cancel = context.WithCancel(parent)
+	// Folders first: the host accepts sessions as soon as it exists, and a session
+	// hands its peer to every folder, which must be running by then.
+	for _, hd := range n.handlers {
+		if err := hd.Start(n.ctx); err != nil {
+			n.Stop()
+			return fmt.Errorf("folder %s: %w", hd.ID(), err)
+		}
+	}
 	opts := n.libp2pOptions()
 	h, err := libp2p.New(opts...)
 	if err != nil {
-		n.cancel()
+		n.Stop()
 		return fmt.Errorf("start network: %w", err)
 	}
 	n.host = h
@@ -213,12 +221,6 @@ func (n *Node) Start(parent context.Context) error {
 		if err := n.mdns.Start(); err != nil {
 			n.log.Warn("LAN discovery unavailable", "err", err)
 			n.mdns = nil
-		}
-	}
-	for _, hd := range n.handlers {
-		if err := hd.Start(n.ctx); err != nil {
-			n.Stop()
-			return fmt.Errorf("folder %s: %w", hd.ID(), err)
 		}
 	}
 	for pid := range n.known {
