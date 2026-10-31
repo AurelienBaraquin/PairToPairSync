@@ -29,6 +29,9 @@ const Scheme = "p2psync://pair/"
 // DefaultTTL is how long an invitation stays valid.
 const DefaultTTL = 10 * time.Minute
 
+// MaxAddrs is the most inviter addresses an invitation may carry.
+const MaxAddrs = 8
+
 // Invite is the content of the QR code. Field names are short to keep the code small.
 type Invite struct {
 	V     int      `json:"v"`
@@ -94,7 +97,7 @@ func Decode(s string) (Invite, error) {
 	} else {
 		i.ID = id
 	}
-	if i.Token == "" || len(i.Token) > 64 || len(i.Addrs) > 8 {
+	if i.Token == "" || len(i.Token) > 64 || len(i.Addrs) > MaxAddrs {
 		return Invite{}, errors.New("malformed invitation")
 	}
 	for _, a := range i.Addrs {

@@ -188,8 +188,11 @@ func CreateInvite(home string, cfg *config.Config, selfID string, addrs []string
 }
 
 // SelectAddrs keeps the few addresses most useful to a guest, so the QR code
-// stays small: a public one, a local-network one, a relayed one, and only if
-// nothing else exists, loopback.
+// stays small: a public one, every local-network one, a relayed one, and only if
+// nothing else exists, loopback. A PC often has several private addresses (VPNs,
+// WSL, virtual machines) and nothing says which one the guest shares, so none is
+// dropped for another; the usual home ranges come first, and the total stays
+// within pairing.MaxAddrs.
 func SelectAddrs(all []string, selfID string) []string {
 	var public, lan, circuit, other, loop []string
 	for _, a := range all {
@@ -215,11 +218,18 @@ func SelectAddrs(all []string, selfID string) []string {
 			}
 		}
 	}
+	sort.SliceStable(lan, func(i, j int) bool { return lanRank(lan[i]) < lanRank(lan[j]) })
 	var out []string
-	for _, group := range [][]string{public, lan, circuit} {
-		if len(group) > 0 {
-			out = append(out, group[0])
-		}
+	if len(public) > 0 {
+		out = append(out, public[0])
+	}
+	room := pairing.MaxAddrs - len(out)
+	if len(circuit) > 0 {
+		room--
+	}
+	out = append(out, lan[:min(len(lan), room)]...)
+	if len(circuit) > 0 {
+		out = append(out, circuit[0])
 	}
 	if len(out) == 0 && len(other) > 0 {
 		out = append(out, other[0])
@@ -228,6 +238,20 @@ func SelectAddrs(all []string, selfID string) []string {
 		out = append(out, loop[0])
 	}
 	return out
+}
+
+// lanRank orders private addresses by how likely they are to be the home network:
+// 192.168/16 (home routers), then 10/8 (often a VPN), then the rest (172.16/12 is
+// mostly Docker and WSL bridges; IPv6 unique-local).
+func lanRank(addr string) int {
+	switch ip := strings.Split(addr, "/")[2]; {
+	case strings.HasPrefix(ip, "192.168."):
+		return 0
+	case strings.HasPrefix(ip, "10."):
+		return 1
+	default:
+		return 2
+	}
 }
 
 // ---- guest side ---------------------------------------------------------------------
