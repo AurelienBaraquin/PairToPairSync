@@ -173,15 +173,16 @@ func TestDeliveredTableSurvivesRestartAndIsBounded(t *testing.T) {
 		t.Fatal("delivery was forgotten across a restart")
 	}
 
+	// r2's tick loop reads deliveredMax under r2.mu: change it under the same lock.
+	r2.mu.Lock()
 	old := deliveredMax
 	deliveredMax = 3
-	defer func() { deliveredMax = old }()
-	r2.mu.Lock()
 	for i := 0; i < 10; i++ {
 		r2.delivered[fmt.Sprintf("%032d", i)] = delivery{Version: model.Vector{"A": 1}, At: time.Now().Add(time.Duration(i) * time.Second)}
 	}
 	r2.pruneDeliveredLocked(time.Now())
 	size := len(r2.delivered)
+	deliveredMax = old
 	r2.mu.Unlock()
 	if size != 3 {
 		t.Fatalf("table not bounded: %d", size)
